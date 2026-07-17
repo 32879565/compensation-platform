@@ -1,31 +1,30 @@
-import { useQuery } from '@tanstack/react-query'
-import { Card, Typography } from 'antd'
-import axios from 'axios'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 
-import { HealthTag } from './components/HealthTag'
-
-interface HealthResponse {
-  status: string
-}
+import { AuthProvider } from './auth/AuthContext'
+import { ProtectedRoute } from './auth/ProtectedRoute'
+import { AppShell } from './components/AppShell'
+import Home from './pages/Home'
+import Login from './pages/Login'
 
 export default function App() {
-  const { data, isError } = useQuery({
-    queryKey: ['health'],
-    queryFn: async () => (await axios.get<HealthResponse>('/api/health')).data,
-    retry: 1,
-  })
-
-  const ok = isError ? false : data ? data.status === 'ok' : undefined
-
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 120 }}>
-      <Card style={{ width: 420, textAlign: 'center' }}>
-        <Typography.Title level={3}>薪酬一体化平台</Typography.Title>
-        <Typography.Paragraph type="secondary">
-          S1 脚手架 — 核算 · 管理 · 查询
-        </Typography.Paragraph>
-        <HealthTag ok={ok} />
-      </Card>
-    </div>
+    <AuthProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route
+            path="/"
+            element={
+              <ProtectedRoute>
+                <AppShell>
+                  <Home />
+                </AppShell>
+              </ProtectedRoute>
+            }
+          />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </AuthProvider>
   )
 }

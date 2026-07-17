@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.4",
     "psycopg[binary]>=3.2",
     "argon2-cffi>=23.1",
+    "pyjwt>=2.9",
     "openpyxl>=3.1",
 ]
 
@@ -39,6 +40,17 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI 依赖注入的标准写法：在参数默认值里调用 Depends/Query 等
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+]
 
 [tool.black]
 line-length = 100

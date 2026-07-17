@@ -3,11 +3,13 @@ from collections.abc import Iterator
 
 import pytest
 
-# 测试环境注入必填配置（database_url 为 fail-closed 必填字段）。
-# DB 相关测试用 testcontainers 起独立 Postgres，并覆盖此默认值。
+# 测试环境注入必填配置（database_url/secret_key 为 fail-closed 必填字段）。
+# DB 相关测试用 testcontainers 起独立 Postgres，并覆盖 database_url。
 os.environ.setdefault(
     "COMP_DATABASE_URL", "postgresql+psycopg://test:test@localhost:5432/compensation_test"
 )
+os.environ.setdefault("COMP_SECRET_KEY", "test-secret-key-only-for-tests-not-production")
+os.environ.setdefault("COMP_COOKIE_SECURE", "false")
 
 
 @pytest.fixture(scope="session")
@@ -32,12 +34,16 @@ def pg_engine() -> Iterator[object]:
 
 @pytest.fixture
 def db_session(pg_engine) -> Iterator[object]:
-    """函数级会话，每个测试用例结束回滚，保证隔离。"""
+    """函数级会话，每个测试用例结束回滚，保证隔离。
+
+    join_transaction_mode='create_savepoint'：被测代码内部的 session.commit()
+    只提交 SAVEPOINT，外层事务仍可整体回滚，从而在有 commit 的路径下保持隔离。
+    """
     from sqlalchemy.orm import sessionmaker
 
     connection = pg_engine.connect()
     trans = connection.begin()
-    session = sessionmaker(bind=connection, future=True)()
+    session = sessionmaker(bind=connection, future=True, join_transaction_mode="create_savepoint")()
     try:
         yield session
     finally:
