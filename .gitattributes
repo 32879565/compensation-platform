@@ -1,0 +1,5 @@
+# 统一用 LF（项目部署在 Linux），避免 Windows 开发时的 CRLF 噪音
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

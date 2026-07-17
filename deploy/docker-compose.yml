@@ -1,0 +1,50 @@
+name: compensation-platform
+
+# fail-closed：POSTGRES_PASSWORD 必填（先 cp .env.example .env）。
+# 所有端口只绑 127.0.0.1，薪资数据默认不暴露局域网；生产经 S17 反代对外。
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-comp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请先 cp deploy/.env.example deploy/.env 并设置强口令}
+      POSTGRES_DB: ${POSTGRES_DB:-compensation}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-comp} -d ${POSTGRES_DB:-compensation}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build: ../backend
+    environment:
+      COMP_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-comp}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-compensation}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  frontend:
+    build: ../frontend
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

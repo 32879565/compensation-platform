@@ -1,0 +1,29 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 锚定到 backend/ 根，避免 env_file 随进程 CWD 漂移
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    """应用配置。全部来自环境变量 / backend/.env（前缀 COMP_），禁止硬编码敏感值。
+
+    fail-closed：database_url 为必填，未配置时启动即 ValidationError（不变量 4/8）。
+    本地开发：cp deploy/.env.example backend/.env 后按需修改。
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=str(_BACKEND_ROOT / ".env"), env_prefix="COMP_", extra="ignore"
+    )
+
+    app_name: str = "compensation-platform"
+    debug: bool = False
+    database_url: str
+
+
+@lru_cache
+def get_settings() -> Settings:
+    # database_url 等必填字段由 pydantic-settings 在运行时从环境/.env 注入
+    return Settings()  # type: ignore[call-arg]

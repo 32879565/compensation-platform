@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+
+# 环境与密钥（不变量8：无明文口令落盘入仓）
+.env
+.env.*
+.envrc
+!.env.example
+
+# 数据文件（不变量：薪资数据绝不入仓）
+*.sqlite
+*.sqlite3
+*.xlsx
+*.xls
+*.csv
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
