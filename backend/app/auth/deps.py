@@ -8,6 +8,7 @@ import jwt
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from app.audit.context import set_actor
 from app.auth.service import Principal, build_principal
 from app.core.security import decode_access_token
 from app.db.session import get_session
@@ -39,6 +40,7 @@ def get_current_principal(request: Request, session: Session = Depends(get_sessi
     user = session.get(User, user_id)
     if user is None or user.is_deleted or user.status != "ACTIVE":
         raise _UNAUTH
+    set_actor(user.id, user.username)  # 供审计记录识别操作者
     return build_principal(session, user)
 
 

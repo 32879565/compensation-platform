@@ -26,6 +26,7 @@ services:
     environment:
       COMP_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-comp}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-compensation}
       COMP_SECRET_KEY: ${COMP_SECRET_KEY:?COMP_SECRET_KEY 未设置：请在 deploy/.env 配置强随机密钥}
+      COMP_ENCRYPTION_KEY: ${COMP_ENCRYPTION_KEY:?COMP_ENCRYPTION_KEY 未设置：请在 deploy/.env 配置强随机密钥}
       COMP_COOKIE_SECURE: ${COMP_COOKIE_SECURE:-true}
       COMP_DEBUG: ${COMP_DEBUG:-false}
     ports:

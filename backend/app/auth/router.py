@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.audit import service as audit
 from app.auth.deps import get_current_principal
 from app.auth.service import (
     AuthError,
@@ -85,6 +86,14 @@ def login(
 ) -> TokenResponse:
     ip = _client_ip(request)
     if _throttle.is_locked(ip, body.username):
+        audit.record(
+            session,
+            action="auth.login",
+            result="LOCKED",
+            ip=ip,
+            detail={"username": body.username},
+        )
+        session.commit()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="尝试过于频繁，请稍后再试",
@@ -93,6 +102,14 @@ def login(
         user = authenticate(session, body.username, body.password)
     except AuthError:
         _throttle.record_failure(ip, body.username)
+        audit.record(
+            session,
+            action="auth.login",
+            result="FAILURE",
+            ip=ip,
+            detail={"username": body.username},
+        )
+        session.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
         ) from None
@@ -100,6 +117,9 @@ def login(
     _throttle.reset(ip, body.username)
     raw_refresh = issue_refresh_token(session, user.id)
     result = _principal_payload(session, user.id, user.username)
+    audit.record(
+        session, action="auth.login", result="SUCCESS", actor=(user.id, user.username), ip=ip
+    )
     session.commit()
     _set_refresh_cookie(response, raw_refresh)
     return result
@@ -116,6 +136,7 @@ def refresh(
         user_id, new_raw = rotate_refresh_token(session, raw)
     except RefreshReuseError:
         # 重放检测触发了该用户全部会话吊销，必须持久化这些安全副作用
+        audit.record(session, action="auth.refresh_reuse", result="FAILURE", ip=_client_ip(request))
         session.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="refresh token 无效"
@@ -142,6 +163,7 @@ def logout(
     raw = request.cookies.get(_REFRESH_COOKIE)
     if raw:
         revoke_refresh_token(session, raw)
+        audit.record(session, action="auth.logout", ip=_client_ip(request))
         session.commit()
     response.delete_cookie(_REFRESH_COOKIE, path=_COOKIE_PATH)
     response.status_code = status.HTTP_204_NO_CONTENT

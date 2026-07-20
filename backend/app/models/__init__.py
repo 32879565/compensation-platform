@@ -1,5 +1,6 @@
 """集中导入所有模型，确保 Base.metadata 完整（供 Alembic autogenerate 与 create_all）。"""
 
+from app.models.audit import AuditLog
 from app.models.auth import (
     Permission,
     RefreshToken,
@@ -31,4 +32,5 @@ __all__ = [
     "RolePermission",
     "UserOrgScope",
     "RefreshToken",
+    "AuditLog",
 ]

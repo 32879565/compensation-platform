@@ -9,7 +9,25 @@ os.environ.setdefault(
     "COMP_DATABASE_URL", "postgresql+psycopg://test:test@localhost:5432/compensation_test"
 )
 os.environ.setdefault("COMP_SECRET_KEY", "test-secret-key-only-for-tests-not-production")
+os.environ.setdefault("COMP_ENCRYPTION_KEY", "test-encryption-key-only-for-tests")
 os.environ.setdefault("COMP_COOKIE_SECURE", "false")
+
+# 与 S4 迁移一致的 audit_log append-only 触发器（create_all 不会建触发器，
+# 测试里手动补上以保真）。
+_AUDIT_APPEND_ONLY_SQL = [
+    """
+    CREATE OR REPLACE FUNCTION audit_log_block_modify() RETURNS trigger AS $$
+    BEGIN
+        RAISE EXCEPTION 'audit_log is append-only: % not allowed', TG_OP;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    """
+    CREATE TRIGGER audit_log_no_update_delete
+    BEFORE UPDATE OR DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_block_modify();
+    """,
+]
 
 
 @pytest.fixture(scope="session")
@@ -20,7 +38,7 @@ def pg_engine() -> Iterator[object]:
     except ImportError:  # pragma: no cover
         pytest.skip("testcontainers 未安装")
 
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, text
 
     import app.models  # noqa: F401  触发所有模型注册进 Base.metadata
     from app.db.base import Base
@@ -28,6 +46,9 @@ def pg_engine() -> Iterator[object]:
     with PostgresContainer("postgres:16", driver="psycopg") as pg:
         engine = create_engine(pg.get_connection_url(), future=True)
         Base.metadata.create_all(engine)
+        with engine.begin() as conn:
+            for stmt in _AUDIT_APPEND_ONLY_SQL:
+                conn.execute(text(stmt))
         yield engine
         engine.dispose()
 

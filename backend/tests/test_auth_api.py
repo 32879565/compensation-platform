@@ -3,6 +3,7 @@ from sqlalchemy import select
 
 from app.auth.bootstrap import seed_rbac
 from app.core.security import hash_password
+from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserOrgScope, UserRole
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
@@ -111,3 +112,24 @@ def test_logout_revokes_and_refresh_then_fails(client, db_session):
     assert client.post("/api/auth/logout").status_code == 204
     # 登出吊销后，用（已被清除的）cookie 刷新应失败
     assert client.post("/api/auth/refresh").status_code == 401
+
+
+def test_login_success_writes_audit(client, db_session):
+    _make_user(db_session, "hr", "StrongPass123!", ["GROUP_HR"])
+    client.post("/api/auth/login", json={"username": "hr", "password": "StrongPass123!"})
+    row = db_session.scalars(
+        select(AuditLog).where(AuditLog.action == "auth.login", AuditLog.result == "SUCCESS")
+    ).first()
+    assert row is not None
+    assert row.actor_username == "hr"
+
+
+def test_login_failure_writes_audit_without_password(client, db_session):
+    _make_user(db_session, "hr", "StrongPass123!", ["GROUP_HR"])
+    client.post("/api/auth/login", json={"username": "hr", "password": "wrong"})
+    row = db_session.scalars(
+        select(AuditLog).where(AuditLog.action == "auth.login", AuditLog.result == "FAILURE")
+    ).first()
+    assert row is not None
+    # 审计明细绝不含明文口令
+    assert "wrong" not in str(row.detail)

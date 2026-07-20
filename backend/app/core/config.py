@@ -24,6 +24,8 @@ class Settings(BaseSettings):
 
     # 认证（不变量4：无默认，缺失即 fail-closed）
     secret_key: str
+    # PII 列级加密口令（不变量7）。任意高熵字符串；轮换需重新加密现有数据（S17）。
+    encryption_key: str
     access_token_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 7
     # 登录限速（防爆破）

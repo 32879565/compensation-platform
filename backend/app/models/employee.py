@@ -4,6 +4,7 @@ from datetime import date
 from sqlalchemy import Date, Enum, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.crypto import EncryptedString
 from app.db.base import Base, SoftDeleteMixin, TimestampMixin
 
 
@@ -22,7 +23,8 @@ class EmployeeStatus(enum.StrEnum):
 class Employee(Base, TimestampMixin, SoftDeleteMixin):
     """员工。emp_no 为全局唯一身份键（不变量3：绝不以姓名作身份）。
 
-    id_card_enc/bank_account_enc 存密文——列在此定义，加密工具在 S4 落地。
+    id_card/bank_account 用 EncryptedString：库中存 Fernet 密文，Python 侧读写明文
+    （不变量7）。API 层展示须调用 mask_id_card/mask_bank_account 脱敏。
     position 岗位目录属主数据，放在 S5；此处先不建岗位表。
     """
 
@@ -49,6 +51,6 @@ class Employee(Base, TimestampMixin, SoftDeleteMixin):
     leave_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     # 社保参保城市（可与所属门店 city 不同）；S12 按此取城市政策
     social_city: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # PII 密文列（S4 加密工具落地前存占位/明文迁移值，S4 起写密文）
-    id_card_enc: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    bank_account_enc: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # PII：库中密文、应用层明文（EncryptedString）
+    id_card: Mapped[str | None] = mapped_column(EncryptedString(512), nullable=True)
+    bank_account: Mapped[str | None] = mapped_column(EncryptedString(512), nullable=True)
