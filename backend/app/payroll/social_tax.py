@@ -170,6 +170,12 @@ def calculate_social_insurance(
     )
 
 
+def validate_social_insurance_policy(policy: SocialInsurancePolicyInput) -> None:
+    """Validate a policy before it is persisted or finalized."""
+
+    _validated_social_rules(policy)
+
+
 def _validated_tax_brackets(policy: TaxPolicyInput) -> tuple[TaxBracket, ...]:
     _require_finite_nonnegative(policy.monthly_basic_deduction, "monthly_basic_deduction")
     if not policy.brackets:
@@ -257,3 +263,9 @@ def calculate_cumulative_tax(
         cumulative_tax_due=cumulative_tax_due,
         current_withholding=current_withholding,
     )
+
+
+def validate_tax_policy(policy: TaxPolicyInput) -> None:
+    """Validate a policy before it is persisted or finalized."""
+
+    _validated_tax_brackets(policy)

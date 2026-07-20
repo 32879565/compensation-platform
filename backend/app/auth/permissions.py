@@ -22,9 +22,18 @@ class Perm:
     STRUCTURE_WRITE = "salary_structure:write"
     ATTENDANCE_READ = "attendance:read"
     ATTENDANCE_WRITE = "attendance:write"
+    ATTENDANCE_SCHEDULE_READ = "attendance_schedule:read"
+    ATTENDANCE_SCHEDULE_WRITE = "attendance_schedule:write"
+    ATTENDANCE_EXPECTED_DAYS_ADJUST = "attendance:expected_days:adjust"
+    HOLIDAY_CALENDAR_READ = "holiday_calendar:read"
+    HOLIDAY_CALENDAR_WRITE = "holiday_calendar:write"
+    POLICY_READ = "policy:read"
+    POLICY_WRITE = "policy:write"
     PAYROLL_READ = "payroll:read"
     PAYROLL_RUN = "payroll:run"
     PAYROLL_APPROVE = "payroll:approve"
+    PAYROLL_CORRECT = "payroll:correct"
+    PAYROLL_REVIEW = "payroll:review"  # 门店负责人复核确认/提异议
     ADJUSTMENT_READ = "adjustment:read"
     ADJUSTMENT_CREATE = "adjustment:create"
     ADJUSTMENT_APPROVE = "adjustment:approve"
@@ -51,9 +60,18 @@ PERMISSION_CATALOG: dict[str, str] = {
     Perm.STRUCTURE_WRITE: "维护薪资结构",
     Perm.ATTENDANCE_READ: "查看考勤",
     Perm.ATTENDANCE_WRITE: "录入考勤",
+    Perm.ATTENDANCE_SCHEDULE_READ: "查看应出勤规则",
+    Perm.ATTENDANCE_SCHEDULE_WRITE: "维护应出勤规则",
+    Perm.ATTENDANCE_EXPECTED_DAYS_ADJUST: "调整应出勤天数",
+    Perm.HOLIDAY_CALENDAR_READ: "查看法定节假日日历",
+    Perm.HOLIDAY_CALENDAR_WRITE: "维护法定节假日日历",
+    Perm.POLICY_READ: "查看社保、公积金与个税政策",
+    Perm.POLICY_WRITE: "维护社保、公积金与个税政策",
     Perm.PAYROLL_READ: "查看核算",
     Perm.PAYROLL_RUN: "执行核算",
     Perm.PAYROLL_APPROVE: "复核核算",
+    Perm.PAYROLL_CORRECT: "解锁后更正工资源数据",
+    Perm.PAYROLL_REVIEW: "门店复核确认/提异议",
     Perm.ADJUSTMENT_READ: "查看调薪",
     Perm.ADJUSTMENT_CREATE: "发起调薪",
     Perm.ADJUSTMENT_APPROVE: "审批调薪",
@@ -69,6 +87,9 @@ PERMISSION_CATALOG: dict[str, str] = {
 }
 
 _ALL_READ = [p for p in PERMISSION_CATALOG if p.endswith(":read")]
+_SUPER_ADMIN_PERMISSIONS = tuple(
+    permission for permission in PERMISSION_CATALOG if permission != Perm.PAYROLL_REVIEW
+)
 
 
 @dataclass(frozen=True)
@@ -80,7 +101,11 @@ class RoleDef:
 
 
 ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
-    RoleDef("SUPER_ADMIN", "超级管理员", True, tuple(PERMISSION_CATALOG)),
+    # Payroll review is never global: the authoritative workflow requires an
+    # explicit store-and-department reviewer assignment before confirmation or
+    # a dispute can be raised.  Super administrators retain every operational
+    # permission except that scoped reviewer action.
+    RoleDef("SUPER_ADMIN", "超级管理员", True, _SUPER_ADMIN_PERMISSIONS),
     RoleDef(
         "GROUP_HR",
         "集团HR",
@@ -97,7 +122,17 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.STRUCTURE_WRITE,
             Perm.ATTENDANCE_READ,
             Perm.ATTENDANCE_WRITE,
+            Perm.ATTENDANCE_SCHEDULE_READ,
+            Perm.ATTENDANCE_SCHEDULE_WRITE,
+            Perm.ATTENDANCE_EXPECTED_DAYS_ADJUST,
+            Perm.HOLIDAY_CALENDAR_READ,
+            Perm.HOLIDAY_CALENDAR_WRITE,
+            Perm.POLICY_READ,
+            Perm.POLICY_WRITE,
             Perm.PAYROLL_READ,
+            Perm.PAYROLL_RUN,
+            Perm.PAYROLL_APPROVE,
+            Perm.PAYROLL_CORRECT,
             Perm.ADJUSTMENT_READ,
             Perm.ADJUSTMENT_CREATE,
             Perm.ADJUSTMENT_APPROVE,
@@ -121,6 +156,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.ATTENDANCE_READ,
             Perm.ATTENDANCE_WRITE,
             Perm.PAYROLL_READ,
+            Perm.PAYROLL_REVIEW,
             Perm.ADJUSTMENT_READ,
             Perm.ADJUSTMENT_CREATE,
             Perm.BUDGET_READ,
@@ -136,6 +172,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.EMPLOYEE_READ,
             Perm.ATTENDANCE_READ,
             Perm.ATTENDANCE_WRITE,
+            Perm.PAYROLL_READ,
+            Perm.PAYROLL_REVIEW,
             Perm.DASHBOARD_READ,
             Perm.SALARY_READ,
         ),
@@ -147,7 +185,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
         (
             Perm.PAYROLL_READ,
             Perm.PAYROLL_RUN,
-            Perm.PAYROLL_APPROVE,
+            Perm.POLICY_READ,
             Perm.DASHBOARD_READ,
             Perm.EXPORT_DATA,
             Perm.SALARY_READ,

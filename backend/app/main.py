@@ -1,18 +1,31 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.audit.middleware import ClientIpMiddleware
 from app.auth.router import router as auth_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
+from app.db.session import engine
 from app.routers.attendance import router as attendance_router
+from app.routers.attendance_schedule import router as attendance_schedule_router
+from app.routers.audit import router as audit_router
+from app.routers.batch import router as batch_router
+from app.routers.budget import router as budget_router
 from app.routers.comp import router as comp_router
 from app.routers.comp import structure_router
+from app.routers.dashboard import router as dashboard_router
 from app.routers.employee import router as employee_router
+from app.routers.export import router as export_router
 from app.routers.grade import router as grade_router
+from app.routers.holiday import router as holiday_router
 from app.routers.imports import router as imports_router
 from app.routers.imports import salary_router
 from app.routers.org import router as org_router
 from app.routers.payroll import router as payroll_router
+from app.routers.payroll_policy import router as payroll_policy_router
+from app.routers.payslip import router as payslip_router
+from app.routers.users import router as users_router
 
 
 def create_app() -> FastAPI:
@@ -35,6 +48,20 @@ def create_app() -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/health/ready")
+    @app.get("/api/health/ready")
+    def readiness() -> dict[str, str]:
+        """Only report ready when the authoritative payroll database is reachable."""
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+        except SQLAlchemyError:
+            # Do not leak database topology or credentials through an unauthenticated
+            # operational endpoint.  The non-2xx response makes container orchestration
+            # remove this instance from service until its database dependency recovers.
+            raise HTTPException(status_code=503, detail="Database is unavailable.") from None
+        return {"status": "ok"}
+
     app.include_router(auth_router)
     app.include_router(org_router)
     app.include_router(employee_router)
@@ -44,7 +71,17 @@ def create_app() -> FastAPI:
     app.include_router(comp_router)
     app.include_router(structure_router)
     app.include_router(attendance_router)
+    app.include_router(attendance_schedule_router)
+    app.include_router(holiday_router)
+    app.include_router(payroll_policy_router)
+    app.include_router(audit_router)
+    app.include_router(budget_router)
+    app.include_router(dashboard_router)
+    app.include_router(export_router)
     app.include_router(payroll_router)
+    app.include_router(payslip_router)
+    app.include_router(batch_router)
+    app.include_router(users_router)
     get_logger("app").info("应用已启动", extra={"context": {"app": settings.app_name}})
     return app
 
