@@ -20,6 +20,7 @@ from app.payroll.engine import (
 from app.payroll.social_tax import (
     ContributionKind,
     ContributionRule,
+    DerivedIncomeRule,
     PayrollPolicyContext,
     SocialInsurancePolicyInput,
     TaxBracket,
@@ -125,7 +126,7 @@ def test_engine_applies_policy_bases_personal_and_employer_contributions_and_cum
 ):
     result = compute(_input())
 
-    assert result.rule_version == "v3"
+    assert result.rule_version == "v4"
     assert _line(result, "SOCIAL_PENSION_EMPLOYEE").amount == Decimal("-1000.00")
     assert _line(result, "HOUSING_FUND_EMPLOYEE").amount == Decimal("-500.00")
     assert _line(result, "SOCIAL_PENSION_EMPLOYER").amount == Decimal("2000.00")
@@ -147,12 +148,37 @@ def test_policy_enabled_payroll_blocks_a_deposit_shortfall_instead_of_deferring_
     assert any("defer" in message.lower() for message in result.exceptions)
 
 
+def test_policy_uses_explicit_derived_holiday_income_flags() -> None:
+    base_policy = _policy()
+    policy = PayrollPolicyContext(
+        policy_id=base_policy.policy_id,
+        city=base_policy.city,
+        effective_from=base_policy.effective_from,
+        social_policy=base_policy.social_policy,
+        tax_policy=base_policy.tax_policy,
+        derived_income_rules=(
+            DerivedIncomeRule(
+                code="HOLIDAY",
+                taxable=True,
+                in_social_base=False,
+                in_housing_base=False,
+            ),
+        ),
+    )
+
+    result = compute(_input(payroll_policy=policy, statutory_holiday_days=Decimal("1")))
+
+    assert result.has_error is False
+    assert result.tax_state is not None
+    assert result.tax_state.current_taxable_income == Decimal("10150.00")
+
+
 def test_policy_and_tax_context_round_trip_through_the_immutable_input_snapshot() -> None:
     original = _input()
 
     snapshot = batch_service._input_snapshot(original, [])
     restored, missing = batch_service._input_from_snapshot(
-        SimpleNamespace(rule_version="v3", input_snapshot=snapshot), {}
+        SimpleNamespace(rule_version="v4", input_snapshot=snapshot), {}
     )
 
     assert missing == []
