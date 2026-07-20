@@ -7,6 +7,7 @@ from app.auth.bootstrap import seed_rbac
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserRole
+from app.models.payroll_batch import BatchStatus, PayrollBatch
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -103,6 +104,20 @@ def _body(*, city: str = "广州", effective_from: str = "2026-01-01") -> dict:
             {"upper_bound": "144000", "rate": "0.1", "quick_deduction": "2520"},
             {"upper_bound": None, "rate": "0.2", "quick_deduction": "16920"},
         ],
+        "derived_income_rules": [
+            {
+                "code": "OVERTIME",
+                "taxable": True,
+                "in_social_base": True,
+                "in_housing_base": False,
+            },
+            {
+                "code": "HOLIDAY",
+                "taxable": True,
+                "in_social_base": False,
+                "in_housing_base": False,
+            },
+        ],
     }
 
 
@@ -114,6 +129,7 @@ def test_group_hr_can_create_finalize_and_resolve_an_effective_payroll_policy(cl
     assert created.status_code == 201, created.text
     policy_id = created.json()["id"]
     assert created.json()["is_finalized"] is False
+    assert created.json()["derived_income_rules"] == _body()["derived_income_rules"]
     finalized = client.post(f"/api/payroll-policies/{policy_id}/finalize", headers=headers)
     assert finalized.status_code == 200, finalized.text
     assert finalized.json()["is_finalized"] is True
@@ -134,7 +150,10 @@ def test_finalized_policy_is_immutable_and_a_newer_effective_policy_wins(client,
     _user(db_session, "hr", ["GROUP_HR"])
     headers = _token(client, "hr")
     first = client.post("/api/payroll-policies", headers=headers, json=_body()).json()
-    assert client.post(f"/api/payroll-policies/{first['id']}/finalize", headers=headers).status_code == 200
+    assert (
+        client.post(f"/api/payroll-policies/{first['id']}/finalize", headers=headers).status_code
+        == 200
+    )
 
     changed_draft = client.post(
         "/api/payroll-policies",
@@ -143,7 +162,10 @@ def test_finalized_policy_is_immutable_and_a_newer_effective_policy_wins(client,
     )
     assert changed_draft.status_code == 201
     second = changed_draft.json()
-    assert client.post(f"/api/payroll-policies/{second['id']}/finalize", headers=headers).status_code == 200
+    assert (
+        client.post(f"/api/payroll-policies/{second['id']}/finalize", headers=headers).status_code
+        == 200
+    )
 
     assert (
         client.patch(
@@ -162,6 +184,36 @@ def test_finalized_policy_is_immutable_and_a_newer_effective_policy_wins(client,
     assert resolved.json()["id"] == second["id"]
 
 
+def test_reopened_current_batch_allows_an_explicit_successor_policy(client, db_session):
+    _user(db_session, "hr", ["GROUP_HR"])
+    headers = _token(client, "hr")
+    original = client.post("/api/payroll-policies", headers=headers, json=_body()).json()
+    assert client.post(f"/api/payroll-policies/{original['id']}/finalize", headers=headers).status_code == 200
+    db_session.add(
+        PayrollBatch(
+            period="2026-05",
+            attendance_start=date(2026, 5, 1),
+            attendance_end=date(2026, 5, 31),
+            status=BatchStatus.DRAFT,
+            version=2,
+        )
+    )
+    db_session.flush()
+
+    successor = client.post(
+        "/api/payroll-policies",
+        headers=headers,
+        json=_body(effective_from="2026-05-01"),
+    )
+    assert successor.status_code == 201, successor.text
+
+    finalized = client.post(
+        f"/api/payroll-policies/{successor.json()['id']}/finalize", headers=headers
+    )
+
+    assert finalized.status_code == 200, finalized.text
+
+
 def test_policy_api_requires_policy_permissions_and_rejects_duplicate_city_effective_date(
     client, db_session
 ):
@@ -171,6 +223,9 @@ def test_policy_api_requires_policy_permissions_and_rejects_duplicate_city_effec
     hr_headers = _token(client, "hr")
 
     assert client.get("/api/payroll-policies", headers=employee_headers).status_code == 403
-    assert client.post("/api/payroll-policies", headers=employee_headers, json=_body()).status_code == 403
+    assert (
+        client.post("/api/payroll-policies", headers=employee_headers, json=_body()).status_code
+        == 403
+    )
     assert client.post("/api/payroll-policies", headers=hr_headers, json=_body()).status_code == 201
     assert client.post("/api/payroll-policies", headers=hr_headers, json=_body()).status_code == 409
