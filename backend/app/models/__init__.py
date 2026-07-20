@@ -14,6 +14,14 @@ from app.models.employee import Employee, EmployeeStatus, EmploymentType
 from app.models.grade import JobGrade, SalaryBand
 from app.models.org import OrgType, OrgUnit
 from app.models.period import PayPeriod, PeriodStatus
+from app.models.salary import (
+    ImportBatch,
+    ImportStagingRow,
+    ImportStatus,
+    RowStatus,
+    SalaryRecord,
+    SalarySource,
+)
 
 __all__ = [
     "OrgUnit",
@@ -33,4 +41,10 @@ __all__ = [
     "UserOrgScope",
     "RefreshToken",
     "AuditLog",
+    "SalaryRecord",
+    "SalarySource",
+    "ImportBatch",
+    "ImportStagingRow",
+    "ImportStatus",
+    "RowStatus",
 ]

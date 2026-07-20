@@ -6,6 +6,8 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.routers.employee import router as employee_router
 from app.routers.grade import router as grade_router
+from app.routers.imports import router as imports_router
+from app.routers.imports import salary_router
 from app.routers.org import router as org_router
 
 
@@ -33,6 +35,8 @@ def create_app() -> FastAPI:
     app.include_router(org_router)
     app.include_router(employee_router)
     app.include_router(grade_router)
+    app.include_router(imports_router)
+    app.include_router(salary_router)
     get_logger("app").info("应用已启动", extra={"context": {"app": settings.app_name}})
     return app
 

@@ -32,6 +32,8 @@ class Perm:
     BUDGET_WRITE = "budget:write"
     DASHBOARD_READ = "dashboard:read"
     EXPORT_DATA = "export:data"
+    IMPORT_RUN = "import:run"
+    SALARY_READ = "salary:read"
     AUDIT_READ = "audit:read"
     USER_MANAGE = "user:manage"
     PAYSLIP_READ_SELF = "payslip:read:self"
@@ -59,6 +61,8 @@ PERMISSION_CATALOG: dict[str, str] = {
     Perm.BUDGET_WRITE: "维护预算",
     Perm.DASHBOARD_READ: "查看看板",
     Perm.EXPORT_DATA: "导出数据",
+    Perm.IMPORT_RUN: "导入薪资数据",
+    Perm.SALARY_READ: "查询薪资记录",
     Perm.AUDIT_READ: "查看审计日志",
     Perm.USER_MANAGE: "用户与权限管理",
     Perm.PAYSLIP_READ_SELF: "查看本人工资条",
@@ -101,6 +105,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.BUDGET_WRITE,
             Perm.DASHBOARD_READ,
             Perm.EXPORT_DATA,
+            Perm.IMPORT_RUN,
+            Perm.SALARY_READ,
         ),
     ),
     RoleDef(
@@ -119,6 +125,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.ADJUSTMENT_CREATE,
             Perm.BUDGET_READ,
             Perm.DASHBOARD_READ,
+            Perm.SALARY_READ,
         ),
     ),
     RoleDef(
@@ -130,6 +137,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.ATTENDANCE_READ,
             Perm.ATTENDANCE_WRITE,
             Perm.DASHBOARD_READ,
+            Perm.SALARY_READ,
         ),
     ),
     RoleDef(
@@ -142,6 +150,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.PAYROLL_APPROVE,
             Perm.DASHBOARD_READ,
             Perm.EXPORT_DATA,
+            Perm.SALARY_READ,
         ),
     ),
     # AUDIT_READ 本身以 :read 结尾，已包含在 _ALL_READ 中
