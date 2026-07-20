@@ -17,6 +17,7 @@ const MENU: MenuDef[] = [
   { key: 'org', label: '组织', permission: Perm.ORG_READ },
   { key: 'employees', label: '员工', permission: Perm.EMPLOYEE_READ },
   { key: 'grades', label: '职级薪档', permission: Perm.GRADE_READ },
+  { key: 'components', label: '薪资组件', permission: 'salary_structure:read' },
   { key: 'attendance', label: '考勤', permission: Perm.ATTENDANCE_READ },
   { key: 'payroll', label: '核算', permission: Perm.PAYROLL_READ },
   { key: 'adjustment', label: '调薪', permission: Perm.ADJUSTMENT_READ },

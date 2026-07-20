@@ -10,6 +10,11 @@ from app.models.auth import (
     UserOrgScope,
     UserRole,
 )
+from app.models.comp import (
+    ComponentType,
+    EmployeeSalaryStructure,
+    SalaryComponentDef,
+)
 from app.models.employee import Employee, EmployeeStatus, EmploymentType
 from app.models.grade import JobGrade, SalaryBand
 from app.models.org import OrgType, OrgUnit
@@ -47,4 +52,7 @@ __all__ = [
     "ImportStagingRow",
     "ImportStatus",
     "RowStatus",
+    "SalaryComponentDef",
+    "EmployeeSalaryStructure",
+    "ComponentType",
 ]

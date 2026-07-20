@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Outlet, Route, Routes } from 'react-router-dom
 import { AuthProvider } from './auth/AuthContext'
 import { ProtectedRoute } from './auth/ProtectedRoute'
 import { AppShell } from './components/AppShell'
+import ComponentsPage from './pages/ComponentsPage'
 import EmployeesPage from './pages/EmployeesPage'
 import GradesPage from './pages/GradesPage'
 import Home from './pages/Home'
@@ -32,6 +33,7 @@ export default function App() {
             <Route path="/org" element={<OrgTreePage />} />
             <Route path="/employees" element={<EmployeesPage />} />
             <Route path="/grades" element={<GradesPage />} />
+            <Route path="/components" element={<ComponentsPage />} />
             <Route path="/attendance" element={<Placeholder title="考勤" />} />
             <Route path="/payroll" element={<Placeholder title="核算" />} />
             <Route path="/adjustment" element={<Placeholder title="调薪" />} />

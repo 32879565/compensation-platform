@@ -4,6 +4,8 @@ from app.audit.middleware import ClientIpMiddleware
 from app.auth.router import router as auth_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
+from app.routers.comp import router as comp_router
+from app.routers.comp import structure_router
 from app.routers.employee import router as employee_router
 from app.routers.grade import router as grade_router
 from app.routers.imports import router as imports_router
@@ -37,6 +39,8 @@ def create_app() -> FastAPI:
     app.include_router(grade_router)
     app.include_router(imports_router)
     app.include_router(salary_router)
+    app.include_router(comp_router)
+    app.include_router(structure_router)
     get_logger("app").info("应用已启动", extra={"context": {"app": settings.app_name}})
     return app
 
