@@ -137,7 +137,7 @@ def test_cumulative_tax_withholding_uses_ytd_inputs_and_crosses_a_bracket() -> N
     result = calculate_cumulative_tax(
         policy=_tax_policy(),
         input=CumulativeTaxInput(
-            month=2,
+            employment_months=2,
             ytd_taxable_income_before=Decimal("10000"),
             ytd_employee_contribution_before=Decimal("1000"),
             ytd_special_deduction_before=Decimal("1000"),
@@ -178,7 +178,7 @@ def test_cumulative_tax_uses_the_lower_bracket_at_its_exact_boundary() -> None:
     result = calculate_cumulative_tax(
         policy=_tax_policy(),
         input=CumulativeTaxInput(
-            month=1,
+            employment_months=1,
             ytd_taxable_income_before=Decimal("0"),
             ytd_employee_contribution_before=Decimal("0"),
             ytd_special_deduction_before=Decimal("0"),
@@ -197,7 +197,7 @@ def test_cumulative_tax_never_creates_a_negative_monthly_withholding() -> None:
     result = calculate_cumulative_tax(
         policy=_tax_policy(),
         input=CumulativeTaxInput(
-            month=1,
+            employment_months=1,
             ytd_taxable_income_before=Decimal("0"),
             ytd_employee_contribution_before=Decimal("0"),
             ytd_special_deduction_before=Decimal("0"),
@@ -211,12 +211,12 @@ def test_cumulative_tax_never_creates_a_negative_monthly_withholding() -> None:
     assert result.current_withholding == Decimal("0.00")
 
 
-def test_cumulative_tax_rejects_an_invalid_month_or_unsorted_brackets() -> None:
-    with pytest.raises(PolicyValidationError, match="month"):
+def test_cumulative_tax_rejects_invalid_employment_months_or_unsorted_brackets() -> None:
+    with pytest.raises(PolicyValidationError, match="employment_months"):
         calculate_cumulative_tax(
             policy=_tax_policy(),
             input=CumulativeTaxInput(
-                month=13,
+                employment_months=13,
                 ytd_taxable_income_before=Decimal("0"),
                 ytd_employee_contribution_before=Decimal("0"),
                 ytd_special_deduction_before=Decimal("0"),
@@ -242,7 +242,7 @@ def test_cumulative_tax_rejects_an_invalid_month_or_unsorted_brackets() -> None:
         calculate_cumulative_tax(
             policy=unsorted,
             input=CumulativeTaxInput(
-                month=1,
+                employment_months=1,
                 ytd_taxable_income_before=Decimal("0"),
                 ytd_employee_contribution_before=Decimal("0"),
                 ytd_special_deduction_before=Decimal("0"),

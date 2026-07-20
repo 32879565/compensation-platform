@@ -90,6 +90,7 @@ class TaxYearToDate:
     employee_contribution_before: Decimal = ZERO
     special_deduction_before: Decimal = ZERO
     tax_withheld_before: Decimal = ZERO
+    employment_months_before: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ class TaxWithholdingState:
     current_tax_withheld: Decimal
     cumulative_taxable_income: Decimal
     cumulative_tax_due: Decimal
+    employment_months_to_date: int
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,10 @@ class EmployeeInput:
     payroll_policy: PayrollPolicyContext | None = None
     monthly_special_deduction: Decimal = ZERO
     tax_ytd: TaxYearToDate = TaxYearToDate()
+    # Derived by the service from the employee's employment start and retained
+    # in the input snapshot.  It must never be inferred from the calendar
+    # month because a mid-year hire has fewer basic deductions.
+    tax_employment_months: int | None = None
     # 服务层遇到缺少/损坏的外部输入配置时，将确定的阻断原因传给纯引擎，
     # 保证批次仍可写出可审计的异常结果而不是吞掉该员工。
     source_exceptions: tuple[str, ...] = ()
@@ -668,16 +674,15 @@ def _compute_v3(inp: EmployeeInput, cfg: RuleConfig) -> PayrollResult:
                             f"{policy.city}政策基数×单位费率",
                             contribution.employer_amount,
                         )
-                try:
-                    month = int(inp.period.split("-")[1])
-                except (IndexError, ValueError) as exc:
+                employment_months = inp.tax_employment_months
+                if employment_months is None:
                     raise PolicyValidationError(
-                        "payroll period must contain a valid month"
-                    ) from exc
+                        "employment-month count is required for cumulative withholding"
+                    )
                 tax_result = calculate_cumulative_tax(
                     policy=policy.tax_policy,
                     input=CumulativeTaxInput(
-                        month=month,
+                        employment_months=employment_months,
                         ytd_taxable_income_before=inp.tax_ytd.taxable_income_before,
                         ytd_employee_contribution_before=inp.tax_ytd.employee_contribution_before,
                         ytd_special_deduction_before=inp.tax_ytd.special_deduction_before,
@@ -702,6 +707,7 @@ def _compute_v3(inp: EmployeeInput, cfg: RuleConfig) -> PayrollResult:
                     current_tax_withheld=tax_withholding,
                     cumulative_taxable_income=tax_result.cumulative_taxable_income,
                     cumulative_tax_due=tax_result.cumulative_tax_due,
+                    employment_months_to_date=employment_months,
                 )
             except PolicyValidationError as exc:
                 res.exceptions.append(f"Payroll policy calculation is invalid: {exc}")

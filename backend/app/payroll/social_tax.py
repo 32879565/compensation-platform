@@ -87,7 +87,15 @@ class PayrollPolicyContext:
 
 @dataclass(frozen=True)
 class CumulativeTaxInput:
-    month: int
+    """Cumulative tax facts for one payroll result.
+
+    ``employment_months`` is deliberately supplied by the payroll service
+    rather than inferred from the calendar period.  The deduction rule is
+    based on the employee's months of employment with this withholding unit;
+    a May hire therefore has one eligible monthly deduction, not five.
+    """
+
+    employment_months: int
     ytd_taxable_income_before: Decimal
     ytd_employee_contribution_before: Decimal
     ytd_special_deduction_before: Decimal
@@ -217,11 +225,11 @@ def _validated_tax_brackets(policy: TaxPolicyInput) -> tuple[TaxBracket, ...]:
 
 def _validated_tax_input(input: CumulativeTaxInput) -> None:
     if (
-        isinstance(input.month, bool)
-        or not isinstance(input.month, int)
-        or not 1 <= input.month <= 12
+        isinstance(input.employment_months, bool)
+        or not isinstance(input.employment_months, int)
+        or not 1 <= input.employment_months <= 12
     ):
-        raise PolicyValidationError("month must be an integer from 1 to 12.")
+        raise PolicyValidationError("employment_months must be an integer from 1 to 12.")
     for name in (
         "ytd_taxable_income_before",
         "ytd_employee_contribution_before",
@@ -261,7 +269,7 @@ def calculate_cumulative_tax(
         - input.current_employee_contribution
         - input.ytd_special_deduction_before
         - input.current_special_deduction
-        - policy.monthly_basic_deduction * input.month,
+        - policy.monthly_basic_deduction * input.employment_months,
     )
     cumulative_taxable_income = _q(cumulative_taxable_income)
     bracket = _tax_bracket_for(cumulative_taxable_income, brackets)

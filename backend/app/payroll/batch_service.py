@@ -131,6 +131,12 @@ def _snapshot_bool(value: object, field: str) -> bool:
     return value
 
 
+def _snapshot_int(value: object, field: str, *, minimum: int = 0, maximum: int = 12) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise BatchError(f"Persisted input snapshot has an invalid integer for {field}.")
+    return value
+
+
 def _payroll_tax_snapshot(inp: EmployeeInput) -> dict[str, object] | None:
     """Serialize the selected policy and cumulative inputs without live DB pointers."""
 
@@ -163,22 +169,24 @@ def _payroll_tax_snapshot(inp: EmployeeInput) -> dict[str, object] | None:
             for bracket in policy.tax_policy.brackets
         ],
         "monthly_special_deduction": str(inp.monthly_special_deduction),
+        "employment_months": inp.tax_employment_months,
         "ytd": {
             "taxable_income_before": str(inp.tax_ytd.taxable_income_before),
             "employee_contribution_before": str(inp.tax_ytd.employee_contribution_before),
             "special_deduction_before": str(inp.tax_ytd.special_deduction_before),
             "tax_withheld_before": str(inp.tax_ytd.tax_withheld_before),
+            "employment_months_before": inp.tax_ytd.employment_months_before,
         },
     }
 
 
 def _payroll_tax_from_snapshot(
     value: object,
-) -> tuple[PayrollPolicyContext | None, Decimal, TaxYearToDate]:
+) -> tuple[PayrollPolicyContext | None, Decimal, TaxYearToDate, int | None]:
     """Restore a v3 context; a missing field deliberately means a v2 snapshot."""
 
     if value is None:
-        return None, Decimal("0"), TaxYearToDate()
+        return None, Decimal("0"), TaxYearToDate(), None
     if not isinstance(value, Mapping):
         raise BatchError("The persisted input snapshot has an invalid payroll tax context.")
     social_rules = value.get("social_rules")
@@ -262,13 +270,19 @@ def _payroll_tax_from_snapshot(
             tax_withheld_before=_snapshot_decimal(
                 ytd["tax_withheld_before"], "tax_ytd.tax_withheld_before"
             ),
+            employment_months_before=_snapshot_int(
+                ytd["employment_months_before"], "tax_ytd.employment_months_before"
+            ),
         )
         special = _snapshot_decimal(value["monthly_special_deduction"], "monthly_special_deduction")
+        employment_months = _snapshot_int(
+            value["employment_months"], "tax_employment_months", minimum=1
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise BatchError(
             "The persisted input snapshot has an invalid payroll tax context."
         ) from exc
-    return policy, special, tax_ytd
+    return policy, special, tax_ytd, employment_months
 
 
 def _input_snapshot(inp: EmployeeInput, missing_component_ids: list[int]) -> dict:
@@ -335,7 +349,7 @@ def _input_snapshot(inp: EmployeeInput, missing_component_ids: list[int]) -> dic
     }
 
 
-def _tax_withholding_snapshot(res: EngineResult) -> dict[str, str] | None:
+def _tax_withholding_snapshot(res: EngineResult) -> dict[str, str | int] | None:
     """Persist structured tax facts; never make later periods parse display lines."""
 
     state = getattr(res, "tax_state", None)
@@ -348,6 +362,7 @@ def _tax_withholding_snapshot(res: EngineResult) -> dict[str, str] | None:
         "current_tax_withheld": str(state.current_tax_withheld),
         "cumulative_taxable_income": str(state.cumulative_taxable_income),
         "cumulative_tax_due": str(state.cumulative_tax_due),
+        "employment_months_to_date": state.employment_months_to_date,
     }
 
 
@@ -419,8 +434,8 @@ def _input_from_snapshot(
     if not isinstance(raw_structure, list):
         raise BatchError("The persisted input snapshot has no salary structure.")
     try:
-        payroll_policy, monthly_special_deduction, tax_ytd = _payroll_tax_from_snapshot(
-            snapshot.get("payroll_tax")
+        payroll_policy, monthly_special_deduction, tax_ytd, tax_employment_months = (
+            _payroll_tax_from_snapshot(snapshot.get("payroll_tax"))
         )
         structure = [
             StructureComponent(
@@ -497,6 +512,7 @@ def _input_from_snapshot(
             payroll_policy=payroll_policy,
             monthly_special_deduction=monthly_special_deduction,
             tax_ytd=tax_ytd,
+            tax_employment_months=tax_employment_months,
             source_exceptions=tuple(str(value) for value in snapshot.get("source_exceptions", [])),
         )
         missing_component_ids = [

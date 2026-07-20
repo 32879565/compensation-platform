@@ -108,7 +108,9 @@ def _input(**overrides: object) -> EmployeeInput:
             employee_contribution_before=Decimal("1000"),
             special_deduction_before=Decimal("0"),
             tax_withheld_before=Decimal("900"),
+            employment_months_before=1,
         ),
+        "tax_employment_months": 2,
     }
     values.update(overrides)
     return EmployeeInput(**values)
@@ -157,6 +159,7 @@ def test_policy_and_tax_context_round_trip_through_the_immutable_input_snapshot(
     assert restored.payroll_policy == original.payroll_policy
     assert restored.monthly_special_deduction == Decimal("500")
     assert restored.tax_ytd == original.tax_ytd
+    assert restored.tax_employment_months == 2
     assert restored.structure[0].taxable is True
     assert restored.structure[0].in_social_base is True
     assert restored.structure[0].in_housing_base is True
