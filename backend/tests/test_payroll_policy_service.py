@@ -7,6 +7,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from app.payroll import service
+from app.payroll.engine import TaxYearToDate
 from app.payroll.social_tax import ContributionKind
 
 
@@ -79,9 +80,12 @@ def test_select_effective_policy_ignores_drafts_and_future_versions() -> None:
     )
 
     assert chosen is january
-    assert service._select_effective_policy(
-        [january, april_draft, june], city="深圳", on_date=date(2026, 5, 1)
-    ) is None
+    assert (
+        service._select_effective_policy(
+            [january, april_draft, june], city="深圳", on_date=date(2026, 5, 1)
+        )
+        is None
+    )
 
 
 def test_locked_tax_ytd_uses_latest_result_per_batch_and_structured_snapshot() -> None:
@@ -140,3 +144,16 @@ def test_employment_months_start_with_the_hire_month_not_january() -> None:
 
     assert service._tax_employment_months_to_date(employee, date(2026, 5, 1)) == 1
     assert service._tax_employment_months_to_date(employee, date(2026, 7, 1)) == 3
+
+
+def test_tax_history_requires_every_prior_employment_month_or_an_opening_balance() -> None:
+    assert service._tax_history_coverage_error(TaxYearToDate(), employment_months=1) is None
+    assert service._tax_history_coverage_error(
+        TaxYearToDate(employment_months_before=4), employment_months=5
+    ) is None
+    assert service._tax_history_coverage_error(
+        TaxYearToDate(employment_months_before=1), employment_months=3
+    ) == (
+        "Locked tax history does not cover every prior employment month; "
+        "an audited opening balance or correction is required."
+    )
