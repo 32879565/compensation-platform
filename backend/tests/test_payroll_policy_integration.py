@@ -200,3 +200,55 @@ def test_v2_snapshot_without_policy_context_remains_recomputable() -> None:
     assert result.actual_attendance_days == Decimal("17.00")
     assert result.gross == Decimal("1800.00")
     assert result.has_error is False
+
+
+def test_v3_policy_snapshot_keeps_its_calendar_month_deduction_basis() -> None:
+    """v4's employment-month input must not reinterpret a locked v3 result."""
+
+    legacy_policy = PayrollPolicyContext(
+        policy_id=43,
+        city="广州",
+        effective_from=date(2026, 1, 1),
+        social_policy=_policy().social_policy,
+        tax_policy=TaxPolicyInput(
+            monthly_basic_deduction=Decimal("5000"),
+            brackets=(
+                TaxBracket(
+                    upper_bound=Decimal("36000"), rate=Decimal("0.03"), quick_deduction=Decimal("0")
+                ),
+                TaxBracket(upper_bound=None, rate=Decimal("0.10"), quick_deduction=Decimal("2520")),
+            ),
+        ),
+    )
+    legacy = _input(
+        period="2026-05",
+        payroll_policy=legacy_policy,
+        tax_ytd=TaxYearToDate(),
+        tax_employment_months=None,
+        structure=[
+            StructureComponent(
+                code="COMP",
+                component_type=ComponentType.COMPREHENSIVE,
+                amount=Decimal("20000"),
+                taxable=True,
+                in_social_base=True,
+                in_housing_base=True,
+            )
+        ],
+    )
+    snapshot = batch_service._input_snapshot(legacy, [])
+    policy_snapshot = snapshot["payroll_tax"]
+    assert isinstance(policy_snapshot, dict)
+    policy_snapshot.pop("employment_months")
+    ytd_snapshot = policy_snapshot["ytd"]
+    assert isinstance(ytd_snapshot, dict)
+    ytd_snapshot.pop("employment_months_before")
+
+    result, _snapshot = batch_service._recompute_result_from_snapshot(
+        SimpleNamespace(rule_version="v3", input_snapshot=snapshot), {}
+    )
+
+    assert result.rule_version == "v3"
+    assert result.has_error is False
+    assert result.tax_state is not None
+    assert result.tax_state.current_tax_withheld == Decimal("0.00")
