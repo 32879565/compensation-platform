@@ -187,3 +187,15 @@ def test_audited_opening_cannot_predate_the_employee_hire_month() -> None:
     assert service._tax_opening_coverage_error(opening, employee) == (
         "Audited tax opening cannot predate the employee hire month."
     )
+
+
+def test_locked_tax_history_requires_every_period_after_an_audited_opening() -> None:
+    employee = SimpleNamespace(hire_date=date(2026, 1, 1))
+    opening = SimpleNamespace(through_period="2026-02")
+
+    assert service._tax_history_period_coverage_error(
+        employee=employee,
+        on_date=date(2026, 5, 1),
+        opening=opening,
+        locked_periods={"2026-04"},
+    ) == "Locked tax history is missing employment period 2026-03."
