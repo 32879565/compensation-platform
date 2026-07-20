@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -14,6 +14,7 @@ from app.payroll.engine import (
     EmployeeInput,
     RuleConfig,
     StructureComponent,
+    TaxOpeningProvenance,
     TaxYearToDate,
     compute,
 )
@@ -80,6 +81,14 @@ def _policy() -> PayrollPolicyContext:
                 ),
             ),
         ),
+        derived_income_rules=(
+            DerivedIncomeRule(
+                code="OVERTIME",
+                taxable=True,
+                in_social_base=True,
+                in_housing_base=False,
+            ),
+        ),
     )
 
 
@@ -112,6 +121,15 @@ def _input(**overrides: object) -> EmployeeInput:
             employment_months_before=1,
         ),
         "tax_employment_months": 2,
+        "tax_opening": TaxOpeningProvenance(
+            opening_id=7,
+            revision=1,
+            tax_year=2026,
+            through_period="2026-01",
+            evidence_ref="migration://signed-ytd",
+            finalized_by=2,
+            finalized_at=datetime(2026, 2, 1, tzinfo=UTC),
+        ),
     }
     values.update(overrides)
     return EmployeeInput(**values)
@@ -186,6 +204,7 @@ def test_policy_and_tax_context_round_trip_through_the_immutable_input_snapshot(
     assert restored.monthly_special_deduction == Decimal("500")
     assert restored.tax_ytd == original.tax_ytd
     assert restored.tax_employment_months == 2
+    assert restored.tax_opening == original.tax_opening
     assert restored.structure[0].taxable is True
     assert restored.structure[0].in_social_base is True
     assert restored.structure[0].in_housing_base is True
