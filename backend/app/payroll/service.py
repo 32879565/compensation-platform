@@ -1,7 +1,8 @@
-"""把 DB 中的薪资结构/考勤/绩效装配成引擎输入并预览核算（不落库；落库在 S13）。"""
+"""把 DB 中的薪资结构/考勤/绩效装配成引擎 v2 输入并预览核算（不落库；落库在 S13c）。"""
 
 from __future__ import annotations
 
+import calendar
 from datetime import date
 from decimal import Decimal
 
@@ -9,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.comp.service import current_structure
-from app.models.attendance import AttendanceRecord, PerformanceRecord
+from app.models.attendance import AttendanceRecord
 from app.models.comp import SalaryComponentDef
 from app.models.employee import Employee
 from app.payroll.engine import (
@@ -27,6 +28,15 @@ def _period_start(period: str) -> date:
     return date(int(year), int(month), 1)
 
 
+def _days_in_month(period: str) -> Decimal:
+    year, month = (int(x) for x in period.split("-"))
+    return Decimal(calendar.monthrange(year, month)[1])
+
+
+def _same_period(d: date | None, period: str) -> bool:
+    return d is not None and f"{d.year:04d}-{d.month:02d}" == period
+
+
 def build_input(
     session: Session, employee: Employee, period: str
 ) -> tuple[EmployeeInput, list[int]]:
@@ -34,19 +44,24 @@ def build_input(
     on_date = _period_start(period)
     ess = current_structure(session, employee.id, on_date)
     comp_meta = {
-        cid: (code, ctype)
-        for cid, code, ctype in session.execute(
+        cid: (code, ctype, akind)
+        for cid, code, ctype, akind in session.execute(
             select(
                 SalaryComponentDef.id,
                 SalaryComponentDef.code,
                 SalaryComponentDef.component_type,
+                SalaryComponentDef.allowance_kind,
             ).where(SalaryComponentDef.id.in_({r.component_id for r in ess} or {0}))
         ).all()
     }
-    # 缺 def 的结构组件不得静默丢弃（会少发且不报错）；收集缺失 id 供 preview 报异常
     missing = sorted({r.component_id for r in ess if r.component_id not in comp_meta})
     structure = [
-        StructureComponent(comp_meta[r.component_id][0], comp_meta[r.component_id][1], r.amount)
+        StructureComponent(
+            comp_meta[r.component_id][0],
+            comp_meta[r.component_id][1],
+            r.amount,
+            comp_meta[r.component_id][2],
+        )
         for r in ess
         if r.component_id in comp_meta
     ]
@@ -60,29 +75,34 @@ def build_input(
         Attendance(
             expected_days=att.expected_days,
             actual_days=att.actual_days,
+            worked_hours=att.worked_hours,
+            rest_days=att.rest_days,
             overtime_hours=att.overtime_hours,
-            leave_days=att.leave_days,
+            holiday_worked_days=att.holiday_worked_days,
         )
         if att
         else None
     )
 
-    perf = session.scalars(
-        select(PerformanceRecord).where(
-            PerformanceRecord.employee_id == employee.id, PerformanceRecord.period == period
-        )
-    ).first()
+    is_new = _same_period(employee.hire_date, period)
+    is_hire_or_leave = is_new or _same_period(employee.leave_date, period)
+    # v2 简化：入职晚于周期首日则视为不享法定节假日（缺法定日历，属已知简化）
+    holiday_eligible = employee.hire_date is None or employee.hire_date <= on_date
 
     inp = EmployeeInput(
         employee_id=employee.id,
         period=period,
+        days_in_month=_days_in_month(period),
         employment_type=employee.employment_type,
+        department=employee.department,
+        is_special_position=employee.is_special_position,
         structure=structure,
         attendance=attendance,
-        performance_coefficient=perf.coefficient if perf else None,
-        # v1：试用期系数默认 1（试用期薪资通过结构生效日期化体现）；引擎已支持系数，
-        # 业务确认试用期口径后在此按 employee.probation_end 传入。
-        probation_coefficient=Decimal("1"),
+        # v2：法定节假日总天数需法定日历配置，暂缺→0（引擎已支持，配置后传入）
+        statutory_holiday_days=Decimal("0"),
+        holiday_eligible=holiday_eligible,
+        is_new_employee=is_new,
+        is_hire_or_leave_month=is_hire_or_leave,
     )
     return inp, missing
 
@@ -93,6 +113,5 @@ def preview(
     inp, missing = build_input(session, employee, period)
     result = compute(inp, cfg)
     if missing:
-        # 有结构组件无法解析（def 缺失）→ 报异常阻断出账，绝不静默少发
         result.exceptions.append(f"存在无法解析的薪资组件(id={missing})，已阻断出账")
     return result

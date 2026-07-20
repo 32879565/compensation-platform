@@ -59,13 +59,15 @@ def _setup_employee(session, with_attendance=True):
     emp = Employee(emp_no="E1", name="张三", org_unit_id=store.id)
     session.add(emp)
     session.flush()
-    base = SalaryComponentDef(code="BASE", name="基本", component_type=ComponentType.BASE)
-    session.add(base)
+    comp = SalaryComponentDef(
+        code="COMP", name="综合薪资", component_type=ComponentType.COMPREHENSIVE
+    )
+    session.add(comp)
     session.flush()
     set_component_amount(
         session,
         employee_id=emp.id,
-        component_id=base.id,
+        component_id=comp.id,
         amount=Decimal("5000"),
         effective_from=date(2026, 1, 1),
     )
@@ -90,9 +92,9 @@ def test_payroll_preview_full(client, db_session):
     assert r.status_code == 200
     body = r.json()
     assert body["has_error"] is False
-    assert body["gross"] == "5000.00"
-    assert body["rule_version"] == "v1"
-    assert any(li["code"] == "BASE" for li in body["lines"])
+    assert body["gross"] == "5000.00"  # 综合5000/应出勤22×实际22（OTHER 部门=应出勤−休息）
+    assert body["rule_version"] == "v2"
+    assert any(li["code"] == "ATTEND_WAGE" for li in body["lines"])
 
 
 def test_payroll_preview_missing_attendance_error(client, db_session):

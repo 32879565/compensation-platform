@@ -18,8 +18,7 @@ router = APIRouter(prefix="/api", tags=["payroll"])
 
 class LineItemOut(BaseModel):
     code: str
-    component_type: str
-    input_amount: Decimal
+    category: str
     formula: str
     amount: Decimal
 
@@ -28,8 +27,12 @@ class PreviewOut(BaseModel):
     employee_id: int
     period: str
     rule_version: str
+    actual_attendance_days: Decimal
     lines: list[LineItemOut]
     gross: Decimal
+    deposit: Decimal
+    net: Decimal
+    carry_forward: Decimal
     exceptions: list[str]
     has_error: bool
 
@@ -44,22 +47,20 @@ def payroll_preview(
     emp = EmployeeRepository(session, org_scope=principal_scope(principal)).get(employee_id)
     if emp is None:
         raise HTTPException(status_code=404, detail="员工不存在或不可见")
-    result = preview(session, emp, period)
+    r = preview(session, emp, period)
     return PreviewOut(
-        employee_id=result.employee_id,
-        period=result.period,
-        rule_version=result.rule_version,
+        employee_id=r.employee_id,
+        period=r.period,
+        rule_version=r.rule_version,
+        actual_attendance_days=r.actual_attendance_days,
         lines=[
-            LineItemOut(
-                code=li.code,
-                component_type=li.component_type.value,
-                input_amount=li.input_amount,
-                formula=li.formula,
-                amount=li.amount,
-            )
-            for li in result.lines
+            LineItemOut(code=li.code, category=li.category, formula=li.formula, amount=li.amount)
+            for li in r.lines
         ],
-        gross=result.gross,
-        exceptions=result.exceptions,
-        has_error=result.has_error,
+        gross=r.gross,
+        deposit=r.deposit,
+        net=r.net,
+        carry_forward=r.carry_forward,
+        exceptions=r.exceptions,
+        has_error=r.has_error,
     )

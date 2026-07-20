@@ -1,13 +1,18 @@
-"""薪资计算规则引擎（纯函数，确定性，逐项可追溯）。
+"""薪资计算规则引擎 v2（按业务规格 docs/payroll-batch-spec.md 的真实公式）。
 
-设计不变量：
-- 全程 Decimal，逐项 quantize(0.01, ROUND_HALF_UP)，禁 float。
-- 同输入 + 同规则版本 → 同输出（确定性）。
-- 每个组件产出一条 LineItem（组件→输入→公式→结果），供工资条与复核展开。
-- 缺输入/异常不静默：进 exceptions 并 has_error=True，S13 据此阻断出账。
+不变量：全程 Decimal、逐项 quantize(0.01, ROUND_HALF_UP)、确定性、逐项可追溯、
+缺输入进 exceptions 且 has_error 阻断出账。策略参数集中在 RuleConfig（版本化 v2）。
 
-策略参数集中在 RuleConfig（版本化、可审计）。默认规则 v1 的口径（出勤折算除数、
-加班倍数、每日工时、兼职工时来源、试用系数）均为可调策略，业务确认后调整（见蓝图开放问题）。
+核心公式：
+- 实际计薪出勤天数（两套标准，无最低工时，允许小数）：
+  · 非特殊岗位·厅面 = 出勤工时 ÷ 9；厨房 = 出勤工时 ÷ 9.5
+  · 特殊岗位 / 其他部门 = 应出勤天数 − 休息天数
+  · 上限：不超过当月天数
+- 出勤工资 = 综合薪资 ÷ 应出勤天数 × 实际计薪出勤天数
+- 法定节假日工资 = 3000 ÷ 应出勤 ×（出勤天数×3 + 未出勤天数×1）；入职晚于法定日不享
+- 房补：入离职当月按比例；否则 >15 天全额、≤15 天按出勤折算
+- 押金：新员工当月扣 600；应发不足扣则当月不发放、结转下月
+- 应发 = 出勤工资+加班+法定节假日+固定补贴+浮动补贴+房补+上月补发−上月补扣
 """
 
 from __future__ import annotations
@@ -15,32 +20,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 
-from app.models.comp import ComponentType
-from app.models.employee import EmploymentType
+from app.models.comp import AllowanceKind, ComponentType
+from app.models.employee import Department, EmploymentType
 
 _CENTS = Decimal("0.01")
 ZERO = Decimal("0")
 
 
 def q(value: Decimal) -> Decimal:
-    """量化到分，四舍五入（财务口径 ROUND_HALF_UP，非银行家舍入）。"""
     return value.quantize(_CENTS, rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)
 class RuleConfig:
-    version: str = "v1"
-    overtime_multiplier: Decimal = Decimal("1.5")  # 工作日加班倍数
+    version: str = "v2"
+    dining_divisor: Decimal = Decimal("9")  # 厅面：出勤工时÷9
+    kitchen_divisor: Decimal = Decimal("9.5")  # 厨房：出勤工时÷9.5
+    holiday_base: Decimal = Decimal("3000")  # 法定节假日固定基数
+    deposit_amount: Decimal = Decimal("600")  # 新员工押金
+    housing_full_threshold_days: Decimal = Decimal("15")  # 房补全额门槛
+    overtime_multiplier: Decimal = Decimal("1.5")
+    monthly_standard_days: Decimal = Decimal("21.75")
     hours_per_day: Decimal = Decimal("8")
-    monthly_standard_days: Decimal = Decimal("21.75")  # 月计薪标准天数（时薪折算用）
-    # 按出勤比例折算的组件类型（其余按全额）
-    prorate_types: frozenset[ComponentType] = frozenset(
-        {ComponentType.BASE, ComponentType.POSITION}
-    )
-    # 加班计算基数所用的组件类型
-    overtime_base_types: frozenset[ComponentType] = frozenset(
-        {ComponentType.BASE, ComponentType.POSITION}
-    )
 
 
 @dataclass(frozen=True)
@@ -48,34 +49,44 @@ class StructureComponent:
     code: str
     component_type: ComponentType
     amount: Decimal
+    allowance_kind: AllowanceKind | None = None
 
 
 @dataclass(frozen=True)
 class Attendance:
     expected_days: Decimal
-    actual_days: Decimal
+    actual_days: Decimal = ZERO
+    worked_hours: Decimal = ZERO
+    rest_days: Decimal = ZERO
     overtime_hours: Decimal = ZERO
-    leave_days: Decimal = ZERO
+    holiday_worked_days: Decimal = ZERO
 
 
 @dataclass(frozen=True)
 class EmployeeInput:
     employee_id: int
     period: str
+    days_in_month: Decimal
     employment_type: EmploymentType
+    department: Department
+    is_special_position: bool
     structure: list[StructureComponent]
     attendance: Attendance | None = None
     performance_coefficient: Decimal | None = None
-    probation_coefficient: Decimal = Decimal("1")  # 试用期系数，1 表示不打折
+    is_new_employee: bool = False  # 入职当月
+    is_hire_or_leave_month: bool = False  # 入职或离职当月（房补按比例）
+    holiday_eligible: bool = True  # 入职晚于法定日则 False
+    statutory_holiday_days: Decimal = ZERO  # 当月法定节假日总天数
+    prev_makeup: Decimal = ZERO  # 上月补发
+    prev_deduct: Decimal = ZERO  # 上月补扣
 
 
 @dataclass
 class LineItem:
     code: str
-    component_type: ComponentType
-    input_amount: Decimal
+    category: str
     formula: str
-    amount: Decimal  # 已量化
+    amount: Decimal
 
 
 @dataclass
@@ -83,131 +94,171 @@ class PayrollResult:
     employee_id: int
     period: str
     rule_version: str
+    actual_attendance_days: Decimal = ZERO
     lines: list[LineItem] = field(default_factory=list)
-    gross: Decimal = ZERO
+    gross: Decimal = ZERO  # 应发
+    deposit: Decimal = ZERO  # 本月实扣押金
+    net: Decimal = ZERO  # 实发（社保个税 S12 后补）
+    carry_forward: Decimal = ZERO  # 结转下月金额（工资不足扣押金时）
     exceptions: list[str] = field(default_factory=list)
 
     @property
     def has_error(self) -> bool:
         return bool(self.exceptions)
 
-
-def _attendance_ratio(att: Attendance) -> Decimal:
-    if att.expected_days <= 0:
-        return ZERO
-    ratio = att.actual_days / att.expected_days
-    return min(ratio, Decimal("1"))  # 超出部分按加班另算，不重复计入
+    def _add(self, code: str, category: str, formula: str, amount: Decimal) -> Decimal:
+        amt = q(amount)
+        self.lines.append(LineItem(code, category, formula, amt))
+        return amt
 
 
-def _overtime_base_monthly(cfg: RuleConfig, structure: list[StructureComponent]) -> Decimal:
-    return sum((c.amount for c in structure if c.component_type in cfg.overtime_base_types), ZERO)
+def _sum(structure: list[StructureComponent], ctype: ComponentType) -> Decimal:
+    return sum((c.amount for c in structure if c.component_type == ctype), ZERO)
 
 
-def _has_perf(structure: list[StructureComponent]) -> bool:
-    return any(c.component_type == ComponentType.PERFORMANCE for c in structure)
-
-
-def _append_other(res: PayrollResult, c: StructureComponent, perf_coeff: Decimal | None) -> None:
-    """非折算组件的统一处理（绩效/补贴/扣款），全职与兼职共用，避免口径分叉。"""
-    if c.component_type == ComponentType.PERFORMANCE:
-        if perf_coeff is None:
-            return  # 缺绩效系数异常已在上层记录
-        res.lines.append(
-            LineItem(
-                c.code, c.component_type, c.amount, "绩效基数×绩效系数", q(c.amount * perf_coeff)
-            )
-        )
-    elif c.component_type == ComponentType.DEDUCTION:
-        # -abs 保证扣款恒为负：即便误录成负数也不会二次取负变成加发
-        res.lines.append(LineItem(c.code, c.component_type, c.amount, "扣款", q(-abs(c.amount))))
-    else:
-        res.lines.append(LineItem(c.code, c.component_type, c.amount, "全额", q(c.amount)))
-
-
-def _compute_full_time(inp: EmployeeInput, cfg: RuleConfig, res: PayrollResult) -> None:
-    if inp.attendance is None:
-        res.exceptions.append("缺少考勤数据，无法核算")
-        return
+def _actual_attendance_days(inp: EmployeeInput, cfg: RuleConfig) -> Decimal:
     att = inp.attendance
-    if att.expected_days <= 0:
-        res.exceptions.append("应出勤天数为 0，无法折算")
-        return
-    ratio = _attendance_ratio(att)
-
-    has_performance_component = any(
-        c.component_type == ComponentType.PERFORMANCE for c in inp.structure
-    )
-    if has_performance_component and inp.performance_coefficient is None:
-        res.exceptions.append("缺少绩效系数，无法核算绩效")
-
-    for c in inp.structure:
-        if c.component_type in cfg.prorate_types:
-            amount = q(c.amount * ratio * inp.probation_coefficient)
-            # 试用系数=1 时不在公式里标注，避免"已按试用折算"的误导
-            label = "月额×出勤比×试用系数" if inp.probation_coefficient != 1 else "月额×出勤比"
-            res.lines.append(LineItem(c.code, c.component_type, c.amount, label, amount))
-        else:
-            _append_other(res, c, inp.performance_coefficient)
-
-    # 加班费：基数月额 / 标准天数 / 每日工时 × 加班时长 × 倍数
-    if att.overtime_hours > 0:
-        base_monthly = _overtime_base_monthly(cfg, inp.structure)
-        hourly = base_monthly / cfg.monthly_standard_days / cfg.hours_per_day
-        ot = q(hourly * att.overtime_hours * cfg.overtime_multiplier)
-        res.lines.append(
-            LineItem("OVERTIME", ComponentType.OVERTIME, base_monthly, "时薪×加班时长×倍数", ot)
-        )
+    assert att is not None
+    # 特殊岗位 / 其他部门：应出勤 − 休息天数
+    if inp.is_special_position or inp.department == Department.OTHER:
+        return att.expected_days - att.rest_days
+    if inp.department == Department.DINING:
+        return att.worked_hours / cfg.dining_divisor
+    if inp.department == Department.KITCHEN:
+        return att.worked_hours / cfg.kitchen_divisor
+    return att.expected_days - att.rest_days  # 兜底
 
 
-def _compute_hourly(inp: EmployeeInput, cfg: RuleConfig, res: PayrollResult) -> None:
-    if inp.attendance is None:
-        res.exceptions.append("缺少考勤数据，无法核算")
-        return
-    base = next((c for c in inp.structure if c.component_type == ComponentType.BASE), None)
-    if base is None:
-        res.exceptions.append("兼职缺少时薪（BASE 组件）")
-        return
-    if _has_perf(inp.structure) and inp.performance_coefficient is None:
-        res.exceptions.append("缺少绩效系数，无法核算绩效")
-    hourly_rate = base.amount
-    worked_hours = inp.attendance.actual_days * cfg.hours_per_day  # v1：按出勤天数×每日工时
-    res.lines.append(
-        LineItem(
-            base.code, ComponentType.BASE, hourly_rate, "时薪×工时", q(hourly_rate * worked_hours)
-        )
-    )
-    if inp.attendance.overtime_hours > 0:
-        ot = q(hourly_rate * inp.attendance.overtime_hours * cfg.overtime_multiplier)
-        res.lines.append(
-            LineItem("OVERTIME", ComponentType.OVERTIME, hourly_rate, "时薪×加班时长×倍数", ot)
-        )
-    for c in inp.structure:
-        if c is base:
-            continue
-        _append_other(res, c, inp.performance_coefficient)
-
-
-def _compute_labor(inp: EmployeeInput, cfg: RuleConfig, res: PayrollResult) -> None:
-    # 劳务：结构组件按全额求和（扣款为负），不做出勤折算
-    for c in inp.structure:
-        _append_other(res, c, inp.performance_coefficient)
+def _housing(inp: EmployeeInput, cfg: RuleConfig, actual: Decimal) -> Decimal:
+    housing = _sum(inp.structure, ComponentType.HOUSING)
+    if housing == 0:
+        return ZERO
+    expected = inp.attendance.expected_days if inp.attendance else ZERO
+    if expected <= 0:
+        return ZERO
+    if inp.is_hire_or_leave_month:
+        # 入离职当月按比例，封顶全额（比值不超过 1）
+        return housing * min(actual / expected, Decimal("1"))
+    if actual > cfg.housing_full_threshold_days:
+        return housing  # >15 天全额
+    return housing * actual / expected  # ≤15 天按出勤折算
 
 
 def compute(inp: EmployeeInput, cfg: RuleConfig | None = None) -> PayrollResult:
     cfg = cfg or RuleConfig()
     res = PayrollResult(inp.employee_id, inp.period, cfg.version)
-    if not inp.structure:
-        res.exceptions.append("缺少薪资结构，无法核算")
 
-    if inp.employment_type == EmploymentType.FULL_TIME:
-        _compute_full_time(inp, cfg, res)
-    elif inp.employment_type == EmploymentType.PART_TIME_HOURLY:
-        _compute_hourly(inp, cfg, res)
-    else:  # LABOR
-        _compute_labor(inp, cfg, res)
+    if inp.attendance is None:
+        res.exceptions.append("缺少考勤数据，无法核算")
+        return res
+    att = inp.attendance
+    if att.expected_days <= 0:
+        res.exceptions.append("应出勤天数为 0，无法折算")
+        return res
 
-    res.gross = q(sum((li.amount for li in res.lines), ZERO))
-    # 防御性守卫：净额为负（扣款超应发）不静默出账，标记待人工复核（v1；封顶/结转口径待业务定）
-    if res.gross < 0:
-        res.exceptions.append("核算净额为负（扣款超过应发），需人工复核")
+    comprehensive = _sum(inp.structure, ComponentType.COMPREHENSIVE)
+    if comprehensive <= 0:
+        res.exceptions.append("缺少综合薪资（计薪基数），无法核算出勤工资")
+
+    # 工时制岗位缺工时无法折算：报异常阻断（区分数据缺失与真实零出勤）
+    if (
+        not inp.is_special_position
+        and inp.department in (Department.DINING, Department.KITCHEN)
+        and att.worked_hours <= 0
+    ):
+        res.exceptions.append("工时制岗位缺出勤工时，无法折算实际出勤")
+
+    # 实际计薪出勤天数（两套标准，上限当月天数）
+    actual = _actual_attendance_days(inp, cfg)
+    actual = min(actual, inp.days_in_month)
+    if actual < 0:
+        actual = ZERO
+    res.actual_attendance_days = q(actual)
+
+    # 1. 出勤工资 = 综合薪资 / 应出勤 × 实际
+    attend_wage = res._add(
+        "ATTEND_WAGE",
+        "出勤工资",
+        "综合薪资÷应出勤×实际出勤",
+        comprehensive / att.expected_days * actual,
+    )
+
+    # 2. 加班工资 = 综合薪资/21.75/8 × 加班时长 × 倍数
+    overtime_wage = ZERO
+    if att.overtime_hours > 0:
+        hourly = comprehensive / cfg.monthly_standard_days / cfg.hours_per_day
+        overtime_wage = res._add(
+            "OVERTIME",
+            "加班工资",
+            "时薪×加班时长×倍数",
+            hourly * att.overtime_hours * cfg.overtime_multiplier,
+        )
+
+    # 3. 法定节假日工资
+    holiday_wage = ZERO
+    if inp.holiday_eligible and inp.statutory_holiday_days > 0:
+        worked = min(att.holiday_worked_days, inp.statutory_holiday_days)
+        not_worked = inp.statutory_holiday_days - worked
+        holiday_wage = res._add(
+            "HOLIDAY",
+            "法定节假日工资",
+            "3000÷应出勤×(出勤×3+未出勤×1)",
+            cfg.holiday_base / att.expected_days * (worked * 3 + not_worked),
+        )
+
+    # 4. 固定补贴 / 5. 浮动补贴
+    fixed_allow = ZERO
+    floating_allow = ZERO
+    for c in inp.structure:
+        if c.component_type != ComponentType.ALLOWANCE:
+            continue
+        if c.allowance_kind == AllowanceKind.FLOATING:
+            floating_allow += res._add(c.code, "浮动补贴", "全额", c.amount)
+        else:  # 默认按固定补贴
+            fixed_allow += res._add(c.code, "固定补贴", "全额", c.amount)
+
+    # 6. 房补
+    housing = _housing(inp, cfg, actual)
+    if housing != 0:
+        res._add("HOUSING", "房补", "按 15 天/入离职规则", housing)
+    housing = q(housing)
+
+    # 7. 上月补发 / 补扣
+    prev_makeup = q(inp.prev_makeup)
+    prev_deduct = q(inp.prev_deduct)
+    if prev_makeup != 0:
+        res._add("PREV_MAKEUP", "上月补发", "上月补发", prev_makeup)
+    if prev_deduct != 0:
+        res._add("PREV_DEDUCT", "上月补扣", "上月补扣", -prev_deduct)
+
+    # 8. 应发 = 出勤+加班+法定+固定+浮动+房补+上月补发−上月补扣
+    res.gross = q(
+        attend_wage
+        + overtime_wage
+        + holiday_wage
+        + fixed_allow
+        + floating_allow
+        + housing
+        + prev_makeup
+        - prev_deduct
+    )
+
+    # 9. 其他扣款 + 押金 + 实发
+    other_deduct = -_sum(inp.structure, ComponentType.DEDUCTION)  # ≤0
+    if other_deduct != 0:
+        res._add("DEDUCTION", "其他扣款", "扣款", other_deduct)
+    payable = res.gross + other_deduct  # 可支配额（应发 − 扣款），据此判断能否扣押金
+
+    if inp.is_new_employee and payable < cfg.deposit_amount:
+        # 规格7.10：工资不足扣押金 → 当月不发放、押金不扣、应发全额结转下月（扣款义务随之延后）
+        res.carry_forward = res.gross
+        res.net = ZERO
+        res.exceptions.append("新员工工资不足扣押金，当月不发放，结转下月")
+    else:
+        if inp.is_new_employee:
+            res.deposit = cfg.deposit_amount  # 新员工足额扣押金
+        # 实发 = 应发 − 扣款 − 押金（社保个税 S12 后补）
+        res.net = q(payable - res.deposit)
+        if res.net < 0:
+            res.exceptions.append("实发为负，需人工复核")
     return res
