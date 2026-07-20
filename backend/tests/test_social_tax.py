@@ -153,6 +153,27 @@ def test_cumulative_tax_withholding_uses_ytd_inputs_and_crosses_a_bracket() -> N
     assert result.current_withholding == Decimal("1990.00")
 
 
+def test_cumulative_tax_uses_employment_months_not_calendar_month() -> None:
+    """A May hire receives one, not five, monthly basic deductions."""
+
+    result = calculate_cumulative_tax(
+        policy=_tax_policy(),
+        input=CumulativeTaxInput(
+            employment_months=1,
+            ytd_taxable_income_before=Decimal("0"),
+            ytd_employee_contribution_before=Decimal("0"),
+            ytd_special_deduction_before=Decimal("0"),
+            ytd_tax_withheld_before=Decimal("0"),
+            current_taxable_income=Decimal("20000"),
+            current_employee_contribution=Decimal("0"),
+            current_special_deduction=Decimal("0"),
+        ),
+    )
+
+    assert result.cumulative_taxable_income == Decimal("15000.00")
+    assert result.current_withholding == Decimal("450.00")
+
+
 def test_cumulative_tax_uses_the_lower_bracket_at_its_exact_boundary() -> None:
     result = calculate_cumulative_tax(
         policy=_tax_policy(),
