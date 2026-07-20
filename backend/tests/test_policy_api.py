@@ -214,6 +214,25 @@ def test_reopened_current_batch_allows_an_explicit_successor_policy(client, db_s
     assert finalized.status_code == 200, finalized.text
 
 
+def test_policy_finalization_requires_explicit_treatment_for_all_derived_income(
+    client, db_session
+):
+    _user(db_session, "hr", ["GROUP_HR"])
+    headers = _token(client, "hr")
+    body = _body()
+    body["derived_income_rules"] = body["derived_income_rules"][:1]
+
+    created = client.post("/api/payroll-policies", headers=headers, json=body)
+    assert created.status_code == 201, created.text
+
+    finalized = client.post(
+        f"/api/payroll-policies/{created.json()['id']}/finalize", headers=headers
+    )
+
+    assert finalized.status_code == 409
+    assert "derived" in finalized.json()["detail"].lower()
+
+
 def test_policy_api_requires_policy_permissions_and_rejects_duplicate_city_effective_date(
     client, db_session
 ):
