@@ -6,8 +6,6 @@ from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
 
-import pytest
-
 from app.models.comp import ComponentType
 from app.models.employee import Department, EmploymentType
 from app.payroll import batch_service
@@ -120,7 +118,9 @@ def _line(result, code: str):
     return next(item for item in result.lines if item.code == code)
 
 
-def test_engine_applies_policy_bases_personal_and_employer_contributions_and_cumulative_tax() -> None:
+def test_engine_applies_policy_bases_personal_and_employer_contributions_and_cumulative_tax() -> (
+    None
+):
     result = compute(_input())
 
     assert result.rule_version == "v3"
@@ -136,7 +136,9 @@ def test_engine_applies_policy_bases_personal_and_employer_contributions_and_cum
     assert result.net == Decimal("7700.00")
 
 
-def test_policy_enabled_payroll_blocks_a_deposit_shortfall_instead_of_deferring_tax_or_social() -> None:
+def test_policy_enabled_payroll_blocks_a_deposit_shortfall_instead_of_deferring_tax_or_social() -> (
+    None
+):
     result = compute(_input(is_new_employee=True), RuleConfig(deposit_amount=Decimal("10000")))
 
     assert result.has_error
@@ -161,13 +163,37 @@ def test_policy_and_tax_context_round_trip_through_the_immutable_input_snapshot(
 
 
 def test_v2_snapshot_without_policy_context_remains_recomputable() -> None:
-    legacy = _input(payroll_policy=None, monthly_special_deduction=Decimal("0"))
+    legacy = _input(
+        payroll_policy=None,
+        monthly_special_deduction=Decimal("0"),
+        attendance=Attendance(
+            expected_days=Decimal("20"),
+            actual_days=Decimal("2"),
+            rest_days=Decimal("3"),
+        ),
+        structure=[
+            StructureComponent(
+                code="COMP",
+                component_type=ComponentType.COMPREHENSIVE,
+                amount=Decimal("2000"),
+            ),
+            # v2 accepted an untyped allowance as a fixed allowance.  A v3
+            # recomputation must never reinterpret this historical snapshot.
+            StructureComponent(
+                code="LEGACY_ALLOW",
+                component_type=ComponentType.ALLOWANCE,
+                amount=Decimal("100"),
+            ),
+        ],
+    )
     snapshot = batch_service._input_snapshot(legacy, [])
     snapshot.pop("payroll_tax", None)
 
-    restored, _missing = batch_service._input_from_snapshot(
+    result, _snapshot = batch_service._recompute_result_from_snapshot(
         SimpleNamespace(rule_version="v2", input_snapshot=snapshot), {}
     )
 
-    assert restored.payroll_policy is None
-    assert compute(restored, RuleConfig(version="v2")).rule_version == "v2"
+    assert result.rule_version == "v2"
+    assert result.actual_attendance_days == Decimal("17.00")
+    assert result.gross == Decimal("1800.00")
+    assert result.has_error is False
