@@ -174,3 +174,16 @@ def test_audited_opening_cannot_claim_more_employment_months_than_its_period() -
     assert service._tax_opening_coverage_error(opening, employee) == (
         "Audited tax opening employment-month count does not match its through period."
     )
+
+
+def test_audited_opening_cannot_predate_the_employee_hire_month() -> None:
+    employee = SimpleNamespace(hire_date=date(2026, 8, 1))
+    opening = SimpleNamespace(
+        tax_year=2026,
+        through_period="2026-07",
+        employment_months_to_date=0,
+    )
+
+    assert service._tax_opening_coverage_error(opening, employee) == (
+        "Audited tax opening cannot predate the employee hire month."
+    )
