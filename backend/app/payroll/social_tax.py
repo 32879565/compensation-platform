@@ -8,6 +8,7 @@ policy snapshot alongside a payroll result before relying on these functions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
 
@@ -71,6 +72,17 @@ class TaxBracket:
 class TaxPolicyInput:
     monthly_basic_deduction: Decimal
     brackets: tuple[TaxBracket, ...]
+
+
+@dataclass(frozen=True)
+class PayrollPolicyContext:
+    """The exact, finalized policy selected for one employee payroll input."""
+
+    policy_id: int
+    city: str
+    effective_from: date
+    social_policy: SocialInsurancePolicyInput
+    tax_policy: TaxPolicyInput
 
 
 @dataclass(frozen=True)
