@@ -51,6 +51,7 @@ extend-immutable-calls = [
     "fastapi.Body",
     "fastapi.Header",
     "fastapi.Cookie",
+    "app.auth.deps.require_permission",
 ]
 
 [tool.black]

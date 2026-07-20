@@ -1,8 +1,12 @@
 // 与后端 app/auth/permissions.py 保持一致的权限点常量（前端菜单/按钮门禁用）。
 export const Perm = {
   ORG_READ: 'org:read',
+  ORG_WRITE: 'org:write',
   EMPLOYEE_READ: 'employee:read',
+  EMPLOYEE_WRITE: 'employee:write',
+  EMPLOYEE_PII: 'employee:pii',
   GRADE_READ: 'grade:read',
+  GRADE_WRITE: 'grade:write',
   STRUCTURE_READ: 'salary_structure:read',
   ATTENDANCE_READ: 'attendance:read',
   PAYROLL_READ: 'payroll:read',

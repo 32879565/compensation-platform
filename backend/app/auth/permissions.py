@@ -13,6 +13,9 @@ class Perm:
     ORG_WRITE = "org:write"
     EMPLOYEE_READ = "employee:read"
     EMPLOYEE_WRITE = "employee:write"
+    # 查看未脱敏 PII（身份证/银行卡全量）。刻意不用 :read 后缀，避免被 AUDITOR 的
+    # _ALL_READ 自动纳入——审计只应看脱敏值。
+    EMPLOYEE_PII = "employee:pii"
     GRADE_READ = "grade:read"
     GRADE_WRITE = "grade:write"
     STRUCTURE_READ = "salary_structure:read"
@@ -39,6 +42,7 @@ PERMISSION_CATALOG: dict[str, str] = {
     Perm.ORG_WRITE: "维护组织",
     Perm.EMPLOYEE_READ: "查看员工",
     Perm.EMPLOYEE_WRITE: "维护员工",
+    Perm.EMPLOYEE_PII: "查看员工完整证件信息",
     Perm.GRADE_READ: "查看职级薪档",
     Perm.GRADE_WRITE: "维护职级薪档",
     Perm.STRUCTURE_READ: "查看薪资结构",
@@ -82,6 +86,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.ORG_WRITE,
             Perm.EMPLOYEE_READ,
             Perm.EMPLOYEE_WRITE,
+            Perm.EMPLOYEE_PII,
             Perm.GRADE_READ,
             Perm.GRADE_WRITE,
             Perm.STRUCTURE_READ,

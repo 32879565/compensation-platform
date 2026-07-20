@@ -1,11 +1,12 @@
 import { Button, Layout, Menu, Typography } from 'antd'
 import type { ReactNode } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 
 import { useAuth } from '../auth/AuthContext'
 import { Perm } from '../auth/permissions'
 
 interface MenuDef {
-  key: string
+  key: string // 同时作为路由路径片段
   label: string
   permission: string
 }
@@ -14,8 +15,8 @@ interface MenuDef {
 const MENU: MenuDef[] = [
   { key: 'dashboard', label: '看板', permission: Perm.DASHBOARD_READ },
   { key: 'org', label: '组织', permission: Perm.ORG_READ },
-  { key: 'employee', label: '员工', permission: Perm.EMPLOYEE_READ },
-  { key: 'grade', label: '职级薪档', permission: Perm.GRADE_READ },
+  { key: 'employees', label: '员工', permission: Perm.EMPLOYEE_READ },
+  { key: 'grades', label: '职级薪档', permission: Perm.GRADE_READ },
   { key: 'attendance', label: '考勤', permission: Perm.ATTENDANCE_READ },
   { key: 'payroll', label: '核算', permission: Perm.PAYROLL_READ },
   { key: 'adjustment', label: '调薪', permission: Perm.ADJUSTMENT_READ },
@@ -27,10 +28,14 @@ const MENU: MenuDef[] = [
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { user, logout, hasPermission } = useAuth()
+  const navigate = useNavigate()
+  const location = useLocation()
+
   const items = MENU.filter((m) => hasPermission(m.permission)).map((m) => ({
     key: m.key,
     label: m.label,
   }))
+  const selectedKey = location.pathname.split('/')[1] || 'dashboard'
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -47,7 +52,13 @@ export function AppShell({ children }: { children: ReactNode }) {
       </Layout.Header>
       <Layout>
         <Layout.Sider width={200} theme="light">
-          <Menu mode="inline" items={items} style={{ height: '100%' }} />
+          <Menu
+            mode="inline"
+            items={items}
+            selectedKeys={[selectedKey]}
+            onClick={({ key }) => navigate(`/${key}`)}
+            style={{ height: '100%' }}
+          />
         </Layout.Sider>
         <Layout.Content style={{ padding: 24 }}>{children}</Layout.Content>
       </Layout>

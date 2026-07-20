@@ -24,8 +24,13 @@ class BaseRepository[ModelT: Base]:
 
     model: type[ModelT]
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, org_scope: frozenset[int] | None = None) -> None:
+        """org_scope=None 表示不受限（集团级）；否则为可见 org_unit id 集合。
+
+        与 Principal 语义一致：None=不受限，空集=什么都看不到（fail-closed）。
+        """
         self.session = session
+        self._org_scope = org_scope
 
     def _base_query(self):
         stmt = select(self.model)
@@ -34,7 +39,7 @@ class BaseRepository[ModelT: Base]:
         return self._apply_org_scope(stmt)
 
     def _apply_org_scope(self, stmt):
-        # 默认不施加范围限制；带组织维度的子类覆写此方法（S3/S5）。
+        # 默认不施加范围限制；带组织维度的子类覆写此方法。
         return stmt
 
     def get(self, obj_id: int) -> ModelT | None:

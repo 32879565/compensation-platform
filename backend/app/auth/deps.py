@@ -44,6 +44,11 @@ def get_current_principal(request: Request, session: Session = Depends(get_sessi
     return build_principal(session, user)
 
 
+def principal_scope(principal: Principal) -> frozenset[int] | None:
+    """把主体转成仓储用的组织范围：None=不受限，否则可见 org id 集合。"""
+    return None if principal.is_unrestricted() else principal.visible_org_ids()
+
+
 def require_permission(permission: str) -> Callable[[Principal], Principal]:
     """依赖工厂：要求主体具备指定权限，否则 403。"""
 
