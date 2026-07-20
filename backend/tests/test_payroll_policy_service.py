@@ -42,6 +42,7 @@ def _policy(
             {"upper_bound": "36000", "rate": "0.03", "quick_deduction": "0"},
             {"upper_bound": None, "rate": "0.10", "quick_deduction": "2520"},
         ],
+        derived_income_rules=[],
     )
 
 
@@ -148,12 +149,28 @@ def test_employment_months_start_with_the_hire_month_not_january() -> None:
 
 def test_tax_history_requires_every_prior_employment_month_or_an_opening_balance() -> None:
     assert service._tax_history_coverage_error(TaxYearToDate(), employment_months=1) is None
-    assert service._tax_history_coverage_error(
-        TaxYearToDate(employment_months_before=4), employment_months=5
-    ) is None
+    assert (
+        service._tax_history_coverage_error(
+            TaxYearToDate(employment_months_before=4), employment_months=5
+        )
+        is None
+    )
     assert service._tax_history_coverage_error(
         TaxYearToDate(employment_months_before=1), employment_months=3
     ) == (
         "Locked tax history does not cover every prior employment month; "
         "an audited opening balance or correction is required."
+    )
+
+
+def test_audited_opening_cannot_claim_more_employment_months_than_its_period() -> None:
+    employee = SimpleNamespace(hire_date=date(2026, 1, 1))
+    opening = SimpleNamespace(
+        tax_year=2026,
+        through_period="2026-01",
+        employment_months_to_date=6,
+    )
+
+    assert service._tax_opening_coverage_error(opening, employee) == (
+        "Audited tax opening employment-month count does not match its through period."
     )
