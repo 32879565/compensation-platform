@@ -12,6 +12,7 @@ from app.routers.grade import router as grade_router
 from app.routers.imports import router as imports_router
 from app.routers.imports import salary_router
 from app.routers.org import router as org_router
+from app.routers.payroll import router as payroll_router
 
 
 def create_app() -> FastAPI:
@@ -43,6 +44,7 @@ def create_app() -> FastAPI:
     app.include_router(comp_router)
     app.include_router(structure_router)
     app.include_router(attendance_router)
+    app.include_router(payroll_router)
     get_logger("app").info("应用已启动", extra={"context": {"app": settings.app_name}})
     return app
 

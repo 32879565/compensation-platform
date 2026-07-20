@@ -29,11 +29,15 @@ def current_structure(
     session: Session, employee_id: int, on_date: date
 ) -> list[EmployeeSalaryStructure]:
     """某日生效的薪资结构记录：effective_from<=on_date 且 (effective_to 空 或 > on_date)。"""
-    stmt = select(EmployeeSalaryStructure).where(
-        EmployeeSalaryStructure.employee_id == employee_id,
-        EmployeeSalaryStructure.effective_from <= on_date,
-        (EmployeeSalaryStructure.effective_to.is_(None))
-        | (EmployeeSalaryStructure.effective_to > on_date),
+    stmt = (
+        select(EmployeeSalaryStructure)
+        .where(
+            EmployeeSalaryStructure.employee_id == employee_id,
+            EmployeeSalaryStructure.effective_from <= on_date,
+            (EmployeeSalaryStructure.effective_to.is_(None))
+            | (EmployeeSalaryStructure.effective_to > on_date),
+        )
+        .order_by(EmployeeSalaryStructure.component_id)  # 确定性行序
     )
     return list(session.scalars(stmt).all())
 
