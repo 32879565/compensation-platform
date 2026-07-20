@@ -162,6 +162,19 @@ def test_unlock_resets_all_confirmation_scopes_for_a_new_review_round() -> None:
     assert confirmation.status == ConfirmStatus.CONFIRMED
 
 
+def test_unlock_serializes_history_changes_with_payroll_input_snapshots(monkeypatch) -> None:
+    batch = PayrollBatch(id=1, status=BatchStatus.LOCKED, version=1)
+    session = _Session(scalar_values=[0])
+    calls: list[object] = []
+    monkeypatch.setattr(
+        batch_service, "lock_payroll_input_mutation", lambda value: calls.append(value)
+    )
+
+    unlock_batch(session, batch, user_id=7, reason="Correct the locked policy history")
+
+    assert calls == [session]
+
+
 @pytest.mark.parametrize(
     "later_status",
     [BatchStatus.PENDING_STORE_CONFIRM, BatchStatus.LOCKED],
@@ -761,7 +774,7 @@ def test_calculation_snapshot_captures_json_safe_engine_inputs(
 
     result, snapshot = batch_service._calculate_result(object(), object(), "2026-05")
 
-    assert result.rule_version == "v3"
+    assert result.rule_version == "v4"
     assert snapshot == {
         "employee_id": 2,
         "period": "2026-05",
