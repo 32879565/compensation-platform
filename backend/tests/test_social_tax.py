@@ -3,9 +3,9 @@ from decimal import Decimal
 import pytest
 
 from app.payroll.social_tax import (
-    CumulativeTaxInput,
     ContributionKind,
     ContributionRule,
+    CumulativeTaxInput,
     PolicyValidationError,
     SocialInsurancePolicyInput,
     TaxBracket,
@@ -34,7 +34,9 @@ def _tax_policy() -> TaxPolicyInput:
     return TaxPolicyInput(
         monthly_basic_deduction=Decimal("5000"),
         brackets=(
-            TaxBracket(upper_bound=Decimal("36000"), rate=Decimal("0.03"), quick_deduction=Decimal("0")),
+            TaxBracket(
+                upper_bound=Decimal("36000"), rate=Decimal("0.03"), quick_deduction=Decimal("0")
+            ),
             TaxBracket(
                 upper_bound=Decimal("144000"), rate=Decimal("0.10"), quick_deduction=Decimal("2520")
             ),
@@ -206,8 +208,12 @@ def test_cumulative_tax_rejects_an_invalid_month_or_unsorted_brackets() -> None:
     unsorted = TaxPolicyInput(
         monthly_basic_deduction=Decimal("5000"),
         brackets=(
-            TaxBracket(upper_bound=Decimal("144000"), rate=Decimal("0.10"), quick_deduction=Decimal("2520")),
-            TaxBracket(upper_bound=Decimal("36000"), rate=Decimal("0.03"), quick_deduction=Decimal("0")),
+            TaxBracket(
+                upper_bound=Decimal("144000"), rate=Decimal("0.10"), quick_deduction=Decimal("2520")
+            ),
+            TaxBracket(
+                upper_bound=Decimal("36000"), rate=Decimal("0.03"), quick_deduction=Decimal("0")
+            ),
             TaxBracket(upper_bound=None, rate=Decimal("0.20"), quick_deduction=Decimal("16920")),
         ),
     )
