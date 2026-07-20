@@ -14,6 +14,8 @@ export interface OrgTreeNode extends OrgUnit {
   children: OrgTreeNode[]
 }
 
+export type Department = 'DINING' | 'KITCHEN' | 'OTHER'
+
 export interface Employee {
   id: number
   emp_no: string
@@ -21,6 +23,9 @@ export interface Employee {
   org_unit_id: number
   job_grade_id: number | null
   employment_type: 'FULL_TIME' | 'PART_TIME_HOURLY' | 'LABOR'
+  department: Department
+  position_title: string | null
+  is_special_position: boolean
   status: 'ACTIVE' | 'RESIGNED' | 'SUSPENDED'
   hire_date: string | null
   probation_end: string | null

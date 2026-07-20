@@ -33,8 +33,12 @@ def _visible_employee(session: Session, principal: Principal, employee_id: int) 
 # ------------------- 考勤 -------------------
 class AttendanceBody(BaseModel):
     expected_days: Decimal = Field(ge=0, le=31)
+    expected_days_adjust_reason: str | None = Field(default=None, max_length=255)
     actual_days: Decimal = Field(ge=0, le=31)
+    worked_hours: Decimal = Field(default=Decimal(0), ge=0, le=744)
+    rest_days: Decimal = Field(default=Decimal(0), ge=0, le=31)
     overtime_hours: Decimal = Field(default=Decimal(0), ge=0, le=744)
+    holiday_worked_days: Decimal = Field(default=Decimal(0), ge=0, le=31)
     leave_days: Decimal = Field(default=Decimal(0), ge=0, le=31)
     late_count: int = Field(default=0, ge=0)
     early_leave_count: int = Field(default=0, ge=0)
@@ -44,8 +48,12 @@ class AttendanceOut(BaseModel):
     employee_id: int
     period: str
     expected_days: Decimal
+    expected_days_adjust_reason: str | None
     actual_days: Decimal
+    worked_hours: Decimal
+    rest_days: Decimal
     overtime_hours: Decimal
+    holiday_worked_days: Decimal
     leave_days: Decimal
     late_count: int
     early_leave_count: int

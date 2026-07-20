@@ -5,7 +5,7 @@ from datetime import date
 from pydantic import BaseModel, Field
 
 from app.core.crypto import mask_bank_account, mask_id_card
-from app.models.employee import Employee, EmployeeStatus, EmploymentType
+from app.models.employee import Department, Employee, EmployeeStatus, EmploymentType
 
 
 class EmployeeCreate(BaseModel):
@@ -14,6 +14,9 @@ class EmployeeCreate(BaseModel):
     org_unit_id: int
     job_grade_id: int | None = None
     employment_type: EmploymentType = EmploymentType.FULL_TIME
+    department: Department = Department.OTHER
+    position_title: str | None = Field(default=None, max_length=64)
+    is_special_position: bool = False
     hire_date: date | None = None
     probation_end: date | None = None
     social_city: str | None = Field(default=None, max_length=32)
@@ -26,6 +29,9 @@ class EmployeeUpdate(BaseModel):
     org_unit_id: int | None = None
     job_grade_id: int | None = None
     employment_type: EmploymentType | None = None
+    department: Department | None = None
+    position_title: str | None = Field(default=None, max_length=64)
+    is_special_position: bool | None = None
     status: EmployeeStatus | None = None
     hire_date: date | None = None
     probation_end: date | None = None
@@ -42,6 +48,9 @@ class EmployeeOut(BaseModel):
     org_unit_id: int
     job_grade_id: int | None
     employment_type: EmploymentType
+    department: Department
+    position_title: str | None
+    is_special_position: bool
     status: EmployeeStatus
     hire_date: date | None
     probation_end: date | None
@@ -60,6 +69,9 @@ class EmployeeOut(BaseModel):
             org_unit_id=emp.org_unit_id,
             job_grade_id=emp.job_grade_id,
             employment_type=emp.employment_type,
+            department=emp.department,
+            position_title=emp.position_title,
+            is_special_position=emp.is_special_position,
             status=emp.status,
             hire_date=emp.hire_date,
             probation_end=emp.probation_end,

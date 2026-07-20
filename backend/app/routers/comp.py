@@ -20,7 +20,12 @@ from app.comp.service import (
     set_component_amount,
 )
 from app.db.session import get_session
-from app.models.comp import ComponentType, EmployeeSalaryStructure, SalaryComponentDef
+from app.models.comp import (
+    AllowanceKind,
+    ComponentType,
+    EmployeeSalaryStructure,
+    SalaryComponentDef,
+)
 from app.repositories.employee import EmployeeRepository
 
 router = APIRouter(prefix="/api/salary-components", tags=["comp"])
@@ -33,6 +38,7 @@ class ComponentCreate(BaseModel):
     taxable: bool = True
     in_social_base: bool = False
     in_housing_base: bool = False
+    allowance_kind: AllowanceKind | None = None  # 仅补贴类需区分固定/浮动
     sort_order: int = 0
 
 
@@ -52,6 +58,7 @@ class ComponentOut(BaseModel):
     taxable: bool
     in_social_base: bool
     in_housing_base: bool
+    allowance_kind: AllowanceKind | None
     sort_order: int
 
     model_config = {"from_attributes": True}

@@ -19,8 +19,15 @@ class AttendanceRecord(Base, TimestampMixin):
     employee_id: Mapped[int] = mapped_column(ForeignKey("employee.id"), nullable=False, index=True)
     period: Mapped[str] = mapped_column(String(7), nullable=False, index=True)
     expected_days: Mapped[Decimal] = mapped_column(DAYS, nullable=False)
+    # 应出勤天数经人事调整时填写原因（前后值走审计/修改记录）
+    expected_days_adjust_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     actual_days: Mapped[Decimal] = mapped_column(DAYS, nullable=False)
+    # 出勤工时：非特殊岗位按 厅面÷9/厨房÷9.5 折算实际出勤天数（允许小数，无最低工时门槛）
+    worked_hours: Mapped[Decimal] = mapped_column(DAYS, nullable=False, default=Decimal(0))
+    # 休息天数：特殊岗位实际出勤 = 应出勤 − 休息天数
+    rest_days: Mapped[Decimal] = mapped_column(DAYS, nullable=False, default=Decimal(0))
     overtime_hours: Mapped[Decimal] = mapped_column(DAYS, nullable=False, default=Decimal(0))
+    holiday_worked_days: Mapped[Decimal] = mapped_column(DAYS, nullable=False, default=Decimal(0))
     leave_days: Mapped[Decimal] = mapped_column(DAYS, nullable=False, default=Decimal(0))
     late_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     early_leave_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

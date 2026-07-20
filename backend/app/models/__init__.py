@@ -12,13 +12,15 @@ from app.models.auth import (
     UserRole,
 )
 from app.models.comp import (
+    AllowanceKind,
     ComponentType,
     EmployeeSalaryStructure,
     SalaryComponentDef,
 )
-from app.models.employee import Employee, EmployeeStatus, EmploymentType
+from app.models.employee import Department, Employee, EmployeeStatus, EmploymentType
 from app.models.grade import JobGrade, SalaryBand
 from app.models.org import OrgType, OrgUnit
+from app.models.payroll_batch import BatchStatus, PayrollBatch
 from app.models.period import PayPeriod, PeriodStatus
 from app.models.salary import (
     ImportBatch,
@@ -58,4 +60,8 @@ __all__ = [
     "ComponentType",
     "AttendanceRecord",
     "PerformanceRecord",
+    "Department",
+    "AllowanceKind",
+    "PayrollBatch",
+    "BatchStatus",
 ]

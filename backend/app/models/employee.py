@@ -1,7 +1,7 @@
 import enum
 from datetime import date
 
-from sqlalchemy import Date, Enum, ForeignKey, String
+from sqlalchemy import Boolean, Date, Enum, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.crypto import EncryptedString
@@ -12,6 +12,14 @@ class EmploymentType(enum.StrEnum):
     FULL_TIME = "FULL_TIME"  # 全职月薪制
     PART_TIME_HOURLY = "PART_TIME_HOURLY"  # 兼职小时工（餐饮高占比，时薪制）
     LABOR = "LABOR"  # 劳务
+
+
+class Department(enum.StrEnum):
+    """部门：决定出勤折算除数与钉钉推送收件人（厅面→店长/厨房→厨房经理）。"""
+
+    DINING = "DINING"  # 厅面（出勤工时÷9）
+    KITCHEN = "KITCHEN"  # 厨房（出勤工时÷9.5）
+    OTHER = "OTHER"  # 其他（后勤/管理等）
 
 
 class EmployeeStatus(enum.StrEnum):
@@ -49,6 +57,17 @@ class Employee(Base, TimestampMixin, SoftDeleteMixin):
     hire_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     probation_end: Mapped[date | None] = mapped_column(Date, nullable=True)
     leave_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    department: Mapped[Department] = mapped_column(
+        Enum(Department, name="department"),
+        nullable=False,
+        default=Department.OTHER,
+        server_default=Department.OTHER.value,
+    )
+    position_title: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 特殊职位（店长/厨师长实习储备、洗碗、寒暑假工等）按审批实际出勤天数核算，不走工时折算
+    is_special_position: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # 社保参保城市（可与所属门店 city 不同）；S12 按此取城市政策
     social_city: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # PII：库中密文、应用层明文（EncryptedString）

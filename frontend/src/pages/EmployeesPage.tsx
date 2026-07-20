@@ -191,6 +191,23 @@ export default function EmployeesPage() {
               options={Object.entries(EMPLOYMENT_LABELS).map(([v, l]) => ({ value: v, label: l }))}
             />
           </Form.Item>
+          <Form.Item name="department" label="部门" initialValue="OTHER">
+            <Select
+              options={[
+                { value: 'DINING', label: '厅面' },
+                { value: 'KITCHEN', label: '厨房' },
+                { value: 'OTHER', label: '其他' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item name="is_special_position" label="特殊岗位(按天数核算)" valuePropName="checked">
+            <Select
+              options={[
+                { value: false, label: '否（按工时折算）' },
+                { value: true, label: '是（应出勤−休息天数）' },
+              ]}
+            />
+          </Form.Item>
           <Form.Item name="social_city" label="社保城市">
             <Input />
           </Form.Item>
