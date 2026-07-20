@@ -1,5 +1,6 @@
 """集中导入所有模型，确保 Base.metadata 完整（供 Alembic autogenerate 与 create_all）。"""
 
+from app.models.attendance import AttendanceRecord, PerformanceRecord
 from app.models.audit import AuditLog
 from app.models.auth import (
     Permission,
@@ -55,4 +56,6 @@ __all__ = [
     "SalaryComponentDef",
     "EmployeeSalaryStructure",
     "ComponentType",
+    "AttendanceRecord",
+    "PerformanceRecord",
 ]
