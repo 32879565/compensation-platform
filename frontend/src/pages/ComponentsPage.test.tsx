@@ -10,6 +10,7 @@ const compApi = vi.hoisted(() => ({
   restoreComponent: vi.fn(),
 }))
 const auth = vi.hoisted(() => ({ permissions: ['salary_structure:write'] as string[] }))
+const legacyReview = vi.hoisted(() => ({ onApplied: null as (() => void) | null }))
 
 vi.mock('../api/comp', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/comp')>()),
@@ -24,6 +25,24 @@ vi.mock('../auth/AuthContext', () => ({
     user: { username: 'hr' },
     hasPermission: (permission: string) => auth.permissions.includes(permission),
   }),
+}))
+vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
+  default: ({
+    open,
+    mode,
+    onApplied,
+  }: {
+    open: boolean
+    mode: string
+    onApplied: () => void
+  }) => {
+    legacyReview.onApplied = onApplied
+    return open ? (
+      <div role="dialog" aria-label={`旧系统真实数据-${mode}`}>
+        <button onClick={onApplied}>模拟应用真实数据</button>
+      </div>
+    ) : null
+  },
 }))
 
 import ComponentsPage from './ComponentsPage'
@@ -85,6 +104,30 @@ describe('ComponentsPage', () => {
     expect(within(row as HTMLTableRowElement).getAllByText('是').length).toBeGreaterThan(0)
   })
 
+  it('opens the reviewed legacy catalog only for import-capable writers and refreshes after apply', async () => {
+    auth.permissions = ['salary_structure:write', 'import:run']
+    const { queryClient } = renderPage()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+    await screen.findByText('餐补')
+    fireEvent.click(screen.getByRole('button', { name: '审阅旧系统真实数据' }))
+
+    expect(screen.getByRole('dialog', { name: '旧系统真实数据-components' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '模拟应用真实数据' }))
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['components', 'hr'] }),
+    )
+    expect(screen.queryByRole('dialog', { name: '旧系统真实数据-components' })).toBeNull()
+  })
+
+  it('does not expose legacy catalog creation to import-only users', async () => {
+    auth.permissions = ['import:run']
+    renderPage()
+
+    await screen.findByText('餐补')
+    expect(screen.queryByRole('button', { name: '审阅旧系统真实数据' })).toBeNull()
+  })
+
   it('lets payroll configuration writers update attendance proration', async () => {
     renderPage()
 
@@ -93,6 +136,7 @@ describe('ComponentsPage', () => {
     await waitFor(() =>
       expect(compApi.updateComponent).toHaveBeenCalledWith(1, {
         prorate_by_attendance: false,
+        expected_updated_at: '2026-07-21T05:00:00Z',
       }),
     )
   })
@@ -263,6 +307,52 @@ describe('ComponentsPage', () => {
     }
     expect((within(dialog).getByLabelText('名称') as HTMLInputElement).disabled).toBe(false)
     expect((within(dialog).getByLabelText('排序') as HTMLInputElement).disabled).toBe(false)
+  })
+
+  it('allows a reasoned one-time classification for an unclassified historical allowance', async () => {
+    compApi.fetchComponents.mockResolvedValue([
+      {
+        id: 6,
+        code: 'LEGACY_ALLOWANCE',
+        name: '历史补贴',
+        component_type: 'ALLOWANCE',
+        allowance_kind: null,
+        taxable: true,
+        in_social_base: false,
+        in_housing_base: false,
+        prorate_by_attendance: false,
+        sort_order: 4,
+        is_active: true,
+        deactivated_at: null,
+        updated_at: '2026-07-21T06:30:00Z',
+        calculation_locked: true,
+        calculation_lock_reason: '已参与历史工资计算',
+      },
+    ])
+    renderPage()
+
+    const row = (await screen.findByText('历史补贴')).closest('tr')
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '编辑' }))
+    const dialog = await screen.findByRole('dialog', { name: '编辑薪资组件' })
+
+    expect((within(dialog).getByLabelText('补贴方式') as HTMLInputElement).disabled).toBe(false)
+    expect((within(dialog).getByLabelText('计税') as HTMLInputElement).disabled).toBe(true)
+    fireEvent.mouseDown(within(dialog).getByLabelText('补贴方式'))
+    fireEvent.click(await screen.findByText('固定补贴'))
+    fireEvent.change(within(dialog).getByLabelText('历史补贴分类原因'), {
+      target: { value: '依据原补贴审批单补录分类' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() =>
+      expect(compApi.updateComponent).toHaveBeenCalledWith(6, {
+        name: '历史补贴',
+        sort_order: 4,
+        expected_updated_at: '2026-07-21T06:30:00Z',
+        allowance_kind: 'FIXED',
+        reason: '依据原补贴审批单补录分类',
+      }),
+    )
   })
 
   it('deactivates and restores components using the latest update timestamp', async () => {

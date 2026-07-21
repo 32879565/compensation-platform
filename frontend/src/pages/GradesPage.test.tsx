@@ -12,6 +12,7 @@ const gradeApi = vi.hoisted(() => ({
   createSalaryBand: vi.fn(),
 }))
 const auth = vi.hoisted(() => ({ permissions: ['grade:write'] as string[] }))
+const legacyReview = vi.hoisted(() => ({ onApplied: null as (() => void) | null }))
 
 vi.mock('../api/masterdata', () => gradeApi)
 vi.mock('../auth/AuthContext', () => ({
@@ -19,6 +20,24 @@ vi.mock('../auth/AuthContext', () => ({
     user: { username: 'grade-editor' },
     hasPermission: (permission: string) => auth.permissions.includes(permission),
   }),
+}))
+vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
+  default: ({
+    open,
+    mode,
+    onApplied,
+  }: {
+    open: boolean
+    mode: string
+    onApplied: () => void
+  }) => {
+    legacyReview.onApplied = onApplied
+    return open ? (
+      <div role="dialog" aria-label={`旧系统真实数据-${mode}`}>
+        <button onClick={onApplied}>模拟应用真实数据</button>
+      </div>
+    ) : null
+  },
 }))
 
 import GradesPage from './GradesPage'
@@ -129,6 +148,30 @@ describe('GradesPage', () => {
         rank: 20,
       }),
     )
+  })
+
+  it('opens reviewed legacy grades only for import-capable writers and refreshes after apply', async () => {
+    auth.permissions = ['grade:write', 'import:run']
+    const { queryClient } = renderPage()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+    await screen.findByText('门店主管')
+    fireEvent.click(screen.getByRole('button', { name: '审阅旧系统真实数据' }))
+
+    expect(screen.getByRole('dialog', { name: '旧系统真实数据-grades' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '模拟应用真实数据' }))
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['grades', 'grade-editor'] }),
+    )
+    expect(screen.queryByRole('dialog', { name: '旧系统真实数据-grades' })).toBeNull()
+  })
+
+  it('does not expose legacy grade creation to import-only users', async () => {
+    auth.permissions = ['import:run']
+    renderPage()
+
+    await screen.findByText('门店主管')
+    expect(screen.queryByRole('button', { name: '审阅旧系统真实数据' })).toBeNull()
   })
 
   it('edits a grade with its current version', async () => {
