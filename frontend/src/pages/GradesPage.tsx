@@ -30,6 +30,7 @@ import {
   type SalaryBand,
 } from '../api/masterdata'
 import { useAuth } from '../auth/AuthContext'
+import LegacyCatalogEvidencePanel from '../components/LegacyCatalogEvidencePanel'
 import LegacyCatalogReviewDrawer from '../components/LegacyCatalogReviewDrawer'
 
 interface GradeFormValues {
@@ -762,6 +763,9 @@ export default function GradesPage() {
         </Form>
       </Modal>
 
+      {canReviewLegacy && (
+        <LegacyCatalogEvidencePanel mode="grades" onReview={() => setLegacyReviewOpen(true)} />
+      )}
       <LegacyCatalogReviewDrawer
         open={legacyReviewOpen}
         mode="grades"

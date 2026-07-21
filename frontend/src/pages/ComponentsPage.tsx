@@ -34,6 +34,7 @@ import {
   type UpdateComponentInput,
 } from '../api/comp'
 import { useAuth } from '../auth/AuthContext'
+import LegacyCatalogEvidencePanel from '../components/LegacyCatalogEvidencePanel'
 import LegacyCatalogReviewDrawer from '../components/LegacyCatalogReviewDrawer'
 
 const TYPE_LABELS: Record<ComponentType, string> = {
@@ -729,6 +730,9 @@ export default function ComponentsPage() {
         </Form>
       </Modal>
 
+      {canReviewLegacy && (
+        <LegacyCatalogEvidencePanel mode="components" onReview={() => setLegacyReviewOpen(true)} />
+      )}
       <LegacyCatalogReviewDrawer
         open={legacyReviewOpen}
         mode="components"

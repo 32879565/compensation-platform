@@ -206,9 +206,7 @@ describe('GradesPage', () => {
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
 
     await screen.findByText('门店主管')
-    expect(
-      screen.getByRole('region', { name: '默认展示旧系统真实数据-grades' }),
-    ).toBeTruthy()
+    expect(screen.getByRole('region', { name: '默认展示旧系统真实数据-grades' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '从真实数据区创建正式职级' }))
 
     expect(screen.getByRole('dialog', { name: '旧系统真实数据-grades' })).toBeTruthy()
@@ -225,9 +223,7 @@ describe('GradesPage', () => {
 
     await screen.findByText('门店主管')
     expect(screen.queryByRole('button', { name: '审阅旧系统真实数据' })).toBeNull()
-    expect(
-      screen.queryByRole('region', { name: '默认展示旧系统真实数据-grades' }),
-    ).toBeNull()
+    expect(screen.queryByRole('region', { name: '默认展示旧系统真实数据-grades' })).toBeNull()
   })
 
   it('edits a grade with its current version', async () => {

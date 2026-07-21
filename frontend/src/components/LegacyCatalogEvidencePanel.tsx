@@ -88,7 +88,12 @@ const componentColumns: ColumnsType<LegacyComponentCandidate> = [
     width: 170,
     render: (_value, candidate) => `${candidate.period_from} 至 ${candidate.period_to}`,
   },
-  { title: '目录状态', key: 'status', width: 160, render: (_value, candidate) => componentStatus(candidate) },
+  {
+    title: '目录状态',
+    key: 'status',
+    width: 160,
+    render: (_value, candidate) => componentStatus(candidate),
+  },
 ]
 
 const gradeColumns: ColumnsType<LegacyGradeCandidate> = [
@@ -118,7 +123,12 @@ const gradeColumns: ColumnsType<LegacyGradeCandidate> = [
     width: 170,
     render: (_value, candidate) => `${candidate.period_from} 至 ${candidate.period_to}`,
   },
-  { title: '目录状态', key: 'status', width: 160, render: (_value, candidate) => gradeStatus(candidate) },
+  {
+    title: '目录状态',
+    key: 'status',
+    width: 160,
+    render: (_value, candidate) => gradeStatus(candidate),
+  },
 ]
 
 export default function LegacyCatalogEvidencePanel({
@@ -196,9 +206,7 @@ export default function LegacyCatalogEvidencePanel({
 
           <div
             role="region"
-            aria-label={
-              mode === 'components' ? '旧系统真实薪资组件数据' : '旧系统真实职级数据'
-            }
+            aria-label={mode === 'components' ? '旧系统真实薪资组件数据' : '旧系统真实职级数据'}
             tabIndex={0}
             style={{ overflowX: 'auto' }}
             onKeyDown={handleHorizontalRegionKeyDown}

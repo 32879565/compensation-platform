@@ -104,9 +104,7 @@ describe('ComponentsPage', () => {
   it('shows a clear salary component page title', async () => {
     renderPage()
 
-    expect(
-      await screen.findByText('薪资组件', { selector: '.ant-card-head-title' }),
-    ).toBeTruthy()
+    expect(await screen.findByText('薪资组件', { selector: '.ant-card-head-title' })).toBeTruthy()
   })
 
   it('shows whether an allowance is configured for attendance proration', async () => {
@@ -125,9 +123,7 @@ describe('ComponentsPage', () => {
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
 
     await screen.findByText('餐补')
-    expect(
-      screen.getByRole('region', { name: '默认展示旧系统真实数据-components' }),
-    ).toBeTruthy()
+    expect(screen.getByRole('region', { name: '默认展示旧系统真实数据-components' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '从真实数据区创建正式组件' }))
 
     expect(screen.getByRole('dialog', { name: '旧系统真实数据-components' })).toBeTruthy()
@@ -142,9 +138,7 @@ describe('ComponentsPage', () => {
 
     await screen.findByText('餐补')
     expect(screen.queryByRole('button', { name: '审阅旧系统真实数据' })).toBeNull()
-    expect(
-      screen.queryByRole('region', { name: '默认展示旧系统真实数据-components' }),
-    ).toBeNull()
+    expect(screen.queryByRole('region', { name: '默认展示旧系统真实数据-components' })).toBeNull()
   })
 
   it('lets payroll configuration writers update attendance proration', async () => {
