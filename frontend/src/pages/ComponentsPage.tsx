@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
   Button,
+  Card,
   Checkbox,
   Form,
   Input,
@@ -395,7 +396,7 @@ export default function ComponentsPage() {
     editing?.component_type === 'ALLOWANCE' && editing.allowance_kind === null
 
   return (
-    <div>
+    <Card title="薪资组件">
       <Space wrap style={{ marginBottom: 16 }}>
         {canWrite && (
           <Button
@@ -737,6 +738,6 @@ export default function ComponentsPage() {
           void invalidateCatalog()
         }}
       />
-    </div>
+    </Card>
   )
 }

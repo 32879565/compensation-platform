@@ -19,7 +19,7 @@ export const NAV_ITEMS: readonly NavigationItem[] = [
     label: '历史薪资',
     permission: Perm.SALARY_READ,
   },
-  { key: 'grades', path: '/grades', label: '职级薪档', permission: Perm.GRADE_READ },
+  { key: 'grades', path: '/grades', label: '职级体系', permission: Perm.GRADE_READ },
   { key: 'components', path: '/components', label: '薪资组件', permission: Perm.STRUCTURE_READ },
   {
     key: 'comp-appeals',
