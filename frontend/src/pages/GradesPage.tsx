@@ -154,10 +154,10 @@ function SalaryRail({ band }: { band: SalaryBand }) {
 }
 
 export default function GradesPage() {
-  const { user, hasPermission } = useAuth()
+  const { user, hasPermission, hasGlobalPermission } = useAuth()
   const queryScope = user?.username ?? 'anonymous'
   const canWrite = hasPermission('grade:write')
-  const canReviewLegacy = canWrite && hasPermission('import:run')
+  const canReviewLegacy = hasGlobalPermission('grade:write') && hasGlobalPermission('import:run')
   const qc = useQueryClient()
   const [statusFilter, setStatusFilter] = useState<GradeCatalogStatus>('active')
   const [createOpen, setCreateOpen] = useState(false)
@@ -403,11 +403,6 @@ export default function GradesPage() {
             }}
           >
             新增职级
-          </Button>
-        )}
-        {canReviewLegacy && (
-          <Button disabled={gradeReadUnavailable} onClick={() => setLegacyReviewOpen(true)}>
-            审阅旧系统真实数据
           </Button>
         )}
         <Typography.Text>
@@ -764,11 +759,18 @@ export default function GradesPage() {
       </Modal>
 
       {canReviewLegacy && (
-        <LegacyCatalogEvidencePanel mode="grades" onReview={() => setLegacyReviewOpen(true)} />
+        <LegacyCatalogEvidencePanel
+          mode="grades"
+          catalogReadUnavailable={gradeReadUnavailable}
+          onReview={() => {
+            if (!gradeReadUnavailable) setLegacyReviewOpen(true)
+          }}
+        />
       )}
       <LegacyCatalogReviewDrawer
         open={legacyReviewOpen}
         mode="grades"
+        catalogReadUnavailable={gradeReadUnavailable}
         onClose={() => setLegacyReviewOpen(false)}
         onApplied={() => {
           setLegacyReviewOpen(false)

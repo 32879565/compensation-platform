@@ -2,13 +2,22 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const auth = vi.hoisted(() => ({ logout: vi.fn(), permissions: ['salary:read'] as string[] }))
+const auth = vi.hoisted(() => ({
+  logout: vi.fn(),
+  permissions: ['salary:read'] as string[],
+  globalPermissions: [] as string[],
+}))
 
 vi.mock('../auth/AuthContext', () => ({
   useAuth: () => ({
-    user: { username: 'preview_admin' },
+    user: {
+      username: 'preview_admin',
+      permissions: auth.permissions,
+      globalPermissions: auth.globalPermissions,
+    },
     logout: auth.logout,
     hasPermission: (permission: string) => auth.permissions.includes(permission),
+    hasGlobalPermission: (permission: string) => auth.globalPermissions.includes(permission),
   }),
 }))
 
@@ -17,6 +26,7 @@ import { AppShell } from './AppShell'
 describe('AppShell historical salary navigation', () => {
   beforeEach(() => {
     auth.permissions = ['salary:read']
+    auth.globalPermissions = []
     auth.logout.mockReset()
   })
 
@@ -49,6 +59,47 @@ describe('AppShell historical salary navigation', () => {
 
     expect(screen.getByTestId('nav-grades').textContent).toBe('职级体系')
     expect(screen.getByTestId('nav-components').textContent).toBe('薪资组件')
+  })
+
+  it('shows salary import navigation only to import operators', () => {
+    auth.permissions = ['import:run']
+    auth.globalPermissions = ['import:run']
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <AppShell>
+          <div>content</div>
+        </AppShell>
+      </MemoryRouter>,
+    )
+
+    expect(screen.getByTestId('nav-imports').textContent).toBe('薪酬导入')
+  })
+
+  it('hides salary import navigation from locally scoped import operators', () => {
+    auth.permissions = ['import:run']
+    auth.globalPermissions = []
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <AppShell>
+          <div>content</div>
+        </AppShell>
+      </MemoryRouter>,
+    )
+
+    expect(screen.queryByTestId('nav-imports')).toBeNull()
+  })
+
+  it('hides salary import navigation without import permission', () => {
+    auth.permissions = ['salary:read']
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <AppShell>
+          <div>content</div>
+        </AppShell>
+      </MemoryRouter>,
+    )
+
+    expect(screen.queryByTestId('nav-imports')).toBeNull()
   })
 
   it('handles a rejected logout request without leaking an unhandled promise', async () => {

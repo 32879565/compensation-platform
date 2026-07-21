@@ -48,6 +48,7 @@ from app.payroll.batch_service import (
     supplement_dispute,
     unlock_batch,
 )
+from app.payroll.guards import lock_payroll_input_mutation
 
 router = APIRouter(prefix="/api/batches", tags=["batch"])
 
@@ -261,6 +262,7 @@ def create_batch(
     session: Session = Depends(get_session),
 ) -> PayrollBatch:
     _require_global_batch_lifecycle_permission(session, principal, Perm.PAYROLL_RUN)
+    lock_payroll_input_mutation(session)
     batch = PayrollBatch(
         period=body.period,
         attendance_start=body.attendance_start,

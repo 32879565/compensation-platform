@@ -112,7 +112,57 @@ MERGED_FIELD_LABELS: frozenset[str] = frozenset(
 
 # 金额类字段（用于影子行判定与数值校验）
 MONEY_FIELDS: frozenset[str] = frozenset(
-    {"综合薪资", "应发工资", "合计工资", "实发工资", "出勤工资", "基本薪资", "补贴", "法定出勤"}
+    {
+        "综合薪资",
+        "应发工资",
+        "合计工资",
+        "实发工资",
+        "出勤工资",
+        "基本薪资",
+        "补贴",
+        "法定出勤",
+        "加班工资",
+        "法定节假日工资",
+        "固定补贴",
+        "浮动补贴",
+        "房补",
+        "上月补发",
+        "上月补扣",
+        "押金",
+        "实际计薪出勤天数",
+        "实际出勤天数",
+        "出勤天数",
+        "法定节假日天数",
+        "法定节假日出勤天数",
+        "法定出勤天数",
+        "社保",
+        "公积金",
+        "个税",
+        "其他扣款",
+        "结转下月",
+    }
+)
+
+# Current payroll uploads are an executable instruction, not a generic data
+# archive.  Keep their persisted JSON limited to reviewed payroll fields so an
+# arbitrary column (for example an ID card or bank account) cannot bypass the
+# encrypted employee master-data fields and appear in salary APIs.
+CURRENT_IMPORT_FIELDS: frozenset[str] = MONEY_FIELDS | frozenset(
+    {
+        "复核部门",
+        "部门",
+        "所属部门",
+        "职位",
+        "入职日期",
+        "休息天数",
+        "折算天数",
+        "旷工",
+        "带薪假",
+        "车费报销",
+        "个人奖金系数",
+        "春节补贴",
+        "化妆/饮品补贴",
+    }
 )
 
 # 跨列应【累加】而非覆盖的字段（如元旦法定+清明法定→法定出勤）
@@ -128,5 +178,5 @@ SUMMARY_ROW_NAMES: frozenset[str] = frozenset(
 
 # 非员工工作表 / 门店标题黑名单（调店/留守等占位表）
 SKIP_SHEET_TITLES: frozenset[str] = frozenset(
-    {"绩效所在门店", "留守", "调店", "运营组", "深圳运营"}
+    {"使用说明", "导入说明", "绩效所在门店", "留守", "调店", "运营组", "深圳运营"}
 )

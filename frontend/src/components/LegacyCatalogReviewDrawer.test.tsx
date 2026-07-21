@@ -193,6 +193,15 @@ describe('LegacyCatalogReviewDrawer', () => {
     legacyApi.applyLegacyGrade.mockResolvedValue({ grade: { id: 6 }, band: { id: 7 } })
   })
 
+  it('blocks every legacy write when the formal catalogue cannot be read', async () => {
+    renderDrawer({ catalogReadUnavailable: true })
+
+    expect(await screen.findByText('正式目录当前不可用，已禁止导入')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '审阅并导入' })).toBeNull()
+    expect(legacyApi.applyLegacyComponent).not.toHaveBeenCalled()
+    expect(legacyApi.applyLegacyGrade).not.toHaveBeenCalled()
+  })
+
   afterEach(cleanup)
 
   it('queries only after opening and shows aggregate source evidence without personal details', async () => {

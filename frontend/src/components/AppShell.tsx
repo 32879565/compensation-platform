@@ -3,17 +3,15 @@ import type { ReactNode } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 
 import { useAuth } from '../auth/AuthContext'
-import { NAV_ITEMS } from '../auth/navigation'
+import { canAccessNavigationItem, NAV_ITEMS } from '../auth/navigation'
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const { user, logout, hasPermission } = useAuth()
+  const { user, logout } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
 
-  const items = NAV_ITEMS.filter((m) =>
-    typeof m.permission === 'string'
-      ? hasPermission(m.permission)
-      : m.permission.some((permission) => hasPermission(permission)),
+  const items = NAV_ITEMS.filter((item) =>
+    canAccessNavigationItem(user?.permissions ?? [], user?.globalPermissions ?? [], item),
   ).map((m) => ({
     key: m.key,
     label: <span data-testid={`nav-${m.key}`}>{m.label}</span>,

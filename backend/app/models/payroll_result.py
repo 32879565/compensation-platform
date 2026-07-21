@@ -8,10 +8,12 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -49,12 +51,25 @@ class PayrollResult(Base):
     __tablename__ = "payroll_result"
     __table_args__ = (
         UniqueConstraint("batch_id", "employee_id", "version", name="uq_result_batch_emp_ver"),
+        Index(
+            "uq_result_import_batch_employee",
+            "source_import_batch_id",
+            "employee_id",
+            unique=True,
+            postgresql_where=text("source_import_batch_id IS NOT NULL"),
+        ),
+        Index("ix_payroll_result_batch_version", "batch_id", "batch_version"),
     )
 
     batch_id: Mapped[int] = mapped_column(
         ForeignKey("payroll_batch.id"), nullable=False, index=True
     )
     employee_id: Mapped[int] = mapped_column(ForeignKey("employee.id"), nullable=False, index=True)
+    # Set only for results created from an HR-confirmed final-payroll workbook.
+    # Engine-calculated historical rows remain null.
+    source_import_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("import_batch.id"), nullable=True
+    )
     # 批次解锁后的新复核轮次。与员工级 version 共同定位不可覆盖的历史结果。
     batch_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

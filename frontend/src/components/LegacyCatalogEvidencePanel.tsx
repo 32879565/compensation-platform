@@ -12,9 +12,11 @@ import {
 export interface LegacyCatalogEvidencePanelProps {
   mode: 'components' | 'grades'
   onReview: () => void
+  catalogReadUnavailable?: boolean
 }
 
 const HORIZONTAL_SCROLL_STEP = 80
+const LEGACY_PREVIEW_STALE_TIME_MS = 5 * 60 * 1000
 
 const COMPONENT_TYPE_LABELS: Record<string, string> = {
   BASE: '基本薪资',
@@ -134,25 +136,56 @@ const gradeColumns: ColumnsType<LegacyGradeCandidate> = [
 export default function LegacyCatalogEvidencePanel({
   mode,
   onReview,
+  catalogReadUnavailable = false,
 }: LegacyCatalogEvidencePanelProps) {
   const previewQuery = useQuery({
     queryKey: ['legacy-catalog-preview'],
     queryFn: fetchLegacyCatalogPreview,
+    staleTime: LEGACY_PREVIEW_STALE_TIME_MS,
+    refetchOnMount: true,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   })
 
   const reviewLabel = mode === 'components' ? '审核并创建正式组件' : '审核并创建正式职级'
+  const pendingCount = previewQuery.data
+    ? mode === 'components'
+      ? previewQuery.data.component_candidates.filter(
+          (candidate) => candidate.importable && !candidate.applied,
+        ).length
+      : previewQuery.data.grade_candidates.filter(
+          (candidate) => !candidate.suppressed_for_privacy && !candidate.applied,
+        ).length
+    : 0
+  const reviewUnavailable =
+    catalogReadUnavailable ||
+    previewQuery.isLoading ||
+    previewQuery.isFetching ||
+    previewQuery.isError ||
+    !previewQuery.data ||
+    pendingCount === 0
 
   return (
     <Card
       title={
         <Space wrap>
           <span>旧系统真实数据</span>
-          <Tag color="gold">待确认目录</Tag>
+          {previewQuery.data && pendingCount === 0 ? (
+            <Tag color="green">可审阅项已同步</Tag>
+          ) : (
+            <Tag color="gold">待确认目录</Tag>
+          )}
         </Space>
       }
       extra={
-        <Button type="primary" disabled={!previewQuery.data} onClick={onReview}>
-          {reviewLabel}
+        <Button
+          type="primary"
+          disabled={reviewUnavailable}
+          onClick={() => {
+            if (!reviewUnavailable) onReview()
+          }}
+        >
+          {previewQuery.data && pendingCount === 0 ? '无待处理项' : reviewLabel}
         </Button>
       }
     >
@@ -192,7 +225,7 @@ export default function LegacyCatalogEvidencePanel({
               <Typography.Text>
                 {mode === 'components'
                   ? `${previewQuery.data.component_candidates.length} 项历史字段`
-                  : `${previewQuery.data.grade_candidates.length} 个历史职位`}
+                  : `${previewQuery.data.grade_candidates.length} 个达到隐私展示阈值的历史职位`}
               </Typography.Text>
             </Space>
           </div>

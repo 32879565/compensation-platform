@@ -136,10 +136,11 @@ function isConflict(error: unknown): boolean {
 }
 
 export default function ComponentsPage() {
-  const { user, hasPermission } = useAuth()
+  const { user, hasPermission, hasGlobalPermission } = useAuth()
   const queryScope = user?.username ?? 'anonymous'
   const canWrite = hasPermission('salary_structure:write')
-  const canReviewLegacy = canWrite && hasPermission('import:run')
+  const canReviewLegacy =
+    hasGlobalPermission('salary_structure:write') && hasGlobalPermission('import:run')
   const qc = useQueryClient()
   const [statusFilter, setStatusFilter] = useState<ComponentCatalogStatus>('active')
   const [createOpen, setCreateOpen] = useState(false)
@@ -409,11 +410,6 @@ export default function ComponentsPage() {
             }}
           >
             新增组件
-          </Button>
-        )}
-        {canReviewLegacy && (
-          <Button disabled={componentReadUnavailable} onClick={() => setLegacyReviewOpen(true)}>
-            审阅旧系统真实数据
           </Button>
         )}
         <Typography.Text>
@@ -731,11 +727,18 @@ export default function ComponentsPage() {
       </Modal>
 
       {canReviewLegacy && (
-        <LegacyCatalogEvidencePanel mode="components" onReview={() => setLegacyReviewOpen(true)} />
+        <LegacyCatalogEvidencePanel
+          mode="components"
+          catalogReadUnavailable={componentReadUnavailable}
+          onReview={() => {
+            if (!componentReadUnavailable) setLegacyReviewOpen(true)
+          }}
+        />
       )}
       <LegacyCatalogReviewDrawer
         open={legacyReviewOpen}
         mode="components"
+        catalogReadUnavailable={componentReadUnavailable}
         onClose={() => setLegacyReviewOpen(false)}
         onApplied={() => {
           setLegacyReviewOpen(false)

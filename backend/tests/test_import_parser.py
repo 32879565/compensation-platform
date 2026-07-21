@@ -1,9 +1,13 @@
 import io
+import re
+import struct
 from decimal import Decimal
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from openpyxl import Workbook
 
+from app.importing import excel as excel_import
 from app.importing.excel import read_salary_workbook
 from app.importing.parser import (
     SalaryRow,
@@ -140,6 +144,194 @@ def test_workbook_applies_legacy_store_aliases_by_default():
     result = read_salary_workbook(source, period="2026-05")
 
     assert result.rows[0].store_name == "天河智慧城店"
+
+
+def test_workbook_skips_instruction_sheet_and_reads_template_data_sheet():
+    workbook = Workbook()
+    instructions = workbook.active
+    instructions.title = "使用说明"
+    instructions.append(["人事导入前请核对工号与门店"])
+    sheet = workbook.create_sheet("海岸城店")
+    sheet.append(["海岸城店"])
+    sheet.append(["第 3 行为表头"])
+    sheet.append(["工号", "姓名", "复核部门", "综合薪资", "实发工资"])
+    sheet.append(["E1", "张三", "厅面", 5000, 4800])
+    source = io.BytesIO()
+    workbook.save(source)
+    source.seek(0)
+
+    result = read_salary_workbook(source, period="2026-07")
+
+    assert result.warnings == []
+    assert len(result.rows) == 1
+    assert result.rows[0].emp_no == "E1"
+    assert result.rows[0].store_name == "深圳海岸城店"
+    assert result.rows[0].fields["复核部门"] == "厅面"
+    assert result.rows[0].money["综合薪资"] == Decimal("5000")
+
+
+def test_workbook_rejects_an_excessive_worksheet_column_dimension():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.cell(row=1, column=257, value="姓名")
+    source = io.BytesIO()
+    workbook.save(source)
+    source.seek(0)
+
+    with pytest.raises(excel_import.WorkbookLimitError, match="column"):
+        read_salary_workbook(source, period="2026-07")
+
+
+def test_workbook_does_not_silently_truncate_rows_when_dimension_is_underreported():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "广州店"
+    sheet.append(["广州店"])
+    sheet.append(["工号", "姓名", "复核部门", "实发工资"])
+    sheet.append(["E1", "张三", "厅面", 4800])
+    sheet.append(["E2", "李四", "厨房", 5200])
+    original = io.BytesIO()
+    workbook.save(original)
+    original.seek(0)
+
+    forged = io.BytesIO()
+    with (
+        ZipFile(original, mode="r") as source_archive,
+        ZipFile(forged, mode="w", compression=ZIP_DEFLATED) as target_archive,
+    ):
+        for member in source_archive.infolist():
+            content = source_archive.read(member.filename)
+            if member.filename == "xl/worksheets/sheet1.xml":
+                content = re.sub(
+                    rb'<dimension ref="[^"]+"',
+                    b'<dimension ref="A1:D3"',
+                    content,
+                    count=1,
+                )
+            target_archive.writestr(member, content)
+    forged.seek(0)
+
+    result = read_salary_workbook(forged, period="2026-07")
+
+    assert [row.emp_no for row in result.rows] == ["E1", "E2"]
+
+
+def test_workbook_rejects_an_excessive_archive_compression_ratio():
+    source = io.BytesIO()
+    with ZipFile(source, mode="w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("xl/worksheets/sheet1.xml", b"0" * 1_000_000)
+    source.seek(0)
+
+    with pytest.raises(excel_import.WorkbookLimitError, match="compression ratio"):
+        read_salary_workbook(source, period="2026-07")
+
+
+def test_workbook_rejects_excessive_zip_entries_before_materializing_the_directory():
+    # A valid-looking end-of-central-directory record is enough to prove the
+    # bounded preflight happens before ZipFile creates one object per member.
+    source = io.BytesIO(struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1001, 1001, 0, 0, 0))
+
+    with pytest.raises(excel_import.WorkbookLimitError, match="member count"):
+        read_salary_workbook(source, period="2026-07")
+
+
+def test_workbook_counts_central_directory_records_before_constructing_zipfile(monkeypatch):
+    central_header = b"PK\x01\x02" + (b"\x00" * 42)
+    central_directory = central_header * 1_001
+    # The attacker lies in EOCD (declares one entry) while the directory has
+    # 1,001 records. The bounded raw preflight must reject before ZipFile.
+    eocd = struct.pack(
+        "<4s4H2LH",
+        b"PK\x05\x06",
+        0,
+        0,
+        1,
+        1,
+        len(central_directory),
+        0,
+        0,
+    )
+    source = io.BytesIO(central_directory + eocd)
+    monkeypatch.setattr(
+        excel_import,
+        "ZipFile",
+        lambda *_args, **_kwargs: pytest.fail("ZipFile must not be constructed"),
+    )
+
+    with pytest.raises(excel_import.WorkbookLimitError, match="member count"):
+        read_salary_workbook(source, period="2026-07")
+
+
+def test_streamed_row_limits_do_not_trust_optional_worksheet_dimensions():
+    with pytest.raises(excel_import.WorkbookLimitError, match="row dimension"):
+        excel_import._validate_streamed_row(20_001, (), processed_cells=0)
+
+    with pytest.raises(excel_import.WorkbookLimitError, match="column dimension"):
+        excel_import._validate_streamed_row(1, (None,) * 257, processed_cells=0)
+
+    with pytest.raises(excel_import.WorkbookLimitError, match="cell dimension"):
+        excel_import._validate_streamed_row(
+            1,
+            (None,),
+            processed_cells=excel_import.MAX_WORKSHEET_DIMENSION_CELLS,
+        )
+
+
+def test_workbook_rejects_an_excessive_number_of_worksheets():
+    workbook = Workbook()
+    for index in range(excel_import.MAX_WORKBOOK_SHEETS):
+        workbook.create_sheet(f"S{index}")
+    source = io.BytesIO()
+    workbook.save(source)
+    source.seek(0)
+
+    with pytest.raises(excel_import.WorkbookLimitError, match="worksheet count"):
+        read_salary_workbook(source, period="2026-07")
+
+
+def test_workbook_global_cell_budget_is_cumulative_across_sheets():
+    with pytest.raises(excel_import.WorkbookLimitError, match="workbook cell budget"):
+        excel_import._accumulate_workbook_cells(
+            excel_import.MAX_WORKBOOK_STREAMED_CELLS,
+            additional_cells=1,
+        )
+
+
+def test_workbook_rejects_more_than_ten_thousand_employee_rows():
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet("广州店")
+    sheet.append(["工号", "姓名", "合计工资"])
+    for row_number in range(10_001):
+        sheet.append([f"E{row_number}", f"员工{row_number}", 5000])
+    source = io.BytesIO()
+    workbook.save(source)
+    source.seek(0)
+
+    with pytest.raises(ValueError, match="10000"):
+        read_salary_workbook(source, period="2026-05")
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "message"),
+    [
+        ("MAX_XLSX_ARCHIVE_MEMBERS", 1, "member"),
+        ("MAX_XLSX_MEMBER_BYTES", 256, "member expanded"),
+        ("MAX_XLSX_EXPANDED_BYTES", 1_024, "expanded"),
+    ],
+)
+def test_workbook_rejects_xlsx_archives_over_safety_limits(monkeypatch, limit_name, limit, message):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "广州店"
+    sheet.append(["工号", "姓名", "合计工资"])
+    sheet.append(["E1", "张三", 5000])
+    source = io.BytesIO()
+    workbook.save(source)
+    source.seek(0)
+    monkeypatch.setattr(excel_import, limit_name, limit, raising=False)
+
+    with pytest.raises(ValueError, match=message):
+        read_salary_workbook(source, period="2026-05")
 
 
 # ---------------- infer_month ----------------

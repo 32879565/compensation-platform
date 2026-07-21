@@ -12,15 +12,21 @@ from datetime import datetime
 from decimal import Decimal
 from urllib.parse import urlencode
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, aliased
 
 from app.approval import service as approvals
+from app.audit import service as audit
 from app.auth.permissions import Perm
 from app.auth.service import Principal
 from app.core.config import DingTalkMode, Settings, get_settings
 from app.db.session import SessionLocal
-from app.dingtalk.client import DingTalkClient, DingTalkClientError, get_dingtalk_client
+from app.dingtalk.client import (
+    DingTalkClient,
+    DingTalkClientError,
+    DingTalkSendOutcomeUnknown,
+    get_dingtalk_client,
+)
 from app.models.approval import ApprovalActionType, ApprovalBusinessType, ApprovalInstance
 from app.models.auth import Permission, RolePermission, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
@@ -58,6 +64,19 @@ def _now(session: Session) -> datetime:
     return session.scalar(select(func.now()))  # type: ignore[return-value]
 
 
+_REVIEW_AUTHORIZATION_TABLE_LOCK = text(
+    "LOCK TABLE app_user, permission, role_permission, user_review_scope, user_role "
+    "IN SHARE MODE"
+)
+
+
+def _lock_review_authorization_tables(session: Session) -> None:
+    """Freeze reviewer eligibility while a delivery is rendered and sent."""
+
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(_REVIEW_AUTHORIZATION_TABLE_LOCK)
+
+
 def _review_recipient_ids(
     session: Session, *, org_unit_id: int, department: Department
 ) -> list[int]:
@@ -81,6 +100,39 @@ def _review_recipient_ids(
             .order_by(UserReviewScope.user_id)
         ).all()
     )
+
+
+def _locked_authorized_review_recipient(
+    session: Session, *, delivery: DingTalkDelivery
+) -> User | None:
+    """Revalidate the sole staged reviewer under the authorization table lock."""
+
+    if delivery.recipient_user_id is None:
+        return None
+    recipient = session.scalars(
+        select(User)
+        .where(User.id == delivery.recipient_user_id)
+        .execution_options(populate_existing=True)
+    ).first()
+    if recipient is None or recipient.is_deleted or recipient.status != "ACTIVE":
+        return None
+    eligible_recipient_ids = set(
+        session.scalars(
+            select(UserReviewScope.user_id)
+            .join(User, User.id == UserReviewScope.user_id)
+            .join(UserRole, UserRole.user_id == UserReviewScope.user_id)
+            .join(RolePermission, RolePermission.role_id == UserRole.role_id)
+            .join(Permission, Permission.id == RolePermission.permission_id)
+            .where(
+                UserReviewScope.org_unit_id == delivery.org_unit_id,
+                UserReviewScope.department == delivery.department,
+                User.is_deleted.is_(False),
+                User.status == "ACTIVE",
+                Permission.code == Perm.PAYROLL_REVIEW,
+            )
+        ).all()
+    )
+    return recipient if eligible_recipient_ids == {recipient.id} else None
 
 
 def _review_delivery_key(
@@ -111,11 +163,16 @@ def _add_delivery_if_missing(
     if existing is not None:
         return existing, False
     result_version = batch.version if batch_version is None else batch_version
+    organization = session.get(OrgUnit, org_unit_id)
+    if organization is None:
+        raise DingTalkError("DingTalk delivery organization not found")
     sandboxed = initial_status is DingTalkDeliveryStatus.SANDBOXED
     delivery = DingTalkDelivery(
         batch_id=batch.id,
         batch_version=result_version,
         org_unit_id=org_unit_id,
+        period_snapshot=batch.period,
+        org_unit_name_snapshot=organization.name,
         department=department,
         recipient_user_id=recipient_user_id,
         kind=kind,
@@ -144,6 +201,58 @@ def _initial_delivery_state(
     if recipient is None or not recipient.dingtalk_user_id:
         return DingTalkDeliveryStatus.FAILED, "MISSING_DINGTALK_USER_ID"
     return DingTalkDeliveryStatus.PENDING, None
+
+
+_REVIEW_CONFIGURATION_ERROR_CODES = {
+    "MISSING_ELIGIBLE_RECIPIENT",
+    "AMBIGUOUS_ELIGIBLE_RECIPIENT",
+    "MISSING_DINGTALK_USER_ID",
+    "RECIPIENT_NOT_AUTHORIZED",
+}
+
+
+def _is_reusable_review_configuration_failure(delivery: DingTalkDelivery) -> bool:
+    return (
+        delivery.status is DingTalkDeliveryStatus.FAILED
+        and delivery.error_code in _REVIEW_CONFIGURATION_ERROR_CODES
+        and delivery.attempt_count == 0
+        and delivery.provider_task_id is None
+        and delivery.dispatched_at is None
+    )
+
+
+def _existing_review_delivery(
+    session: Session,
+    *,
+    batch: PayrollBatch,
+    org_unit_id: int,
+    department: Department,
+    idempotency_key: str,
+) -> DingTalkDelivery | None:
+    exact = session.scalars(
+        select(DingTalkDelivery)
+        .where(DingTalkDelivery.idempotency_key == idempotency_key)
+        .with_for_update()
+    ).first()
+    if exact is not None:
+        return exact
+    return session.scalars(
+        select(DingTalkDelivery)
+        .where(
+            DingTalkDelivery.batch_id == batch.id,
+            DingTalkDelivery.batch_version == batch.version,
+            DingTalkDelivery.org_unit_id == org_unit_id,
+            DingTalkDelivery.department == department,
+            DingTalkDelivery.kind == DingTalkDeliveryKind.PAYROLL_REVIEW,
+            DingTalkDelivery.status == DingTalkDeliveryStatus.FAILED,
+            DingTalkDelivery.error_code.in_(_REVIEW_CONFIGURATION_ERROR_CODES),
+            DingTalkDelivery.attempt_count == 0,
+            DingTalkDelivery.provider_task_id.is_(None),
+            DingTalkDelivery.dispatched_at.is_(None),
+        )
+        .order_by(DingTalkDelivery.id)
+        .with_for_update()
+    ).first()
 
 
 def stage_review_deliveries(
@@ -203,24 +312,58 @@ def stage_review_deliveries(
             settings=active_settings,
             missing_recipient_error=error_code,
         )
-        delivery, created = _add_delivery_if_missing(
-            session,
+        idempotency_key = _review_delivery_key(
             batch=batch,
             org_unit_id=confirmation.org_unit_id,
             department=confirmation.department,
             recipient_user_id=recipient_id,
-            kind=DingTalkDeliveryKind.PAYROLL_REVIEW,
-            idempotency_key=_review_delivery_key(
+        )
+        delivery = _existing_review_delivery(
+            session,
+            batch=batch,
+            org_unit_id=confirmation.org_unit_id,
+            department=confirmation.department,
+            idempotency_key=idempotency_key,
+        )
+        created = delivery is None
+        if delivery is None:
+            delivery, created = _add_delivery_if_missing(
+                session,
                 batch=batch,
                 org_unit_id=confirmation.org_unit_id,
                 department=confirmation.department,
                 recipient_user_id=recipient_id,
-            ),
-            initial_status=initial_status,
-            error_code=error_code,
-        )
+                kind=DingTalkDeliveryKind.PAYROLL_REVIEW,
+                idempotency_key=idempotency_key,
+                initial_status=initial_status,
+                error_code=error_code,
+            )
         if not created:
             existing += 1
+            if delivery.status is DingTalkDeliveryStatus.FAILED:
+                if initial_status is DingTalkDeliveryStatus.FAILED:
+                    configuration_failures += 1
+                    if _is_reusable_review_configuration_failure(delivery):
+                        delivery.recipient_user_id = recipient_id
+                        delivery.idempotency_key = idempotency_key
+                        delivery.error_code = error_code
+                elif _is_reusable_review_configuration_failure(delivery):
+                    delivery.recipient_user_id = recipient_id
+                    delivery.idempotency_key = idempotency_key
+                    delivery.status = initial_status
+                    delivery.error_code = None
+                    delivery.provider_task_id = None
+                    if initial_status is DingTalkDeliveryStatus.SANDBOXED:
+                        delivery.attempt_count = 1
+                        delivery.dispatched_at = _now(session)
+                    else:
+                        delivery.attempt_count = 0
+                        delivery.dispatched_at = None
+                    routed += 1
+                    if delivery.status is DingTalkDeliveryStatus.PENDING:
+                        pending_deliveries.append(delivery)
+            elif delivery.status is DingTalkDeliveryStatus.PENDING:
+                pending_deliveries.append(delivery)
         elif delivery.status is DingTalkDeliveryStatus.FAILED:
             configuration_failures += 1
         else:
@@ -241,6 +384,9 @@ _DEPARTMENT_LABEL = {
     Department.KITCHEN: "厨房",
     Department.OTHER: "其他",
 }
+_REVIEW_MARKDOWN_MAX_CHARS = 1_000
+_REVIEW_MARKDOWN_MAX_BYTES = 900
+_REVIEW_CONFIDENTIALITY_FOOTER = "> 薪资敏感信息，仅限本门店本部门授权负责人查看。"
 
 
 def _markdown_plain(value: str) -> str:
@@ -258,9 +404,7 @@ def _review_action_card(
     delivery: DingTalkDelivery,
     settings: Settings,
 ) -> tuple[str, str, str]:
-    batch = session.get(PayrollBatch, delivery.batch_id)
-    organization = session.get(OrgUnit, delivery.org_unit_id)
-    if batch is None or organization is None:
+    if not delivery.period_snapshot or not delivery.org_unit_name_snapshot:
         raise DingTalkError("The delivery source record is incomplete")
 
     latest = aliased(PayrollResult)
@@ -276,47 +420,66 @@ def _review_action_card(
     )
     results = list(
         session.execute(
-            select(Employee.name, PayrollResult.gross, PayrollResult.net)
-            .join(Employee, Employee.id == PayrollResult.employee_id)
+            select(
+                PayrollResult.employee_name_snapshot,
+                PayrollResult.employee_id,
+                PayrollResult.gross,
+                PayrollResult.net,
+            )
             .where(
                 PayrollResult.batch_id == delivery.batch_id,
                 PayrollResult.batch_version == delivery.batch_version,
                 PayrollResult.org_unit_id == delivery.org_unit_id,
                 PayrollResult.department == delivery.department,
                 PayrollResult.version == latest_version,
-                Employee.is_deleted.is_(False),
             )
-            .order_by(Employee.name, Employee.id)
+            .order_by(PayrollResult.employee_name_snapshot, PayrollResult.employee_id)
         ).all()
     )
     if not results:
         raise DingTalkError("The delivery has no payroll results")
 
-    title = f"{batch.period} 薪资复核"
+    title = f"{delivery.period_snapshot} 薪资复核"
     lines = [
         f"### {_markdown_plain(title)}",
-        f"门店：{_markdown_plain(organization.name)}",
+        f"门店：{_markdown_plain(delivery.org_unit_name_snapshot)}",
         f"部门：{_DEPARTMENT_LABEL[delivery.department]}",
         f"人数：{len(results)}",
         "",
     ]
-    omitted = 0
-    for name, gross, net in results:
-        line = f"- {_markdown_plain(name)}：应发 {gross:.2f}，实发 {net:.2f}"
-        if len("\n".join([*lines, line]).encode("utf-8")) > 1200:
-            omitted += 1
-        else:
-            lines.append(line)
-    if omitted:
-        lines.append(f"- 另有 {omitted} 人，请进入系统查看")
-    lines.extend(["", "> 薪资敏感信息，仅限本门店本部门授权负责人查看。"])
+    detail_lines: list[str] = []
+
+    def render(candidate_lines: list[str]) -> str:
+        omitted = len(results) - len(candidate_lines)
+        rendered = [*lines, *candidate_lines]
+        if omitted:
+            rendered.append(f"- 另有 {omitted} 人，请进入系统查看")
+        rendered.extend(["", _REVIEW_CONFIDENTIALITY_FOOTER])
+        return "\n".join(rendered)
+
+    for name, employee_id, gross, net in results:
+        display_name = name or f"员工#{employee_id}"
+        line = f"- {_markdown_plain(display_name)}：应发 {gross:.2f}，实发 {net:.2f}"
+        candidate = render([*detail_lines, line])
+        if (
+            len(candidate) > _REVIEW_MARKDOWN_MAX_CHARS
+            or len(candidate.encode("utf-8")) > _REVIEW_MARKDOWN_MAX_BYTES
+        ):
+            break
+        detail_lines.append(line)
+    markdown = render(detail_lines)
+    if (
+        len(markdown) > _REVIEW_MARKDOWN_MAX_CHARS
+        or len(markdown.encode("utf-8")) > _REVIEW_MARKDOWN_MAX_BYTES
+    ):
+        raise DingTalkError("The delivery notification metadata exceeds the provider limit")
 
     public_base_url = settings.dingtalk_public_base_url
     if public_base_url is None:
         raise DingTalkError("DingTalk public base URL is not configured")
     query = urlencode({"delivery_id": delivery.id})
     action_url = f"{str(public_base_url).rstrip('/')}/comp-appeals?{query}"
-    return title, "\n".join(lines), action_url
+    return title, markdown, action_url
 
 
 def _appeal_status_action_card(
@@ -343,6 +506,7 @@ def dispatch_live_delivery(
     active_settings = settings or get_settings()
     if active_settings.dingtalk_mode is not DingTalkMode.LIVE:
         raise DingTalkError("Live DingTalk delivery is disabled")
+    _lock_review_authorization_tables(session)
     delivery = session.scalars(
         select(DingTalkDelivery).where(DingTalkDelivery.id == delivery_id).with_for_update()
     ).first()
@@ -350,13 +514,27 @@ def dispatch_live_delivery(
         raise DingTalkError("DingTalk delivery not found")
     if delivery.status is DingTalkDeliveryStatus.SENT:
         return delivery
+    if (
+        delivery.status is DingTalkDeliveryStatus.FAILED
+        and delivery.error_code == "PROVIDER_SEND_OUTCOME_UNKNOWN"
+        and delivery.attempt_count > 0
+        and delivery.provider_task_id is None
+    ):
+        raise DingTalkError(
+            "DingTalk delivery outcome is unknown; reconcile it in DingTalk before retrying"
+        )
     if delivery.status is DingTalkDeliveryStatus.SANDBOXED:
         raise DingTalkError("A sandbox delivery cannot be promoted to a live notification")
-    recipient = (
-        session.get(User, delivery.recipient_user_id)
-        if delivery.recipient_user_id is not None
-        else None
-    )
+    recipient = None
+    if delivery.kind is DingTalkDeliveryKind.PAYROLL_REVIEW:
+        recipient = _locked_authorized_review_recipient(session, delivery=delivery)
+        if delivery.recipient_user_id is not None and recipient is None:
+            delivery.status = DingTalkDeliveryStatus.FAILED
+            delivery.error_code = "RECIPIENT_NOT_AUTHORIZED"
+            session.flush()
+            return delivery
+    elif delivery.recipient_user_id is not None:
+        recipient = session.get(User, delivery.recipient_user_id)
     if recipient is None or not recipient.dingtalk_user_id:
         delivery.status = DingTalkDeliveryStatus.FAILED
         delivery.error_code = "MISSING_DINGTALK_USER_ID"
@@ -378,8 +556,58 @@ def dispatch_live_delivery(
         session.flush()
         return delivery
 
+    # Persist an unknown-outcome marker before crossing the provider boundary.
+    # If the process dies after DingTalk accepts the POST, a later retry fails
+    # closed instead of disclosing the same salary notification twice.
     delivery.attempt_count += 1
+    attempt_count = delivery.attempt_count
     delivery.dispatched_at = _now(session)
+    delivery.status = DingTalkDeliveryStatus.FAILED
+    delivery.error_code = "PROVIDER_SEND_OUTCOME_UNKNOWN"
+    delivery.provider_task_id = None
+    audit.record(
+        session,
+        action="dingtalk.delivery.dispatch.attempt",
+        result="PENDING",
+        target_type="dingtalk_delivery",
+        target_id=delivery.id,
+        detail={
+            "attempt_count": attempt_count,
+            "kind": delivery.kind.value,
+            "outcome": "UNKNOWN_UNTIL_CONFIRMED",
+        },
+    )
+    session.flush()
+    session.commit()
+
+    _lock_review_authorization_tables(session)
+    delivery = session.scalars(
+        select(DingTalkDelivery).where(DingTalkDelivery.id == delivery_id).with_for_update()
+    ).first()
+    if delivery is None:
+        raise DingTalkError("DingTalk delivery not found")
+    if (
+        delivery.status is not DingTalkDeliveryStatus.FAILED
+        or delivery.error_code != "PROVIDER_SEND_OUTCOME_UNKNOWN"
+        or delivery.attempt_count != attempt_count
+        or delivery.provider_task_id is not None
+    ):
+        raise DingTalkError("DingTalk delivery state changed before dispatch")
+    if delivery.kind is DingTalkDeliveryKind.PAYROLL_REVIEW:
+        recipient = _locked_authorized_review_recipient(session, delivery=delivery)
+        if delivery.recipient_user_id is not None and recipient is None:
+            delivery.error_code = "RECIPIENT_NOT_AUTHORIZED"
+            session.commit()
+            return delivery
+    elif delivery.recipient_user_id is not None:
+        recipient = session.get(User, delivery.recipient_user_id)
+    else:
+        recipient = None
+    if recipient is None or not recipient.dingtalk_user_id:
+        delivery.error_code = "MISSING_DINGTALK_USER_ID"
+        session.commit()
+        return delivery
+
     try:
         result = (client or get_dingtalk_client()).send_action_card(
             recipient_user_id=recipient.dingtalk_user_id,
@@ -387,6 +615,10 @@ def dispatch_live_delivery(
             markdown=markdown,
             action_url=action_url,
         )
+    except DingTalkSendOutcomeUnknown:
+        # Keep the durable pre-send marker.  There is deliberately no automatic
+        # retry path for an outcome that the provider cannot confirm.
+        pass
     except DingTalkClientError:
         delivery.status = DingTalkDeliveryStatus.FAILED
         delivery.error_code = "PROVIDER_SEND_FAILED"
@@ -394,7 +626,7 @@ def dispatch_live_delivery(
         delivery.status = DingTalkDeliveryStatus.SENT
         delivery.error_code = None
         delivery.provider_task_id = result.task_id
-    session.flush()
+    session.commit()
     return delivery
 
 
@@ -418,6 +650,7 @@ def dispatch_live_deliveries(delivery_ids: tuple[int, ...]) -> None:
 def retry_sandbox_delivery(session: Session, *, delivery_id: int) -> DingTalkDelivery:
     """Requeue a sandbox delivery without creating another notification payload."""
 
+    _lock_review_authorization_tables(session)
     delivery = session.scalars(
         select(DingTalkDelivery).where(DingTalkDelivery.id == delivery_id).with_for_update()
     ).first()
@@ -427,6 +660,14 @@ def retry_sandbox_delivery(session: Session, *, delivery_id: int) -> DingTalkDel
         raise DingTalkError("Fix the delivery routing configuration before retrying")
     if delivery.status is DingTalkDeliveryStatus.SENT:
         raise DingTalkError("A sent delivery cannot be retried in sandbox")
+    if (
+        delivery.kind is DingTalkDeliveryKind.PAYROLL_REVIEW
+        and _locked_authorized_review_recipient(session, delivery=delivery) is None
+    ):
+        delivery.status = DingTalkDeliveryStatus.FAILED
+        delivery.error_code = "RECIPIENT_NOT_AUTHORIZED"
+        session.flush()
+        return delivery
     delivery.status = DingTalkDeliveryStatus.SANDBOXED
     delivery.error_code = None
     delivery.attempt_count += 1

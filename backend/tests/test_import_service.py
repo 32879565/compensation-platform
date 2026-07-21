@@ -5,6 +5,7 @@ import pytest
 from openpyxl import Workbook
 from sqlalchemy import text
 
+from app.importing import service as import_service
 from app.importing.excel import read_salary_workbook
 from app.importing.parser import SalaryRow
 from app.importing.service import ImportError_, confirm_import, stage_import
@@ -177,6 +178,62 @@ def test_current_import_rejects_employee_master_store_mismatch(db_session):
     assert db_session.query(SalaryRecord).count() == 0
 
 
+def test_current_import_rejects_employee_number_name_mismatch(db_session):
+    store = OrgUnit(code="NAME-S1", name="Name Store", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    _employee(db_session, store, "NAME-E1", "Master Name")
+    batch = stage_import(
+        db_session,
+        filename="wrong-name.xlsx",
+        period="2026-05",
+        rows=[
+            _row(
+                "Workbook Name",
+                store.name,
+                emp_no="NAME-E1",
+                fields={"合计工资": "5000"},
+                money={"合计工资": Decimal("5000")},
+            )
+        ],
+    )
+
+    staged = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).one()
+    assert staged.status == RowStatus.ERROR
+    assert any("姓名不一致" in error for error in staged.errors)
+    with pytest.raises(ImportError_):
+        confirm_import(db_session, batch)
+
+
+def test_confirm_rechecks_employee_name_after_staging(db_session):
+    store = OrgUnit(code="RENAME-S1", name="Rename Store", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    employee = _employee(db_session, store, "RENAME-E1", "Original Name")
+    batch = stage_import(
+        db_session,
+        filename="before-rename.xlsx",
+        period="2026-05",
+        rows=[
+            _row(
+                employee.name,
+                store.name,
+                emp_no=employee.emp_no,
+                fields={"合计工资": "5000"},
+                money={"合计工资": Decimal("5000")},
+            )
+        ],
+    )
+    assert batch.error_rows == 0
+    employee.name = "Renamed Employee"
+    db_session.flush()
+
+    with pytest.raises(ImportError_, match="name does not match"):
+        confirm_import(db_session, batch)
+
+    assert db_session.query(SalaryRecord).count() == 0
+
+
 def test_confirm_rechecks_employee_master_store_after_staging(db_session):
     staged_store = OrgUnit(code="S1", name="Staged Store", type=OrgType.STORE, city="Guangzhou")
     transferred_store = OrgUnit(
@@ -209,7 +266,36 @@ def test_confirm_rechecks_employee_master_store_after_staging(db_session):
     assert db_session.query(SalaryRecord).count() == 0
 
 
-def test_confirm_twice_rejected(db_session):
+def test_confirm_rejects_unsupported_fields_left_in_a_legacy_parsed_batch(db_session):
+    store = OrgUnit(code="LEGACY-FIELD-S1", name="Legacy Field Store", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    employee = _employee(db_session, store, "LEGACY-FIELD-E1", "Legacy Field Employee")
+    batch = stage_import(
+        db_session,
+        filename="legacy-parsed.xlsx",
+        period="2026-05",
+        rows=[
+            _row(
+                employee.name,
+                store.name,
+                emp_no=employee.emp_no,
+                fields={"合计工资": "5000"},
+                money={"合计工资": Decimal("5000")},
+            )
+        ],
+    )
+    staged = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).one()
+    staged.parsed_fields = {**staged.parsed_fields, "银行卡号": "6222000000000000"}
+    db_session.flush()
+
+    with pytest.raises(ImportError_, match="模板未支持.*银行卡号"):
+        confirm_import(db_session, batch)
+
+    assert db_session.query(SalaryRecord).count() == 0
+
+
+def test_confirm_retry_is_idempotent(db_session):
     store = OrgUnit(code="S1", name="广州店", type=OrgType.STORE, city="广州")
     db_session.add(store)
     db_session.flush()
@@ -224,9 +310,100 @@ def test_confirm_twice_rejected(db_session):
         )
     ]
     batch = stage_import(db_session, filename="t.xlsx", period="2026-05", rows=rows)
-    confirm_import(db_session, batch)
-    with pytest.raises(ImportError_):
-        confirm_import(db_session, batch)
+    assert confirm_import(db_session, batch) == 1
+    assert confirm_import(db_session, batch) == 1
+    assert db_session.query(SalaryRecord).filter_by(import_batch_id=batch.id).count() == 1
+
+
+def test_restage_parsed_batch_clears_stale_master_data_errors(db_session, pg_engine):
+    rows = [
+        _row(
+            "Restaged Employee",
+            "Restaged Store",
+            emp_no="RESTAGE-E1",
+            fields={"合计工资": "5000"},
+            money={"合计工资": Decimal("5000")},
+        )
+    ]
+    batch = stage_import(
+        db_session,
+        filename="restage.xlsx",
+        period="2026-05",
+        rows=rows,
+        file_sha256="a" * 64,
+    )
+    original_staging_id = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).one().id
+    assert batch.error_rows == 1
+
+    store = OrgUnit(code="RESTAGE-S1", name="Restaged Store", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    _employee(db_session, store, "RESTAGE-E1", "Restaged Employee")
+
+    restaged = import_service.restage_import(
+        db_session,
+        batch,
+        filename="restage.xlsx",
+        period="2026-05",
+        rows=rows,
+        created_by=9,
+    )
+
+    staged = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).one()
+    assert restaged is True
+    assert batch.error_rows == 0
+    assert batch.total_rows == 1
+    assert batch.status == ImportStatus.PARSED
+    assert staged.id != original_staging_id
+    assert staged.status == RowStatus.OK
+    with pg_engine.connect() as competing_connection:
+        acquired = competing_connection.scalar(
+            text("SELECT pg_try_advisory_xact_lock(:key)"),
+            {"key": LEGACY_SALARY_DATASET_LOCK_KEY},
+        )
+        competing_connection.rollback()
+    assert acquired is False
+
+
+def test_restage_refuses_a_confirmed_batch_without_mutating_evidence(db_session):
+    store = OrgUnit(code="RESTAGE-S2", name="Confirmed Store", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    _employee(db_session, store, "RESTAGE-E2", "Confirmed Employee")
+    original_rows = [
+        _row(
+            "Confirmed Employee",
+            store.name,
+            emp_no="RESTAGE-E2",
+            fields={"合计工资": "5000"},
+            money={"合计工资": Decimal("5000")},
+        )
+    ]
+    batch = stage_import(
+        db_session,
+        filename="confirmed.xlsx",
+        period="2026-05",
+        rows=original_rows,
+        file_sha256="b" * 64,
+    )
+    assert confirm_import(db_session, batch) == 1
+    staging_id = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).one().id
+
+    restaged = import_service.restage_import(
+        db_session,
+        batch,
+        filename="renamed.xlsx",
+        period="2026-05",
+        rows=[_row("Replacement", store.name, emp_no="RESTAGE-E2")],
+        created_by=99,
+    )
+
+    staged = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).one()
+    assert restaged is False
+    assert batch.filename == "confirmed.xlsx"
+    assert staged.id == staging_id
+    assert staged.name == "Confirmed Employee"
+    assert db_session.query(SalaryRecord).filter_by(import_batch_id=batch.id).count() == 1
 
 
 def test_staging_row_status(db_session):
@@ -417,7 +594,42 @@ def test_current_import_stages_conflicting_store_for_same_period_emp_no(db_sessi
         ],
     )
 
-    staged = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).one()
-    assert batch.total_rows == 1
-    assert staged.status == RowStatus.ERROR
-    assert any("多个姓名或门店" in error for error in staged.errors)
+    staged = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).all()
+    assert batch.total_rows == 2
+    assert batch.error_rows == 2
+    assert all(row.status == RowStatus.ERROR for row in staged)
+    assert all(any("重复" in error for error in row.errors) for row in staged)
+
+
+def test_current_import_blocks_duplicate_real_payroll_rows_without_choosing_an_amount(db_session):
+    store = OrgUnit(code="S1", name="广州店", type=OrgType.STORE, city="广州")
+    db_session.add(store)
+    db_session.flush()
+    _employee(db_session, store, "E1", "张三")
+    batch = stage_import(
+        db_session,
+        filename="duplicate-payroll.xlsx",
+        period="2026-05",
+        rows=[
+            _row(
+                "张三",
+                "广州店",
+                emp_no="E1",
+                fields={"应发工资": "5000"},
+                money={"应发工资": Decimal("5000")},
+            ),
+            _row(
+                "张三",
+                "广州店",
+                emp_no="E1",
+                fields={"应发工资": "6000"},
+                money={"应发工资": Decimal("6000")},
+            ),
+        ],
+    )
+
+    staged = db_session.query(ImportStagingRow).filter_by(batch_id=batch.id).all()
+    assert batch.total_rows == 2
+    assert batch.error_rows == 2
+    assert {row.parsed_fields["应发工资"] for row in staged} == {"5000", "6000"}
+    assert all(any("重复" in error for error in row.errors) for row in staged)

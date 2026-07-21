@@ -7,6 +7,7 @@ export interface NavigationItem {
   path: string
   label: string
   permission: RoutePermission
+  requiresGlobalScope?: boolean
 }
 
 export const NAV_ITEMS: readonly NavigationItem[] = [
@@ -18,6 +19,13 @@ export const NAV_ITEMS: readonly NavigationItem[] = [
     path: '/salary-history',
     label: '历史薪资',
     permission: Perm.SALARY_READ,
+  },
+  {
+    key: 'imports',
+    path: '/imports',
+    label: '薪酬导入',
+    permission: Perm.IMPORT_RUN,
+    requiresGlobalScope: true,
   },
   { key: 'grades', path: '/grades', label: '职级体系', permission: Perm.GRADE_READ },
   { key: 'components', path: '/components', label: '薪资组件', permission: Perm.STRUCTURE_READ },
@@ -68,6 +76,25 @@ export function navigationItemForPath(path: string): NavigationItem | undefined 
   return NAV_ITEMS.find((item) => item.path === path)
 }
 
-export function firstAccessiblePath(permissions: readonly string[]): string | null {
-  return NAV_ITEMS.find((item) => hasRoutePermission(permissions, item.permission))?.path ?? null
+export function canAccessNavigationItem(
+  permissions: readonly string[],
+  globalPermissions: readonly string[],
+  item: NavigationItem,
+): boolean {
+  const required = typeof item.permission === 'string' ? [item.permission] : item.permission
+  return required.some(
+    (permission) =>
+      permissions.includes(permission) &&
+      (!item.requiresGlobalScope || globalPermissions.includes(permission)),
+  )
+}
+
+export function firstAccessiblePath(
+  permissions: readonly string[],
+  globalPermissions: readonly string[] = [],
+): string | null {
+  return (
+    NAV_ITEMS.find((item) => canAccessNavigationItem(permissions, globalPermissions, item))?.path ??
+    null
+  )
 }

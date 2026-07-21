@@ -4,7 +4,7 @@ from sqlalchemy import select
 from app.auth.bootstrap import seed_rbac
 from app.core.security import hash_password
 from app.models.audit import AuditLog
-from app.models.auth import Role, User, UserOrgScope, UserRole
+from app.models.auth import Permission, Role, RolePermission, User, UserOrgScope, UserRole
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -46,8 +46,40 @@ def test_login_success_sets_cookie_and_returns_token(client, db_session):
     body = resp.json()
     assert body["access_token"]
     assert "employee:read" in body["permissions"]
+    assert "import:run" in body["global_permissions"]
     assert "comp_refresh" in resp.cookies
     assert resp.headers["cache-control"] == "no-store"
+
+
+def test_login_reports_global_scope_for_each_permission_without_mixing_roles(client, db_session):
+    seed_rbac(db_session)
+    local_import = Role(code="LOCAL_IMPORT_TEST", name="Local import test", is_global_scope=False)
+    user = User(username="local-importer", password_hash=hash_password("StrongPass123!"))
+    db_session.add_all([local_import, user])
+    db_session.flush()
+    import_permission = db_session.scalars(
+        select(Permission).where(Permission.code == "import:run")
+    ).one()
+    auditor = db_session.scalars(select(Role).where(Role.code == "AUDITOR")).one()
+    db_session.add_all(
+        [
+            RolePermission(role_id=local_import.id, permission_id=import_permission.id),
+            UserRole(user_id=user.id, role_id=local_import.id),
+            UserRole(user_id=user.id, role_id=auditor.id),
+        ]
+    )
+    db_session.flush()
+
+    response = client.post(
+        "/api/auth/login",
+        json={"username": "local-importer", "password": "StrongPass123!"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "import:run" in body["permissions"]
+    assert "import:run" not in body["global_permissions"]
+    assert "salary:read" in body["global_permissions"]
 
 
 def test_login_wrong_password_401(client, db_session):
@@ -98,6 +130,7 @@ def test_me_returns_permissions_and_scope(client, db_session):
     assert resp.status_code == 200
     body = resp.json()
     assert body["username"] == "hr"
+    assert "import:run" in body["global_permissions"]
     assert body["unrestricted_scope"] is True  # GROUP_HR 全局范围
 
 
@@ -112,6 +145,7 @@ def test_refresh_happy_path(client, db_session):
     resp = client.post("/api/auth/refresh")
     assert resp.status_code == 200
     assert resp.json()["access_token"]
+    assert "import:run" in resp.json()["global_permissions"]
     assert resp.headers["cache-control"] == "no-store"
 
 

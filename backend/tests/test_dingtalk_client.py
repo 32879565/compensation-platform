@@ -77,3 +77,45 @@ def test_provider_http_errors_are_sanitized(monkeypatch):
     assert "401" in message
     assert "highly-sensitive-value" not in message
     assert "secret=value" not in message
+
+
+def test_notification_timeout_is_reported_as_an_unknown_send_outcome(monkeypatch):
+    def timeout_after_send(_request, *, timeout):
+        del timeout
+        raise TimeoutError
+
+    monkeypatch.setattr(client_module, "urlopen", timeout_after_send)
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+    monkeypatch.setattr(client, "access_token", lambda: ("provider-token", 3600))
+
+    with pytest.raises(client_module.DingTalkSendOutcomeUnknown):
+        client.send_action_card(
+            recipient_user_id="manager-userid",
+            title="2026-07 薪资复核",
+            markdown="请复核本门店厅面薪资结果。",
+            action_url="https://pay.example.test/comp-appeals?delivery=1",
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"task_id": 42},
+        {"errcode": "0", "task_id": 42},
+        {"errcode": False, "task_id": 42},
+        {"errcode": 0, "task_id": True},
+        {"errcode": 0, "task_id": 0},
+    ],
+)
+def test_malformed_notification_response_is_an_unknown_outcome(monkeypatch, payload):
+    monkeypatch.setattr(client_module, "urlopen", lambda *_args, **_kwargs: _Response(payload))
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+    monkeypatch.setattr(client, "access_token", lambda: ("provider-token", 3600))
+
+    with pytest.raises(client_module.DingTalkSendOutcomeUnknown):
+        client.send_action_card(
+            recipient_user_id="manager-userid",
+            title="2026-07 薪资复核",
+            markdown="请复核本门店厅面薪资结果。",
+            action_url="https://pay.example.test/comp-appeals?delivery=1",
+        )

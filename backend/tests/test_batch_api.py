@@ -374,6 +374,41 @@ def _copy_payroll_result_to_round(
     return copied
 
 
+def test_create_batch_acquires_payroll_input_lock_before_staging_batch(
+    client, db_session, monkeypatch
+):
+    from app.routers import batch as batch_router
+
+    _user(db_session, "batch-lock-hr", ["GROUP_HR"])
+    headers = _token(client, "batch-lock-hr")
+    lock_calls = []
+
+    def record_lock(session):
+        assert session is db_session
+        assert not any(isinstance(pending, PayrollBatch) for pending in session.new)
+        lock_calls.append(session)
+
+    monkeypatch.setattr(
+        batch_router,
+        "lock_payroll_input_mutation",
+        record_lock,
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/batches",
+        headers=headers,
+        json={
+            "period": "2026-05",
+            "attendance_start": "2026-05-01",
+            "attendance_end": "2026-05-31",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert lock_calls == [db_session]
+
+
 _GLOBAL_BATCH_LIFECYCLE_ACTIONS = (
     pytest.param("run", None, Perm.PAYROLL_RUN, id="run"),
     pytest.param("approve", None, Perm.PAYROLL_APPROVE, id="approve"),

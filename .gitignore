@@ -26,6 +26,7 @@ test-results/
 *.sqlite
 *.sqlite3
 *.xlsx
+!frontend/public/payroll-import-template.xlsx
 *.xls
 *.csv
 # PostgreSQL salary archives must be stored outside this repository.  Keeping

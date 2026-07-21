@@ -88,6 +88,8 @@ class DingTalkDelivery(Base, TimestampMixin):
     )
     batch_version: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     org_unit_id: Mapped[int] = mapped_column(ForeignKey("org_unit.id"), nullable=False, index=True)
+    period_snapshot: Mapped[str] = mapped_column(String(7), nullable=False)
+    org_unit_name_snapshot: Mapped[str] = mapped_column(String(128), nullable=False)
     department: Mapped[Department] = mapped_column(
         Enum(Department, name="department"), nullable=False
     )

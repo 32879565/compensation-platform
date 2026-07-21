@@ -3,7 +3,11 @@ import { Alert, Spin } from 'antd'
 import { BrowserRouter, Navigate, Outlet, Route, Routes } from 'react-router-dom'
 
 import { AuthProvider, useAuth } from './auth/AuthContext'
-import { firstAccessiblePath, hasRoutePermission, navigationItemForPath } from './auth/navigation'
+import {
+  canAccessNavigationItem,
+  firstAccessiblePath,
+  navigationItemForPath,
+} from './auth/navigation'
 import { ProtectedRoute } from './auth/ProtectedRoute'
 import { AppShell } from './components/AppShell'
 
@@ -18,6 +22,7 @@ const EmployeesPage = lazy(() => import('./pages/EmployeesPage'))
 const ExportPage = lazy(() => import('./pages/ExportPage'))
 const GradesPage = lazy(() => import('./pages/GradesPage'))
 const HolidayCalendarPage = lazy(() => import('./pages/HolidayCalendarPage'))
+const ImportsPage = lazy(() => import('./pages/ImportsPage'))
 const Login = lazy(() => import('./pages/Login'))
 const MonthlyPayrollAdjustmentsPage = lazy(() => import('./pages/MonthlyPayrollAdjustmentsPage'))
 const OrgTreePage = lazy(() => import('./pages/OrgTreePage'))
@@ -47,16 +52,27 @@ function ProtectedLayout() {
 
 function HomeRedirect() {
   const { user } = useAuth()
-  return <Navigate to={firstAccessiblePath(user?.permissions ?? []) ?? '/no-access'} replace />
+  return (
+    <Navigate
+      to={
+        firstAccessiblePath(user?.permissions ?? [], user?.globalPermissions ?? []) ?? '/no-access'
+      }
+      replace
+    />
+  )
 }
 
 function PermissionRoute({ path, children }: { path: string; children: React.ReactNode }) {
   const { user } = useAuth()
   const permissions = user?.permissions ?? []
+  const globalPermissions = user?.globalPermissions ?? []
   const route = navigationItemForPath(path)
 
-  if (route && hasRoutePermission(permissions, route.permission)) return <>{children}</>
-  return <Navigate to={firstAccessiblePath(permissions) ?? '/no-access'} replace />
+  if (route && canAccessNavigationItem(permissions, globalPermissions, route))
+    return <>{children}</>
+  return (
+    <Navigate to={firstAccessiblePath(permissions, globalPermissions) ?? '/no-access'} replace />
+  )
 }
 
 function NoAccessPage() {
@@ -114,6 +130,14 @@ export default function App() {
                 element={
                   <PermissionRoute path="/salary-history">
                     <SalaryHistoryPage />
+                  </PermissionRoute>
+                }
+              />
+              <Route
+                path="/imports"
+                element={
+                  <PermissionRoute path="/imports">
+                    <ImportsPage />
                   </PermissionRoute>
                 }
               />

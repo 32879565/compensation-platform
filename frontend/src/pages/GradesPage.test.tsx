@@ -11,7 +11,10 @@ const gradeApi = vi.hoisted(() => ({
   fetchGradeBands: vi.fn(),
   createSalaryBand: vi.fn(),
 }))
-const auth = vi.hoisted(() => ({ permissions: ['grade:write'] as string[] }))
+const auth = vi.hoisted(() => ({
+  permissions: ['grade:write'] as string[],
+  globalPermissions: ['grade:write'] as string[],
+}))
 const legacyReview = vi.hoisted(() => ({ onApplied: null as (() => void) | null }))
 
 vi.mock('../api/masterdata', () => gradeApi)
@@ -19,6 +22,7 @@ vi.mock('../auth/AuthContext', () => ({
   useAuth: () => ({
     user: { username: 'grade-editor' },
     hasPermission: (permission: string) => auth.permissions.includes(permission),
+    hasGlobalPermission: (permission: string) => auth.globalPermissions.includes(permission),
   }),
 }))
 vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
@@ -90,6 +94,7 @@ describe('GradesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     auth.permissions = ['grade:write']
+    auth.globalPermissions = ['grade:write']
     gradeApi.fetchGrades.mockImplementation(
       ({ status }: { status: 'active' | 'inactive' | 'all' } = { status: 'active' }) =>
         Promise.resolve(
@@ -202,6 +207,7 @@ describe('GradesPage', () => {
 
   it('shows legacy evidence and opens its review for import-capable writers', async () => {
     auth.permissions = ['grade:write', 'import:run']
+    auth.globalPermissions = ['grade:write', 'import:run']
     const { queryClient } = renderPage()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
 
@@ -217,8 +223,18 @@ describe('GradesPage', () => {
     expect(screen.queryByRole('dialog', { name: '旧系统真实数据-grades' })).toBeNull()
   })
 
+  it('hides legacy review when its permissions are only locally scoped', async () => {
+    auth.permissions = ['grade:write', 'import:run']
+    auth.globalPermissions = []
+    renderPage()
+
+    await screen.findByText('门店主管')
+    expect(screen.queryByRole('region', { name: '默认展示旧系统真实数据-grades' })).toBeNull()
+  })
+
   it('does not expose legacy grade creation to import-only users', async () => {
     auth.permissions = ['import:run']
+    auth.globalPermissions = ['import:run']
     renderPage()
 
     await screen.findByText('门店主管')

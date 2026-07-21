@@ -18,6 +18,7 @@ from app.auth.service import (
     build_principal,
     get_user_by_username,
     issue_refresh_token,
+    load_global_permissions,
     revoke_refresh_token,
     rotate_refresh_token,
 )
@@ -77,6 +78,7 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     username: str
     permissions: list[str]
+    global_permissions: list[str]
 
 
 def _client_ip(request: Request) -> str:
@@ -107,6 +109,7 @@ def _principal_payload(session: Session, user_id: int, username: str) -> TokenRe
         access_token=access_token_for(user_id),
         username=username,
         permissions=sorted(principal.permissions),
+        global_permissions=sorted(load_global_permissions(session, user_id)),
     )
 
 
@@ -269,13 +272,18 @@ def logout(
 class MeResponse(BaseModel):
     username: str
     permissions: list[str]
+    global_permissions: list[str]
     unrestricted_scope: bool
 
 
 @router.get("/me", response_model=MeResponse)
-def me(principal: Principal = Depends(get_current_principal)) -> MeResponse:
+def me(
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
+) -> MeResponse:
     return MeResponse(
         username=principal.username,
         permissions=sorted(principal.permissions),
+        global_permissions=sorted(load_global_permissions(session, principal.user_id)),
         unrestricted_scope=principal.org_scope is None,
     )

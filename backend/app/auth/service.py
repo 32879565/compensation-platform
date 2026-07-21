@@ -92,6 +92,22 @@ def load_permissions(session: Session, user_id: int) -> frozenset[str]:
     return frozenset(code for (code,) in rows)
 
 
+def load_global_permissions(session: Session, user_id: int) -> frozenset[str]:
+    """Return permissions granted by roles that are themselves globally scoped.
+
+    This is intentionally permission-specific.  A separate global role must
+    never widen a permission granted only by a store- or region-scoped role.
+    """
+    rows = session.execute(
+        select(Permission.code)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .join(Role, Role.id == RolePermission.role_id)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == user_id, Role.is_global_scope.is_(True))
+    ).all()
+    return frozenset(code for (code,) in rows)
+
+
 def _has_global_scope(session: Session, user_id: int) -> bool:
     return (
         session.execute(

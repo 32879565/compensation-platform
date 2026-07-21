@@ -66,13 +66,21 @@ const preview = {
   warnings: ['旧系统没有正式薪资组件编码。'],
 }
 
-function renderPanel(mode: 'components' | 'grades', onReview = vi.fn()) {
+function renderPanel(
+  mode: 'components' | 'grades',
+  onReview = vi.fn(),
+  catalogReadUnavailable = false,
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return {
     onReview,
     ...render(
       <QueryClientProvider client={queryClient}>
-        <LegacyCatalogEvidencePanel mode={mode} onReview={onReview} />
+        <LegacyCatalogEvidencePanel
+          mode={mode}
+          onReview={onReview}
+          catalogReadUnavailable={catalogReadUnavailable}
+        />
       </QueryClientProvider>,
     ),
   }
@@ -109,7 +117,7 @@ describe('LegacyCatalogEvidencePanel', () => {
   it('shows real legacy positions and observed salary bands directly on the page', async () => {
     const { onReview } = renderPanel('grades')
 
-    expect(await screen.findByText('1 个历史职位')).toBeTruthy()
+    expect(await screen.findByText('1 个达到隐私展示阈值的历史职位')).toBeTruthy()
     expect(screen.getByText('服务员')).toBeTruthy()
     expect(screen.getByText('625 人')).toBeTruthy()
     expect(screen.getByText('3,800.00 / 4,200.00 / 4,800.00')).toBeTruthy()
@@ -129,5 +137,33 @@ describe('LegacyCatalogEvidencePanel', () => {
 
     await waitFor(() => expect(legacyApi.fetchLegacyCatalogPreview).toHaveBeenCalledTimes(2))
     expect(await screen.findByText('68,245 条真实工资记录')).toBeTruthy()
+  })
+
+  it('keeps the review entry fail-closed while the formal catalogue is unavailable', async () => {
+    const onReview = vi.fn()
+    renderPanel('components', onReview, true)
+
+    expect(await screen.findByText('68,245 条真实工资记录')).toBeTruthy()
+    const review = screen.getByRole('button', { name: '审核并创建正式组件' })
+    expect((review as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(review)
+    expect(onReview).not.toHaveBeenCalled()
+  })
+
+  it('shows a completed state instead of offering an empty review drawer', async () => {
+    legacyApi.fetchLegacyCatalogPreview.mockResolvedValue({
+      ...preview,
+      component_candidates: preview.component_candidates.map((candidate) => ({
+        ...candidate,
+        importable: false,
+        applied: candidate.classification === 'NEEDS_HR_CONFIRMATION',
+      })),
+    })
+    renderPanel('components')
+
+    expect(await screen.findByText('可审阅项已同步')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '无待处理项' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
   })
 })

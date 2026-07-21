@@ -1,6 +1,19 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from collections.abc import Sequence
+from datetime import date
+from hashlib import sha256
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -9,11 +22,22 @@ from app.audit import service as audit
 from app.auth.deps import require_permission
 from app.auth.permissions import Perm
 from app.auth.service import Principal, resolve_permission_org_scope
+from app.core.config import DingTalkMode, Settings, get_settings
 from app.db.session import get_session
-from app.importing.excel import read_salary_workbook
-from app.importing.service import ImportError_, confirm_import, stage_import
+from app.dingtalk import service as dingtalk
+from app.importing.excel import WorkbookLimitError, read_salary_workbook
+from app.importing.header_rules import CURRENT_IMPORT_FIELDS
+from app.importing.publish import ImportPublishError, publish_import_for_review
+from app.importing.service import ImportError_, confirm_import, restage_import, stage_import
+from app.importing.source_lock import lock_legacy_salary_dataset
 from app.importing.store_aliases import STORE_ALIASES
-from app.models.salary import ImportBatch, ImportStagingRow, RowStatus
+from app.models.salary import (
+    ImportBatch,
+    ImportStagingRow,
+    ImportStatus,
+    RowStatus,
+    SalarySource,
+)
 from app.repositories.salary import SalaryRecordRepository
 
 router = APIRouter(prefix="/api/imports", tags=["imports"])
@@ -27,6 +51,21 @@ def _require_global_importer(
     if resolve_permission_org_scope(session, principal, Perm.IMPORT_RUN) is not None:
         raise HTTPException(
             status_code=403, detail="salary import requires global organization scope"
+        )
+    return principal
+
+
+def _require_global_publisher(
+    principal: Principal = Depends(_require_global_importer),
+    payroll_principal: Principal = Depends(require_permission(Perm.PAYROLL_RUN)),
+    session: Session = Depends(get_session),
+) -> Principal:
+    """Publishing is both a group-wide import and payroll lifecycle action."""
+    if principal.user_id != payroll_principal.user_id:
+        raise HTTPException(status_code=403, detail="invalid payroll publish principal")
+    if resolve_permission_org_scope(session, principal, Perm.PAYROLL_RUN) is not None:
+        raise HTTPException(
+            status_code=403, detail="salary publish requires global organization scope"
         )
     return principal
 
@@ -55,27 +94,154 @@ class StagingRowOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+def _same_file_batch(
+    session: Session, *, period: str, file_sha256: str, for_update: bool = False
+) -> ImportBatch | None:
+    statement = select(ImportBatch).where(
+        ImportBatch.period == period,
+        ImportBatch.source == SalarySource.IMPORT,
+        ImportBatch.file_sha256 == file_sha256,
+    )
+    if for_update:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    return session.scalars(statement).first()
+
+
+def _can_restage(batch: ImportBatch) -> bool:
+    return (
+        batch.status is ImportStatus.PARSED and getattr(batch, "published_batch_id", None) is None
+    )
+
+
+def _return_reused_upload(
+    session: Session, *, batch: ImportBatch, principal: Principal
+) -> ImportBatch:
+    audit.record(
+        session,
+        action="import.upload.reuse",
+        actor=(principal.user_id, principal.username),
+        target_type="import_batch",
+        target_id=batch.id,
+        detail={"status": batch.status.value, "rows": batch.total_rows, "errors": batch.error_rows},
+    )
+    session.commit()
+    return batch
+
+
+def _unsupported_current_import_fields(rows: Sequence[object]) -> list[str]:
+    fields: set[str] = set()
+    for row in rows:
+        row_fields = getattr(row, "fields", {})
+        row_money = getattr(row, "money", {})
+        if isinstance(row_fields, dict):
+            fields.update(str(name) for name in row_fields)
+        if isinstance(row_money, dict):
+            fields.update(str(name) for name in row_money)
+    return sorted(fields - CURRENT_IMPORT_FIELDS)
+
+
 @router.post("", response_model=BatchSummary, status_code=status.HTTP_201_CREATED)
-async def upload_import(
+def upload_import(
     period: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
     file: UploadFile = File(...),
     principal: Principal = Depends(_require_global_importer),
     session: Session = Depends(get_session),
 ) -> ImportBatch:
+    try:
+        date.fromisoformat(f"{period}-01")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="薪资月份无效") from None
     if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="仅支持 .xlsx/.xlsm 文件")
     import io
 
+    # Serialize before reading or expanding the upload, bounding concurrent
+    # memory as well as parser work across all application workers.
+    lock_legacy_salary_dataset(session)
     _MAX_UPLOAD = 20 * 1024 * 1024  # 20MB 上限，防超大文件 OOM
-    content = await file.read(_MAX_UPLOAD + 1)
+    content = file.file.read(_MAX_UPLOAD + 1)
     if len(content) > _MAX_UPLOAD:
         raise HTTPException(status_code=413, detail="文件超过 20MB 上限")
+    file_sha256 = sha256(content).hexdigest()
+    existing = _same_file_batch(
+        session,
+        period=period,
+        file_sha256=file_sha256,
+        for_update=True,
+    )
+    if existing is not None and not _can_restage(existing):
+        return _return_reused_upload(session, batch=existing, principal=principal)
     try:
         result = read_salary_workbook(io.BytesIO(content), period=period, aliases=STORE_ALIASES)
+    except WorkbookLimitError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from None
     except Exception as exc:  # noqa: BLE001  解析失败以 400 反馈，不泄露内部堆栈
         raise HTTPException(status_code=400, detail=f"解析失败：{type(exc).__name__}") from None
+    if result.warnings:
+        visible = result.warnings[:10]
+        suffix = (
+            f"；另有 {len(result.warnings) - len(visible)} 项警告"
+            if len(result.warnings) > 10
+            else ""
+        )
+        empty_prefix = "工作簿没有可导入的员工工资数据；" if not result.rows else ""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{empty_prefix}工作簿解析未完整：{'；'.join(visible)}{suffix}。"
+                "请修正或删除相应工作表后重新上传"
+            ),
+        )
+    if not result.rows:
+        raise HTTPException(status_code=400, detail="工作簿没有可导入的员工工资数据")
+    unsupported_fields = _unsupported_current_import_fields(result.rows)
+    if unsupported_fields:
+        visible = unsupported_fields[:10]
+        suffix = (
+            f"；另有 {len(unsupported_fields) - len(visible)} 个字段"
+            if len(unsupported_fields) > len(visible)
+            else ""
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"工作簿包含模板未支持的字段：{'、'.join(visible)}{suffix}。"
+                "为避免身份证、银行卡等敏感信息进入薪资记录，"
+                "请删除这些列或使用系统模板"
+            ),
+        )
+    if existing is not None:
+        previous_errors = existing.error_rows
+        if _can_restage(existing) and restage_import(
+            session,
+            existing,
+            filename=file.filename or "upload.xlsx",
+            period=period,
+            rows=result.rows,
+            created_by=principal.user_id,
+        ):
+            audit.record(
+                session,
+                action="import.upload.restage",
+                actor=(principal.user_id, principal.username),
+                target_type="import_batch",
+                target_id=existing.id,
+                detail={
+                    "previous_errors": previous_errors,
+                    "rows": existing.total_rows,
+                    "errors": existing.error_rows,
+                },
+            )
+            session.commit()
+            return existing
+        return _return_reused_upload(session, batch=existing, principal=principal)
     batch = stage_import(
-        session, filename=file.filename or "upload.xlsx", period=period, rows=result.rows
+        session,
+        filename=file.filename or "upload.xlsx",
+        period=period,
+        rows=result.rows,
+        file_sha256=file_sha256,
+        created_by=principal.user_id,
     )
     audit.record(
         session,
@@ -145,6 +311,89 @@ def confirm_batch(
     )
     session.commit()
     return ConfirmResult(written=written)
+
+
+class PublishResult(BaseModel):
+    import_batch_id: int
+    payroll_batch_id: int
+    batch_version: int
+    employees: int
+    scopes: int
+    routed: int
+    configuration_failures: int
+    existing: int
+    already_published: bool
+    sandbox: bool
+
+
+@router.post("/{batch_id}/publish", response_model=PublishResult)
+def publish_batch_for_review(
+    batch_id: int,
+    background_tasks: BackgroundTasks,
+    principal: Principal = Depends(_require_global_publisher),
+    settings: Settings = Depends(get_settings),
+    session: Session = Depends(get_session),
+) -> PublishResult:
+    """Publish exact imported totals and route each store/department review scope."""
+    imported = session.get(ImportBatch, batch_id)
+    if imported is None:
+        raise HTTPException(status_code=404, detail="导入批次不存在")
+    try:
+        published = publish_import_for_review(session, imported)
+        delivery = dingtalk.stage_review_deliveries(
+            session, batch_id=published.payroll_batch_id, settings=settings
+        )
+    except ImportPublishError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except dingtalk.DingTalkError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    sandbox = settings.dingtalk_mode is DingTalkMode.SANDBOX
+    audit.record(
+        session,
+        action="import.publish",
+        actor=(principal.user_id, principal.username),
+        target_type="import_batch",
+        target_id=imported.id,
+        detail={
+            "payroll_batch_id": published.payroll_batch_id,
+            "batch_version": published.batch_version,
+            "employees": published.employees,
+            "scopes": published.scopes,
+            "already_published": published.already_published,
+        },
+    )
+    audit.record(
+        session,
+        action="dingtalk.review.stage",
+        actor=(principal.user_id, principal.username),
+        target_type="payroll_batch",
+        target_id=published.payroll_batch_id,
+        detail={
+            "sandbox": sandbox,
+            "routed": delivery.routed,
+            "configuration_failures": delivery.configuration_failures,
+            "existing": delivery.existing,
+        },
+    )
+    session.commit()
+    if settings.dingtalk_mode is DingTalkMode.LIVE and delivery.pending_delivery_ids:
+        background_tasks.add_task(
+            dingtalk.dispatch_live_deliveries,
+            delivery.pending_delivery_ids,
+        )
+    return PublishResult(
+        import_batch_id=published.import_batch_id,
+        payroll_batch_id=published.payroll_batch_id,
+        batch_version=published.batch_version,
+        employees=published.employees,
+        scopes=published.scopes,
+        routed=delivery.routed,
+        configuration_failures=delivery.configuration_failures,
+        existing=delivery.existing,
+        already_published=published.already_published,
+        sandbox=sandbox,
+    )
 
 
 # ------------------- 薪资记录查询（历史工资可查，M2 核心）-------------------

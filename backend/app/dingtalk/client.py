@@ -48,6 +48,10 @@ class DingTalkClientError(Exception):
     """A deliberately sanitized DingTalk integration error."""
 
 
+class DingTalkSendOutcomeUnknown(DingTalkClientError):
+    """The provider may have accepted a notification before the response failed."""
+
+
 class _DingTalkTemporaryError(DingTalkClientError):
     """Internal marker for provider/network failures that are safe to retry."""
 
@@ -519,24 +523,34 @@ class DingTalkClient:
         # DingTalk's work-notification API currently requires access_token as a
         # query parameter.  The URL is never logged or surfaced in exceptions.
         request_url = f"{_WORK_NOTIFICATION_URL}?{urlencode({'access_token': token})}"
-        payload = self._perform(
-            Request(
-                request_url,
-                data=form,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-                },
-                method="POST",
+        try:
+            payload = self._perform(
+                Request(
+                    request_url,
+                    data=form,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+                    },
+                    method="POST",
+                )
             )
-        )
+        except DingTalkClientError:
+            # Once the POST has started, a missing/invalid response cannot prove
+            # that DingTalk rejected it.  Callers must reconcile instead of
+            # blindly sending the same salary notification again.
+            raise DingTalkSendOutcomeUnknown(
+                "DingTalk notification outcome could not be confirmed"
+            ) from None
         errcode = payload.get("errcode")
+        if type(errcode) is not int:
+            raise DingTalkSendOutcomeUnknown("DingTalk notification outcome could not be confirmed")
         if errcode != 0:
             raise DingTalkClientError(f"DingTalk rejected the notification (code {errcode})")
         task_id = payload.get("task_id")
         request_id = payload.get("request_id")
-        if not isinstance(task_id, int):
-            raise DingTalkClientError("DingTalk returned an invalid send result")
+        if type(task_id) is not int or task_id <= 0:
+            raise DingTalkSendOutcomeUnknown("DingTalk notification outcome could not be confirmed")
         return DingTalkSendResult(
             task_id=task_id,
             request_id=request_id if isinstance(request_id, str) else None,

@@ -22,8 +22,13 @@ import { clearSessionQueries, queryClient } from '../queryClient'
 import { AuthProvider, useAuth } from './AuthContext'
 
 function AuthProbe() {
-  const { user } = useAuth()
-  return <span>{user?.username ?? 'guest'}</span>
+  const { user, hasGlobalPermission } = useAuth()
+  return (
+    <span>
+      {user?.username ?? 'guest'}:
+      {hasGlobalPermission('payroll:run') ? 'global-run' : 'no-global-run'}
+    </span>
+  )
 }
 
 describe('AuthProvider session expiry', () => {
@@ -37,6 +42,7 @@ describe('AuthProvider session expiry', () => {
         access_token: 'fresh-token',
         username: 'alice',
         permissions: ['payroll:read'],
+        global_permissions: ['payroll:run'],
       },
     })
   })
@@ -53,14 +59,34 @@ describe('AuthProvider session expiry', () => {
       </AuthProvider>,
     )
 
-    expect(await screen.findByText('alice')).toBeTruthy()
-    queryClient.setQueryData(['payrollResults', 'alice', 17], [
-      { employee_name: 'sensitive payroll' },
-    ])
+    expect(await screen.findByText('alice:global-run')).toBeTruthy()
+    queryClient.setQueryData(
+      ['payrollResults', 'alice', 17],
+      [{ employee_name: 'sensitive payroll' }],
+    )
 
     act(() => apiClient.state.listener?.())
 
-    await waitFor(() => expect(screen.getByText('guest')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('guest:no-global-run')).toBeTruthy())
     expect(queryClient.getQueryData(['payrollResults', 'alice', 17])).toBeUndefined()
+  })
+
+  it('fails closed when an older backend omits permission-level global scope', async () => {
+    apiClient.api.post.mockResolvedValueOnce({
+      status: 200,
+      data: {
+        access_token: 'rolling-deploy-token',
+        username: 'alice',
+        permissions: ['payroll:run'],
+      },
+    })
+
+    render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    )
+
+    expect(await screen.findByText('alice:no-global-run')).toBeTruthy()
   })
 })

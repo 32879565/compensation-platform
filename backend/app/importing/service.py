@@ -8,10 +8,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from app.importing.header_rules import MONEY_FIELDS
+from app.importing.header_rules import CURRENT_IMPORT_FIELDS, MONEY_FIELDS
 from app.importing.parser import SalaryRow, dedupe_rows
 from app.importing.source_lock import lock_legacy_salary_dataset
 from app.models.employee import Employee
@@ -58,6 +58,20 @@ def _employee_org_ids_by_emp_no(session: Session, emp_nos: set[str]) -> dict[str
     }
 
 
+def _employee_names_by_emp_no(session: Session, emp_nos: set[str]) -> dict[str, str]:
+    """Return authoritative current employee names for identity validation."""
+    if not emp_nos:
+        return {}
+    return {
+        emp_no: name
+        for emp_no, name in session.execute(
+            select(Employee.emp_no, Employee.name).where(
+                Employee.emp_no.in_(emp_nos), Employee.is_deleted.is_(False)
+            )
+        ).tuples()
+    }
+
+
 def _active_store_ids_by_name(session: Session) -> dict[str, int | None]:
     """Resolve active stores without guessing when names are ambiguous."""
     stores_by_name: dict[str, int | None] = {}
@@ -89,6 +103,22 @@ def _conflicting_employee_identities(rows: list[SalaryRow]) -> set[tuple]:
     return {key for key, details in details_by_identity.items() if len(details) > 1}
 
 
+def _duplicate_employee_identities(rows: list[SalaryRow]) -> set[tuple]:
+    """Find current-payroll employee keys represented by more than one source row.
+
+    Final payroll imports are authoritative money instructions.  Even when two
+    rows look like an old-system shadow pair, choosing one silently could drop
+    a legitimate zero-pay or correction row.  Preserve both for HR and block
+    confirmation until the workbook contains exactly one row per employee.
+    """
+    counts: dict[tuple, int] = {}
+    for row in rows:
+        if row.emp_no:
+            key = row.identity_key()
+            counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
+
+
 def _validate_row(
     row: SalaryRow,
     *,
@@ -96,8 +126,10 @@ def _validate_row(
     source: SalarySource,
     employee_ids: dict[str, int],
     employee_org_ids: dict[str, int],
+    employee_names: dict[str, str],
     store_ids: dict[str, int | None],
     conflicting_identities: set[tuple],
+    duplicate_identities: set[tuple],
 ) -> list[str]:
     errors: list[str] = []
     if row.period != batch_period:
@@ -118,6 +150,12 @@ def _validate_row(
         elif row.identity_key() in conflicting_identities:
             errors.append(
                 f"工号『{row.emp_no}』在周期『{row.period}』对应多个姓名或门店；请核对后保留唯一记录"
+            )
+        elif row.name.strip() != employee_names.get(row.emp_no, "").strip():
+            errors.append(f"工号『{row.emp_no}』与员工主数据姓名不一致")
+        if row.emp_no and row.identity_key() in duplicate_identities:
+            errors.append(
+                f"工号『{row.emp_no}』在同一计薪月份出现重复工资行；" "请合并或删除重复行后重新导入"
             )
     # 金额字段有原值文本但无法解析 → 报错（不静默归零）
     for f in MONEY_FIELDS:
@@ -149,43 +187,40 @@ def _money_to_str(row: SalaryRow) -> dict[str, str]:
     return out
 
 
-def stage_import(
+def _write_staging_rows(
     session: Session,
     *,
-    filename: str,
+    batch: ImportBatch,
     period: str,
     rows: list[SalaryRow],
-    source: SalarySource = SalarySource.IMPORT,
-) -> ImportBatch:
-    """去重后逐行校验并写入暂存表；返回批次（状态 PARSED）。"""
-    deduped = dedupe_rows(rows)
-    emp_nos = {row.emp_no for row in deduped if row.emp_no}
+    source: SalarySource,
+) -> None:
+    """Validate and persist one complete staging snapshot for ``batch``."""
+    staged_rows = list(rows) if source is SalarySource.IMPORT else dedupe_rows(rows)
+    emp_nos = {row.emp_no for row in staged_rows if row.emp_no}
     employee_ids = _employee_ids_by_emp_no(session, emp_nos)
     employee_org_ids = _employee_org_ids_by_emp_no(session, emp_nos)
+    employee_names = _employee_names_by_emp_no(session, emp_nos)
     store_ids = _active_store_ids_by_name(session)
     conflicting_identities = _conflicting_employee_identities(rows)
-    batch = ImportBatch(
-        filename=filename,
-        period=period,
-        source=source,
-        status=ImportStatus.PARSED,
-        total_rows=len(deduped),
+    duplicate_identities = (
+        _duplicate_employee_identities(rows) if source is SalarySource.IMPORT else set()
     )
-    session.add(batch)
-    session.flush()
 
     error_count = 0
-    for idx, row in enumerate(deduped):
+    for idx, row in enumerate(staged_rows):
         errors = _validate_row(
             row,
             batch_period=period,
             source=source,
             employee_ids=employee_ids,
             employee_org_ids=employee_org_ids,
+            employee_names=employee_names,
             store_ids=store_ids,
             conflicting_identities=conflicting_identities,
+            duplicate_identities=duplicate_identities,
         )
-        status = RowStatus.ERROR if errors else RowStatus.OK
+        row_status = RowStatus.ERROR if errors else RowStatus.OK
         if errors:
             error_count += 1
         session.add(
@@ -198,23 +233,98 @@ def stage_import(
                 store_name=row.store_name or "(空)",
                 parsed_fields=_money_to_str(row),
                 errors=errors,
-                status=status,
+                status=row_status,
             )
         )
+
+    batch.total_rows = len(staged_rows)
     batch.error_rows = error_count
     session.flush()
+
+
+def stage_import(
+    session: Session,
+    *,
+    filename: str,
+    period: str,
+    rows: list[SalaryRow],
+    source: SalarySource = SalarySource.IMPORT,
+    file_sha256: str | None = None,
+    created_by: int | None = None,
+) -> ImportBatch:
+    """逐行校验并写入暂存表；历史来源仍按兼容规则去重。"""
+    batch = ImportBatch(
+        filename=filename,
+        period=period,
+        source=source,
+        status=ImportStatus.PARSED,
+        total_rows=0,
+        file_sha256=file_sha256,
+        created_by=created_by,
+    )
+    session.add(batch)
+    session.flush()
+    _write_staging_rows(session, batch=batch, period=period, rows=rows, source=source)
     return batch
+
+
+def restage_import(
+    session: Session,
+    batch: ImportBatch,
+    *,
+    filename: str,
+    period: str,
+    rows: list[SalaryRow],
+    created_by: int | None = None,
+) -> bool:
+    """Atomically replace a still-PARSED batch's validation snapshot.
+
+    The dataset advisory lock and batch row lock use the same ordering as
+    confirmation. If confirmation or publication won the race, the immutable
+    evidence is left untouched and ``False`` is returned.
+    """
+    del filename, created_by  # Preserve the original upload's evidence metadata.
+    lock_legacy_salary_dataset(session)
+    session.refresh(batch, with_for_update=True)
+    if (
+        batch.status is not ImportStatus.PARSED
+        or batch.source is not SalarySource.IMPORT
+        or batch.published_batch_id is not None
+    ):
+        return False
+    if batch.period != period:
+        raise ImportError_("不能使用不同计薪周期重新暂存导入批次")
+
+    session.execute(delete(ImportStagingRow).where(ImportStagingRow.batch_id == batch.id))
+    _write_staging_rows(
+        session,
+        batch=batch,
+        period=period,
+        rows=rows,
+        source=batch.source,
+    )
+    return True
 
 
 def confirm_import(session: Session, batch: ImportBatch) -> int:
     """把批次的 OK 行写入 salary_record；有 ERROR 行则拒绝。返回写入条数。"""
-    # 行锁防并发/双击重复确认（重复确认将只在第一个成功，其余见 CONFIRMED 报错）
+    # 行锁防并发/双击重复确认；成功重试返回同一批次的原写入数。
     # Catalog evidence is reviewed as one append-only dataset. Take the same
     # transaction lock used by preview/apply before inserting any source row.
     lock_legacy_salary_dataset(session)
     session.refresh(batch, with_for_update=True)
     if batch.status == ImportStatus.CONFIRMED:
-        raise ImportError_("批次已确认")
+        written = (
+            session.scalar(
+                select(func.count())
+                .select_from(SalaryRecord)
+                .where(SalaryRecord.import_batch_id == batch.id)
+            )
+            or 0
+        )
+        if written <= 0:
+            raise ImportError_("批次已确认但工资记录缺失，请联系系统管理员")
+        return int(written)
     if batch.error_rows > 0:
         raise ImportError_(f"存在 {batch.error_rows} 行错误，请先修正后再确认")
 
@@ -230,10 +340,35 @@ def confirm_import(session: Session, batch: ImportBatch) -> int:
 
     employee_ids: dict[str, int] = {}
     if batch.source is SalarySource.IMPORT:
+        unsupported_fields = sorted(
+            {
+                str(field)
+                for srow in staged
+                if isinstance(srow.parsed_fields, dict)
+                for field in srow.parsed_fields
+                if str(field) not in CURRENT_IMPORT_FIELDS
+            }
+        )
+        if unsupported_fields:
+            visible = unsupported_fields[:10]
+            suffix = (
+                f"；另有 {len(unsupported_fields) - len(visible)} 个字段"
+                if len(unsupported_fields) > len(visible)
+                else ""
+            )
+            raise ImportError_(
+                "导入批次包含模板未支持的字段："
+                + "、".join(visible)
+                + suffix
+                + "；请重新上传系统模板"
+            )
         employee_ids = _employee_ids_by_emp_no(
             session, {srow.emp_no for srow in staged if srow.emp_no}
         )
         employee_org_ids = _employee_org_ids_by_emp_no(
+            session, {srow.emp_no for srow in staged if srow.emp_no}
+        )
+        employee_names = _employee_names_by_emp_no(
             session, {srow.emp_no for srow in staged if srow.emp_no}
         )
         unmatched = sorted(
@@ -242,6 +377,19 @@ def confirm_import(session: Session, batch: ImportBatch) -> int:
         if unmatched:
             identifiers = "、".join(unmatched)
             raise ImportError_(f"工号 {identifiers} 未匹配员工主数据；请重新暂存并完成人工认领")
+
+        mismatched_names = sorted(
+            {
+                srow.emp_no or "(missing employee number)"
+                for srow in staged
+                if srow.emp_no and srow.name.strip() != employee_names.get(srow.emp_no, "").strip()
+            }
+        )
+        if mismatched_names:
+            raise ImportError_(
+                "Workbook name does not match the employee master record for: "
+                + ", ".join(mismatched_names)
+            )
 
         invalid_stores = sorted(
             {srow.store_name for srow in staged if org_by_name.get(srow.store_name) is None}
@@ -276,6 +424,7 @@ def confirm_import(session: Session, batch: ImportBatch) -> int:
             source=batch.source,
             fields=srow.parsed_fields,
             import_batch_id=batch.id,
+            created_by=batch.created_by,
         )
         session.add(record)
         session.flush()

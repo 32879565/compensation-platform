@@ -11,6 +11,7 @@ interface AuthState {
   login: (username: string, password: string) => Promise<void>
   logout: () => Promise<void>
   hasPermission: (perm: string) => boolean
+  hasGlobalPermission: (perm: string) => boolean
 }
 
 const AuthContext = createContext<AuthState | null>(null)
@@ -45,7 +46,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setAccessToken(r.data.access_token)
           if (active) {
             clearSessionQueries()
-            setUser({ username: r.data.username, permissions: r.data.permissions })
+            setUser({
+              username: r.data.username,
+              permissions: r.data.permissions,
+              globalPermissions: r.data.global_permissions ?? [],
+            })
           }
         }
       } catch {
@@ -70,7 +75,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearSessionQueries()
     const r = await api.post<LoginResponse>('/api/auth/login', { username, password })
     setAccessToken(r.data.access_token)
-    setUser({ username: r.data.username, permissions: r.data.permissions })
+    setUser({
+      username: r.data.username,
+      permissions: r.data.permissions,
+      globalPermissions: r.data.global_permissions ?? [],
+    })
   }, [])
 
   const logout = useCallback(async () => {
@@ -88,10 +97,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     (perm: string) => user?.permissions.includes(perm) ?? false,
     [user],
   )
+  const hasGlobalPermission = useCallback(
+    (perm: string) => user?.globalPermissions.includes(perm) ?? false,
+    [user],
+  )
 
   const value = useMemo(
-    () => ({ user, loading, login, logout, hasPermission }),
-    [user, loading, login, logout, hasPermission],
+    () => ({ user, loading, login, logout, hasPermission, hasGlobalPermission }),
+    [user, loading, login, logout, hasPermission, hasGlobalPermission],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

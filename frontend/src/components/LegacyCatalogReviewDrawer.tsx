@@ -37,6 +37,7 @@ export interface LegacyCatalogReviewDrawerProps {
   mode: ReviewMode
   onClose: () => void
   onApplied?: () => void
+  catalogReadUnavailable?: boolean
 }
 
 interface ComponentReviewValues {
@@ -110,6 +111,7 @@ function isConflict(error: unknown): boolean {
 }
 
 const HORIZONTAL_SCROLL_STEP = 80
+const LEGACY_PREVIEW_STALE_TIME_MS = 5 * 60 * 1000
 
 function handleHorizontalRegionKeyDown(event: KeyboardEvent<HTMLDivElement>) {
   if (event.key === 'ArrowRight') {
@@ -150,6 +152,7 @@ export default function LegacyCatalogReviewDrawer({
   mode,
   onClose,
   onApplied,
+  catalogReadUnavailable = false,
 }: LegacyCatalogReviewDrawerProps) {
   const queryClient = useQueryClient()
   const [componentForm] = Form.useForm<ComponentReviewValues>()
@@ -168,7 +171,10 @@ export default function LegacyCatalogReviewDrawer({
     queryKey: ['legacy-catalog-preview'],
     queryFn: fetchLegacyCatalogPreview,
     enabled: open,
-    refetchOnMount: 'always',
+    staleTime: LEGACY_PREVIEW_STALE_TIME_MS,
+    refetchOnMount: true,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   })
 
   useEffect(() => {
@@ -235,6 +241,7 @@ export default function LegacyCatalogReviewDrawer({
   const pending = componentMutation.isPending || gradeMutation.isPending
   const previewUnavailable =
     !open ||
+    catalogReadUnavailable ||
     previewQuery.isLoading ||
     previewQuery.isFetching ||
     previewQuery.isError ||
@@ -500,7 +507,14 @@ export default function LegacyCatalogReviewDrawer({
           onClose()
         }}
       >
-        {previewQuery.isError ? (
+        {catalogReadUnavailable ? (
+          <Alert
+            type="error"
+            showIcon
+            message="正式目录当前不可用，已禁止导入"
+            description="请先重新读取正式薪资目录，确认现有项目后再继续。"
+          />
+        ) : previewQuery.isError ? (
           <Alert
             type="error"
             showIcon

@@ -9,7 +9,10 @@ const compApi = vi.hoisted(() => ({
   deactivateComponent: vi.fn(),
   restoreComponent: vi.fn(),
 }))
-const auth = vi.hoisted(() => ({ permissions: ['salary_structure:write'] as string[] }))
+const auth = vi.hoisted(() => ({
+  permissions: ['salary_structure:write'] as string[],
+  globalPermissions: ['salary_structure:write'] as string[],
+}))
 const legacyReview = vi.hoisted(() => ({ onApplied: null as (() => void) | null }))
 
 vi.mock('../api/comp', async (importOriginal) => ({
@@ -24,6 +27,7 @@ vi.mock('../auth/AuthContext', () => ({
   useAuth: () => ({
     user: { username: 'hr' },
     hasPermission: (permission: string) => auth.permissions.includes(permission),
+    hasGlobalPermission: (permission: string) => auth.globalPermissions.includes(permission),
   }),
 }))
 vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
@@ -75,6 +79,7 @@ describe('ComponentsPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     auth.permissions = ['salary_structure:write']
+    auth.globalPermissions = ['salary_structure:write']
     compApi.fetchComponents.mockResolvedValue([
       {
         id: 1,
@@ -119,6 +124,7 @@ describe('ComponentsPage', () => {
 
   it('shows legacy evidence and opens its review for import-capable writers', async () => {
     auth.permissions = ['salary_structure:write', 'import:run']
+    auth.globalPermissions = ['salary_structure:write', 'import:run']
     const { queryClient } = renderPage()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
 
@@ -132,8 +138,18 @@ describe('ComponentsPage', () => {
     expect(screen.queryByRole('dialog', { name: '旧系统真实数据-components' })).toBeNull()
   })
 
+  it('hides legacy review when its permissions are only locally scoped', async () => {
+    auth.permissions = ['salary_structure:write', 'import:run']
+    auth.globalPermissions = []
+    renderPage()
+
+    await screen.findByText('餐补')
+    expect(screen.queryByRole('region', { name: '默认展示旧系统真实数据-components' })).toBeNull()
+  })
+
   it('does not expose legacy catalog creation to import-only users', async () => {
     auth.permissions = ['import:run']
+    auth.globalPermissions = ['import:run']
     renderPage()
 
     await screen.findByText('餐补')

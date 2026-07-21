@@ -203,6 +203,143 @@ def test_upgrade_head_from_empty_postgresql_schema(pg_engine) -> None:
             connection.commit()
 
 
+def test_d18_upgrade_rolls_back_atomically_when_an_index_creation_fails(pg_engine) -> None:
+    schema = f"alembic_d18_atomic_{uuid4().hex}"
+    with pg_engine.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.commit()
+        try:
+            connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
+            config = _config_with_connection(connection)
+            command.upgrade(config, "f1n4i7k9m235")
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_payroll_result_batch_version "
+                    "ON payroll_result (employee_id)"
+                )
+            )
+            connection.commit()
+
+            with pytest.raises(DBAPIError):
+                command.upgrade(config, "g2p5j8l0n346")
+
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "f1n4i7k9m235"
+            )
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.columns "
+                        "WHERE table_schema = :schema AND table_name = 'import_batch' "
+                        "AND column_name = 'file_sha256'"
+                    ),
+                    {"schema": schema},
+                )
+                == 0
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT to_regclass(:qualified_name) IS NOT NULL"),
+                    {"qualified_name": f"{schema}.uq_result_import_batch_employee"},
+                )
+                is False
+            )
+
+            connection.execute(text("DROP INDEX ix_payroll_result_batch_version"))
+            connection.commit()
+            command.upgrade(config, "head")
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                ScriptDirectory.from_config(config).get_current_head()
+            )
+        finally:
+            connection.rollback()
+            connection.execute(text("SET search_path TO public"))
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            connection.commit()
+
+
+def test_d18_backfills_delivery_snapshots_and_ambiguous_legacy_failures(pg_engine) -> None:
+    schema = f"alembic_d18_delivery_{uuid4().hex}"
+    with pg_engine.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.commit()
+        try:
+            connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
+            config = _config_with_connection(connection)
+            command.upgrade(config, "f1n4i7k9m235")
+            org_id = connection.scalar(
+                text(
+                    "INSERT INTO org_unit (code, name, type, city) "
+                    "VALUES ('D18-STORE', 'D18 Store', 'STORE', 'Guangzhou') RETURNING id"
+                )
+            )
+            batch_id = connection.scalar(
+                text(
+                    "INSERT INTO payroll_batch "
+                    "(period, attendance_start, attendance_end, status, version) "
+                    "VALUES ('2026-07', '2026-07-01', '2026-07-31', "
+                    "'PENDING_STORE_CONFIRM', 1) RETURNING id"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO dingtalk_delivery "
+                    "(batch_id, batch_version, org_unit_id, department, kind, status, "
+                    "error_code, attempt_count, dispatched_at, idempotency_key) VALUES "
+                    "(:batch_id, 1, :org_id, 'DINING', 'PAYROLL_REVIEW', 'FAILED', "
+                    "'SOURCE_DATA_INVALID', 1, now(), 'legacy-ambiguous'), "
+                    "(:batch_id, 1, :org_id, 'KITCHEN', 'PAYROLL_REVIEW', 'FAILED', "
+                    "'PROVIDER_SEND_FAILED', 0, NULL, 'never-attempted'), "
+                    "(:batch_id, 1, :org_id, 'DINING', 'PAYROLL_REVIEW', 'PENDING', "
+                    "NULL, 0, NULL, 'legacy-pending')"
+                ),
+                {"batch_id": batch_id, "org_id": org_id},
+            )
+            connection.commit()
+
+            command.upgrade(config, "g2p5j8l0n346")
+
+            rows = connection.execute(
+                text(
+                    "SELECT idempotency_key, status, error_code, attempt_count, period_snapshot, "
+                    "org_unit_name_snapshot FROM dingtalk_delivery ORDER BY id"
+                )
+            ).all()
+            assert rows == [
+                (
+                    "legacy-ambiguous",
+                    "FAILED",
+                    "PROVIDER_SEND_OUTCOME_UNKNOWN",
+                    1,
+                    "2026-07",
+                    "D18 Store",
+                ),
+                (
+                    "never-attempted",
+                    "FAILED",
+                    "PROVIDER_SEND_FAILED",
+                    0,
+                    "2026-07",
+                    "D18 Store",
+                ),
+                (
+                    "legacy-pending",
+                    "FAILED",
+                    "PROVIDER_SEND_OUTCOME_UNKNOWN",
+                    1,
+                    "2026-07",
+                    "D18 Store",
+                ),
+            ]
+        finally:
+            connection.rollback()
+            connection.execute(text("SET search_path TO public"))
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            connection.commit()
+
+
 def test_d15_backfills_and_protects_dispute_events(pg_engine) -> None:
     """Legacy disputes gain a minimal event trail that cannot be rewritten."""
 

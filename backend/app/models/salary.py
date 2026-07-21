@@ -1,7 +1,17 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -55,6 +65,26 @@ class SalaryRecord(Base, TimestampMixin):
 
 class ImportBatch(Base, TimestampMixin):
     __tablename__ = "import_batch"
+    __table_args__ = (
+        UniqueConstraint(
+            "period", "source", "file_sha256", name="uq_import_batch_period_source_file_sha"
+        ),
+        CheckConstraint(
+            "(published_batch_id IS NULL AND published_batch_version IS NULL "
+            "AND published_at IS NULL) OR (published_batch_id IS NOT NULL "
+            "AND published_batch_version IS NOT NULL AND published_at IS NOT NULL)",
+            name="ck_import_batch_published_link_complete",
+        ),
+        CheckConstraint(
+            "published_batch_version IS NULL OR published_batch_version > 0",
+            name="ck_import_batch_published_version_positive",
+        ),
+        UniqueConstraint(
+            "published_batch_id",
+            "published_batch_version",
+            name="uq_import_batch_published_round",
+        ),
+    )
 
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     period: Mapped[str | None] = mapped_column(String(7), nullable=True)
@@ -66,7 +96,16 @@ class ImportBatch(Base, TimestampMixin):
     )
     total_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    file_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A confirmed final-payroll workbook can be published into exactly one
+    # immutable review round.  The reverse link makes double-clicks idempotent
+    # while preserving the original workbook staging/audit evidence.
+    published_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("payroll_batch.id"), nullable=True, index=True
+    )
+    published_batch_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ImportStagingRow(Base):
