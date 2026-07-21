@@ -31,6 +31,13 @@ vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
     ) : null
   },
 }))
+vi.mock('../components/LegacyCatalogEvidencePanel', () => ({
+  default: ({ mode, onReview }: { mode: string; onReview: () => void }) => (
+    <section aria-label={`默认展示旧系统真实数据-${mode}`}>
+      <button onClick={onReview}>从真实数据区创建正式职级</button>
+    </section>
+  ),
+}))
 
 import GradesPage from './GradesPage'
 
@@ -193,13 +200,16 @@ describe('GradesPage', () => {
     await waitFor(() => expect(screen.queryByRole('dialog', { name: '新增职级' })).toBeNull())
   })
 
-  it('opens reviewed legacy grades only for import-capable writers and refreshes after apply', async () => {
+  it('shows legacy evidence and opens its review for import-capable writers', async () => {
     auth.permissions = ['grade:write', 'import:run']
     const { queryClient } = renderPage()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
 
     await screen.findByText('门店主管')
-    fireEvent.click(screen.getByRole('button', { name: '审阅旧系统真实数据' }))
+    expect(
+      screen.getByRole('region', { name: '默认展示旧系统真实数据-grades' }),
+    ).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '从真实数据区创建正式职级' }))
 
     expect(screen.getByRole('dialog', { name: '旧系统真实数据-grades' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '模拟应用真实数据' }))
@@ -215,6 +225,9 @@ describe('GradesPage', () => {
 
     await screen.findByText('门店主管')
     expect(screen.queryByRole('button', { name: '审阅旧系统真实数据' })).toBeNull()
+    expect(
+      screen.queryByRole('region', { name: '默认展示旧系统真实数据-grades' }),
+    ).toBeNull()
   })
 
   it('edits a grade with its current version', async () => {

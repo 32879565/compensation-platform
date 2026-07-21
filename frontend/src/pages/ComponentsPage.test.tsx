@@ -36,6 +36,13 @@ vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
     ) : null
   },
 }))
+vi.mock('../components/LegacyCatalogEvidencePanel', () => ({
+  default: ({ mode, onReview }: { mode: string; onReview: () => void }) => (
+    <section aria-label={`默认展示旧系统真实数据-${mode}`}>
+      <button onClick={onReview}>从真实数据区创建正式组件</button>
+    </section>
+  ),
+}))
 
 import ComponentsPage from './ComponentsPage'
 
@@ -112,13 +119,16 @@ describe('ComponentsPage', () => {
     expect(within(row as HTMLTableRowElement).getAllByText('是').length).toBeGreaterThan(0)
   })
 
-  it('opens the reviewed legacy catalog only for import-capable writers and refreshes after apply', async () => {
+  it('shows legacy evidence and opens its review for import-capable writers', async () => {
     auth.permissions = ['salary_structure:write', 'import:run']
     const { queryClient } = renderPage()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
 
     await screen.findByText('餐补')
-    fireEvent.click(screen.getByRole('button', { name: '审阅旧系统真实数据' }))
+    expect(
+      screen.getByRole('region', { name: '默认展示旧系统真实数据-components' }),
+    ).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '从真实数据区创建正式组件' }))
 
     expect(screen.getByRole('dialog', { name: '旧系统真实数据-components' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '模拟应用真实数据' }))
@@ -132,6 +142,9 @@ describe('ComponentsPage', () => {
 
     await screen.findByText('餐补')
     expect(screen.queryByRole('button', { name: '审阅旧系统真实数据' })).toBeNull()
+    expect(
+      screen.queryByRole('region', { name: '默认展示旧系统真实数据-components' }),
+    ).toBeNull()
   })
 
   it('lets payroll configuration writers update attendance proration', async () => {
