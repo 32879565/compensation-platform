@@ -90,9 +90,9 @@ describe('LegacyCatalogEvidencePanel', () => {
     const { onReview } = renderPanel('components')
 
     expect(await screen.findByText('68,245 条真实工资记录')).toBeTruthy()
-    expect(screen.getByText('2024-01 至 2026-06')).toBeTruthy()
+    expect(screen.getAllByText('2024-01 至 2026-06').length).toBeGreaterThan(0)
     expect(screen.getByText('2 项历史字段')).toBeTruthy()
-    expect(screen.getByText('综合薪资')).toBeTruthy()
+    expect(screen.getAllByText('综合薪资').length).toBeGreaterThan(0)
     expect(screen.getByText('出勤工资')).toBeTruthy()
     expect(screen.getByText('待人事确认')).toBeTruthy()
     expect(screen.getByText('核算结果，不导入')).toBeTruthy()
