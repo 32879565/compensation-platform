@@ -31,6 +31,7 @@ def _isolated_schema(pg_engine, prefix: str) -> Iterator[tuple[object, Config]]:
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             yield connection, _config_with_connection(connection)
         finally:
             connection.rollback()

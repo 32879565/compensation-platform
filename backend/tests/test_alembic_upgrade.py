@@ -62,6 +62,7 @@ def test_fresh_legacy_runbook_loads_before_store_and_employee_backfills(pg_engin
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
             command.upgrade(config, "089dead90284")
             connection.execute(text("""
@@ -152,6 +153,7 @@ def test_upgrade_head_from_empty_postgresql_schema(pg_engine) -> None:
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
 
             command.upgrade(config, "head")
@@ -184,6 +186,7 @@ def test_d15_backfills_and_protects_dispute_events(pg_engine) -> None:
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
             command.upgrade(config, "c8k1f4h6j902")
 
@@ -282,6 +285,7 @@ def test_s8_approval_action_trigger_blocks_updates_and_deletes(pg_engine) -> Non
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
             command.upgrade(config, "head")
 
@@ -357,6 +361,7 @@ def test_s8_upgrade_preserves_legacy_unclassified_allowances_but_enforces_new_ro
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
             command.upgrade(config, "m2d8e5c1a734")
             connection.execute(text("""
@@ -408,6 +413,7 @@ def test_appeal_correction_work_item_migration_backfills_approved_appeals(pg_eng
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
             command.upgrade(config, "o4d7e2f8a631")
 
@@ -469,6 +475,7 @@ def test_appeal_correction_work_item_migration_backfills_approved_appeals(pg_eng
             ).one()
             assert row == (1, "PENDING_TRIAGE", None, None)
 
+            connection.commit()
             command.downgrade(config, "o4d7e2f8a631")
             assert (
                 connection.scalar(
@@ -493,6 +500,7 @@ def test_historical_store_org_backfill_is_reversible(pg_engine) -> None:
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
             command.upgrade(config, "p5e8f3a1b742")
 
@@ -571,6 +579,7 @@ def test_historical_store_org_backfill_is_reversible(pg_engine) -> None:
                 == 1
             )
 
+            connection.commit()
             command.downgrade(config, "p5e8f3a1b742")
 
             assert (
@@ -597,6 +606,7 @@ def test_historical_store_org_backfill_is_reversible(pg_engine) -> None:
                 == 1
             )
 
+            connection.commit()
             command.upgrade(config, "q6f9a2c8d753")
             assert (
                 connection.scalar(
@@ -632,6 +642,7 @@ def test_latest_historical_names_create_reversible_provisional_employees(pg_engi
         connection.commit()
         try:
             connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
             config = _config_with_connection(connection)
             command.upgrade(config, "q6f9a2c8d753")
 
@@ -710,6 +721,7 @@ def test_latest_historical_names_create_reversible_provisional_employees(pg_engi
                     WHERE name = 'Former Person' AND employee_id IS NULL
                     """)) == 1
 
+            connection.commit()
             command.downgrade(config, "q6f9a2c8d753")
 
             assert connection.scalar(text("SELECT count(*) FROM employee")) == 0
@@ -720,6 +732,7 @@ def test_latest_historical_names_create_reversible_provisional_employees(pg_engi
                 == 0
             )
 
+            connection.commit()
             command.upgrade(config, "r7a0b3d9e864")
             assert connection.scalar(text("SELECT count(*) FROM employee")) == 2
             assert (
