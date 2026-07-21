@@ -53,6 +53,32 @@ def test_supplied_connection_does_not_commit_caller_owned_transaction(pg_engine)
             connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
 
 
+def test_noop_upgrades_return_supplied_connection_idle(pg_engine) -> None:
+    """Alembic must close transactions created by no-op version checks."""
+
+    schema = f"alembic_noop_transaction_{uuid4().hex}"
+    with pg_engine.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+    try:
+        with pg_engine.connect() as connection:
+            connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
+            config = _config_with_connection(connection)
+
+            command.upgrade(config, "head")
+            assert not connection.in_transaction()
+
+            command.upgrade(config, "head")
+            assert not connection.in_transaction()
+
+            command.upgrade(config, "head")
+            assert not connection.in_transaction()
+    finally:
+        with pg_engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
 def test_fresh_legacy_runbook_loads_before_store_and_employee_backfills(pg_engine) -> None:
     """The documented S6 load order must produce linked real historical rows."""
 
