@@ -37,6 +37,20 @@ describe('AppShell historical salary navigation', () => {
     expect(screen.getByTestId('nav-salary-history')).toBeTruthy()
   })
 
+  it('shows both compensation catalog entries with their business names', () => {
+    auth.permissions = ['grade:read', 'salary_structure:read']
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <AppShell>
+          <div>content</div>
+        </AppShell>
+      </MemoryRouter>,
+    )
+
+    expect(screen.getByTestId('nav-grades').textContent).toBe('职级体系')
+    expect(screen.getByTestId('nav-components').textContent).toBe('薪资组件')
+  })
+
   it('handles a rejected logout request without leaking an unhandled promise', async () => {
     auth.logout.mockRejectedValueOnce(new Error('logout transport failed'))
     render(

@@ -94,6 +94,14 @@ describe('ComponentsPage', () => {
 
   afterEach(cleanup)
 
+  it('shows a clear salary component page title', async () => {
+    renderPage()
+
+    expect(
+      await screen.findByText('薪资组件', { selector: '.ant-card-head-title' }),
+    ).toBeTruthy()
+  })
+
   it('shows whether an allowance is configured for attendance proration', async () => {
     renderPage()
 
