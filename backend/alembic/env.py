@@ -32,8 +32,8 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    # Integration tests (and deployment tooling that owns a transaction) can
-    # pass a live connection through Alembic's standard config attribute.
+    # Integration tests and deployment tooling can pass an idle live
+    # connection through Alembic's standard config attribute.
     # Keep it separate from the normal engine path so production startup still
     # obtains its URL exclusively from application configuration.
     supplied_connection = config.attributes.get("connection")
