@@ -7,15 +7,17 @@ import pytest
 from sqlalchemy import select
 
 from app.auth.bootstrap import seed_rbac
+from app.auth.permissions import Perm
 from app.core.security import hash_password
 from app.models.approval import SalaryAdjustment, SalaryAdjustmentStatus
 from app.models.audit import AuditLog
-from app.models.auth import Role, User, UserRole
+from app.models.auth import Permission, Role, RolePermission, User, UserOrgScope, UserRole
 from app.models.comp import SalaryComponentDef
 from app.models.employee import Employee
 from app.models.org import OrgType, OrgUnit
 from app.models.payroll_batch import BatchStatus, PayrollBatch
 from app.models.payroll_result import PayrollResult
+from app.payroll.service import build_input
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -44,6 +46,45 @@ def _user(session, username: str, role_codes: list[str]) -> User:
     for role_code in role_codes:
         role = session.scalars(select(Role).where(Role.code == role_code)).one()
         session.add(UserRole(user_id=user.id, role_id=role.id))
+    session.flush()
+    return user
+
+
+def _mixed_scope_structure_writer(session, *, username: str) -> User:
+    """Grant STRUCTURE_WRITE only through a local role plus an unrelated global role."""
+    seed_rbac(session)
+    store = OrgUnit(
+        code=f"MIXED_SCOPE_{username}",
+        name=f"Mixed scope store {username}",
+        type=OrgType.STORE,
+        city="Guangzhou",
+    )
+    global_role = Role(
+        code=f"GLOBAL_OTHER_{username}"[:32],
+        name=f"Unrelated global role {username}",
+        is_global_scope=True,
+    )
+    scoped_role = Role(
+        code=f"LOCAL_STRUCT_{username}"[:32],
+        name=f"Scoped structure writer {username}",
+        is_global_scope=False,
+    )
+    user = User(username=username, password_hash=hash_password("StrongPass123!"))
+    session.add_all([store, global_role, scoped_role, user])
+    session.flush()
+    audit_read = session.scalars(select(Permission).where(Permission.code == Perm.AUDIT_READ)).one()
+    structure_write = session.scalars(
+        select(Permission).where(Permission.code == Perm.STRUCTURE_WRITE)
+    ).one()
+    session.add_all(
+        [
+            RolePermission(role_id=global_role.id, permission_id=audit_read.id),
+            RolePermission(role_id=scoped_role.id, permission_id=structure_write.id),
+            UserRole(user_id=user.id, role_id=global_role.id),
+            UserRole(user_id=user.id, role_id=scoped_role.id),
+            UserOrgScope(user_id=user.id, org_unit_id=store.id),
+        ]
+    )
     session.flush()
     return user
 
@@ -121,7 +162,9 @@ def _initial_structure(
     )
 
 
-def _persist_payroll_result(session, employee: Employee) -> None:
+def _persist_payroll_result(
+    session, employee: Employee, *, input_snapshot: dict | None = None
+) -> PayrollResult:
     batch = PayrollBatch(
         period="2026-01",
         attendance_start=date(2026, 1, 1),
@@ -131,28 +174,28 @@ def _persist_payroll_result(session, employee: Employee) -> None:
     )
     session.add(batch)
     session.flush()
-    session.add(
-        PayrollResult(
-            batch_id=batch.id,
-            employee_id=employee.id,
-            batch_version=1,
-            version=1,
-            org_unit_id=employee.org_unit_id,
-            department=employee.department,
-            actual_attendance_days=Decimal("22"),
-            gross=Decimal("5000"),
-            deposit=Decimal("0"),
-            net=Decimal("5000"),
-            carry_forward=Decimal("0"),
-            rule_version="component-catalog-test",
-            input_snapshot={},
-            lines=[],
-            exceptions=[],
-            warnings=[],
-            has_error=False,
-        )
+    result = PayrollResult(
+        batch_id=batch.id,
+        employee_id=employee.id,
+        batch_version=1,
+        version=1,
+        org_unit_id=employee.org_unit_id,
+        department=employee.department,
+        actual_attendance_days=Decimal("22"),
+        gross=Decimal("5000"),
+        deposit=Decimal("0"),
+        net=Decimal("5000"),
+        carry_forward=Decimal("0"),
+        rule_version="component-catalog-test",
+        input_snapshot=input_snapshot or {},
+        lines=[],
+        exceptions=[],
+        warnings=[],
+        has_error=False,
     )
+    session.add(result)
     session.flush()
+    return result
 
 
 def test_catalog_defaults_to_active_and_supports_inactive_and_all_filters(client, db_session):
@@ -197,6 +240,73 @@ def test_catalog_defaults_to_active_and_supports_inactive_and_all_filters(client
     assert duplicate.status_code == 409
     duplicate_detail = str(duplicate.json()["detail"])
     assert "restore" in duplicate_detail.lower() or "恢复" in duplicate_detail
+
+    _user(db_session, "component-adjustment-only", ["STORE_MANAGER"])
+    adjustment_headers = _token(client, "component-adjustment-only")
+    assert client.get("/api/salary-components", headers=adjustment_headers).status_code == 200
+    assert (
+        client.get(
+            "/api/salary-components",
+            headers=adjustment_headers,
+            params={"status": "all"},
+        ).status_code
+        == 403
+    )
+
+
+def test_component_catalog_writes_reject_permission_scope_mixing(client, db_session):
+    """A global unrelated role must not globalize a locally granted catalog write."""
+    _user(db_session, "component-scope-setup-hr", ["GROUP_HR"])
+    hr_headers = _token(client, "component-scope-setup-hr")
+    active = _component(client, hr_headers, code="SCOPE_ACTIVE")
+    to_deactivate = _component(client, hr_headers, code="SCOPE_DEACTIVATE")
+    to_restore = _component(client, hr_headers, code="SCOPE_RESTORE")
+    deactivated = _deactivate(
+        client,
+        hr_headers,
+        to_restore["id"],
+        reason="Prepare inactive catalog row for scope regression",
+    )
+    assert deactivated.status_code == 200, deactivated.text
+
+    scoped_user = _mixed_scope_structure_writer(
+        db_session,
+        username="component-mixed-scope",
+    )
+    scoped_headers = _token(client, scoped_user.username)
+    responses = [
+        client.post(
+            "/api/salary-components",
+            headers=scoped_headers,
+            json={
+                "code": "SCOPE_CREATE",
+                "name": "Unauthorized scoped create",
+                "component_type": "BASE",
+            },
+        ),
+        client.patch(
+            f"/api/salary-components/{active['id']}",
+            headers=scoped_headers,
+            json={
+                "expected_updated_at": active["updated_at"],
+                "name": "Unauthorized scoped update",
+            },
+        ),
+        client.post(
+            f"/api/salary-components/{to_deactivate['id']}/deactivate",
+            headers=scoped_headers,
+            json={"reason": "Unauthorized scoped deactivate"},
+        ),
+        client.post(
+            f"/api/salary-components/{to_restore['id']}/restore",
+            headers=scoped_headers,
+            json={"reason": "Unauthorized scoped restore"},
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [403, 403, 403, 403], [
+        response.text for response in responses
+    ]
 
 
 def test_component_patch_is_optimistic_rejects_noops_and_edits_all_unlocked_metadata(
@@ -302,6 +412,17 @@ def test_deactivate_and_restore_require_reasons_are_idempotent_and_audited(clien
     assert first_deactivation.json()["is_active"] is False
     deactivated_at = first_deactivation.json()["deactivated_at"]
 
+    timeout_retry = client.post(
+        f"/api/salary-components/{component['id']}/deactivate",
+        headers=headers,
+        json={
+            "reason": "Retry after response timeout",
+            "expected_updated_at": component["updated_at"],
+        },
+    )
+    assert timeout_retry.status_code == 200, timeout_retry.text
+    assert timeout_retry.json()["deactivated_at"] == deactivated_at
+
     repeated_deactivation = _deactivate(
         client,
         headers,
@@ -322,6 +443,16 @@ def test_deactivate_and_restore_require_reasons_are_idempotent_and_audited(clien
     assert missing_restore_reason.status_code == 422
     assert blank_restore_reason.status_code == 422
 
+    stale_restore = client.post(
+        restore_endpoint,
+        headers=headers,
+        json={
+            "reason": "Attempt with stale catalog data",
+            "expected_updated_at": component["updated_at"],
+        },
+    )
+    assert stale_restore.status_code == 409
+
     restored = client.post(
         restore_endpoint,
         headers=headers,
@@ -331,6 +462,17 @@ def test_deactivate_and_restore_require_reasons_are_idempotent_and_audited(clien
     assert restored.json()["is_active"] is True
     assert restored.json()["deactivated_at"] is None
     restored_updated_at = restored.json()["updated_at"]
+
+    restore_timeout_retry = client.post(
+        restore_endpoint,
+        headers=headers,
+        json={
+            "reason": "Retry after response timeout",
+            "expected_updated_at": first_deactivation.json()["updated_at"],
+        },
+    )
+    assert restore_timeout_retry.status_code == 200, restore_timeout_retry.text
+    assert restore_timeout_retry.json()["updated_at"] == restored_updated_at
 
     repeated_restore = client.post(
         restore_endpoint,
@@ -420,6 +562,38 @@ def test_pending_salary_adjustment_blocks_component_deactivation(client, db_sess
     assert stored_component is not None and stored_component.is_deleted is False
 
 
+def test_draft_adjustment_cannot_be_submitted_after_its_component_is_deactivated(
+    client, db_session
+):
+    hr = _user(db_session, "component-draft-hr", ["GROUP_HR"])
+    headers = _token(client, hr.username)
+    employee = _employee(db_session, suffix="DRAFT")
+    component = _component(client, headers, code="DRAFT_BASE")
+    adjustment = client.post(
+        "/api/salary-adjustments",
+        headers=headers,
+        json={
+            "employee_id": employee.id,
+            "component_id": component["id"],
+            "amount": "5500",
+            "effective_from": "2026-08-01",
+            "reason": "Draft raised while component was active",
+            "attachment_url": "https://files.example.test/adjustments/draft.pdf",
+        },
+    )
+    assert adjustment.status_code == 201, adjustment.text
+
+    deactivated = _deactivate(client, headers, component["id"], reason="Retire before submit")
+    assert deactivated.status_code == 200, deactivated.text
+    submitted = client.post(
+        f"/api/salary-adjustments/{adjustment.json()['id']}/submit",
+        headers=headers,
+    )
+
+    assert submitted.status_code == 409
+    assert "inactive" in str(submitted.json()["detail"]).lower()
+
+
 def test_inactive_component_keeps_existing_payroll_input_but_blocks_new_references(
     client, db_session
 ):
@@ -448,6 +622,12 @@ def test_inactive_component_keeps_existing_payroll_input_but_blocks_new_referenc
     assert existing.json()["compa"]["total"] == "5000.00"
     assert existing.json()["items"][0]["component_id"] == component["id"]
 
+    payroll_input, missing_component_ids = build_input(db_session, existing_employee, "2026-06")
+    assert missing_component_ids == []
+    assert [(item.code, item.amount) for item in payroll_input.structure] == [
+        ("LEGACY_BASE", Decimal("5000"))
+    ]
+
     new_structure = _initial_structure(
         client,
         headers,
@@ -470,6 +650,63 @@ def test_inactive_component_keeps_existing_payroll_input_but_blocks_new_referenc
     assert new_adjustment.status_code == 409
     assert "inactive" in str(new_structure.json()["detail"]).lower()
     assert "inactive" in str(new_adjustment.json()["detail"]).lower()
+
+
+def test_inactive_component_remains_available_to_historical_dispute_correction(client, db_session):
+    from app.payroll.batch_service import dispute_correction_options
+
+    _user(db_session, "component-correction-hr", ["GROUP_HR"])
+    headers = _token(client, "component-correction-hr")
+    employee = _employee(db_session, suffix="CORRECTION")
+    allowance = _component(
+        client,
+        headers,
+        code="LEGACY_MEAL",
+        name="Legacy meal allowance",
+        component_type="ALLOWANCE",
+        allowance_kind="FIXED",
+    )
+    initialized = _initial_structure(
+        client,
+        headers,
+        employee.id,
+        [
+            {
+                "component_id": allowance["id"],
+                "amount": "300",
+                "reason": "Approved legacy allowance",
+                "attachment_url": "https://files.example.test/policy/legacy-meal.pdf",
+            }
+        ],
+    )
+    assert initialized.status_code == 201, initialized.text
+    result = _persist_payroll_result(
+        db_session,
+        employee,
+        input_snapshot={
+            "period": "2026-01",
+            "hire_date": None,
+            "structure": [
+                {
+                    "code": "LEGACY_MEAL",
+                    "component_type": "ALLOWANCE",
+                    "amount": "300.00",
+                }
+            ],
+        },
+    )
+    deactivated = _deactivate(
+        client,
+        headers,
+        allowance["id"],
+        reason="Retire after historical payroll",
+    )
+    assert deactivated.status_code == 200, deactivated.text
+
+    options = dispute_correction_options(db_session, result, "LEGACY_MEAL")
+
+    assert options[0]["kind"] == "SALARY_STRUCTURE"
+    assert options[0]["components"][0]["component_id"] == allowance["id"]
 
 
 def test_structure_history_includes_record_revision_and_component_identity_in_stable_order(

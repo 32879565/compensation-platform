@@ -6,9 +6,11 @@ import pytest
 from sqlalchemy import select
 
 from app.auth.bootstrap import seed_rbac
+from app.auth.permissions import Perm
 from app.core.security import hash_password
 from app.models.audit import AuditLog
-from app.models.auth import Role, User, UserRole
+from app.models.auth import Permission, Role, RolePermission, User, UserOrgScope, UserRole
+from app.models.org import OrgType, OrgUnit
 from app.models.salary import SalaryRecord, SalarySource
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
@@ -37,6 +39,49 @@ def _user(session, username: str, role_code: str) -> User:
     session.flush()
     role = session.scalars(select(Role).where(Role.code == role_code)).one()
     session.add(UserRole(user_id=user.id, role_id=role.id))
+    session.flush()
+    return user
+
+
+def _mixed_scope_importer(
+    session,
+    *,
+    username: str,
+    scoped_permission: str,
+) -> User:
+    """Grant IMPORT_RUN globally but the catalog write only through a local role."""
+    seed_rbac(session)
+    store = OrgUnit(
+        code=f"LEGACY_SCOPE_{username}",
+        name=f"Legacy catalog scope {username}",
+        type=OrgType.STORE,
+    )
+    importer_role = Role(
+        code=f"GLOBAL_IMPORT_{username}"[:32],
+        name=f"Global importer {username}",
+        is_global_scope=True,
+    )
+    writer_role = Role(
+        code=f"LOCAL_WRITE_{username}"[:32],
+        name=f"Scoped catalog writer {username}",
+        is_global_scope=False,
+    )
+    user = User(username=username, password_hash=hash_password("StrongPass123!"))
+    session.add_all([store, importer_role, writer_role, user])
+    session.flush()
+    import_run = session.scalars(select(Permission).where(Permission.code == Perm.IMPORT_RUN)).one()
+    catalog_write = session.scalars(
+        select(Permission).where(Permission.code == scoped_permission)
+    ).one()
+    session.add_all(
+        [
+            RolePermission(role_id=importer_role.id, permission_id=import_run.id),
+            RolePermission(role_id=writer_role.id, permission_id=catalog_write.id),
+            UserRole(user_id=user.id, role_id=importer_role.id),
+            UserRole(user_id=user.id, role_id=writer_role.id),
+            UserOrgScope(user_id=user.id, org_unit_id=store.id),
+        ]
+    )
     session.flush()
     return user
 
@@ -99,11 +144,20 @@ def test_legacy_catalog_preview_is_aggregate_private_and_does_not_invent_officia
         comprehensive="4400.00",
         allowance="0.00",
     )
+    for index, salary in enumerate(("4100.00", "4200.00", "4300.00"), start=4):
+        _legacy_record(
+            db_session,
+            period="2026-05",
+            emp_no=f"PRIVATE-00{index}",
+            name=f"Private legacy person {index}",
+            position="服务员",
+            comprehensive=salary,
+        )
     _legacy_record(
         db_session,
         period="2026-05",
-        emp_no="PRIVATE-003",
-        name="Private legacy person three",
+        emp_no="PRIVATE-009",
+        name="Private legacy person nine",
         position="厨工",
         comprehensive="5000.00",
     )
@@ -113,7 +167,7 @@ def test_legacy_catalog_preview_is_aggregate_private_and_does_not_invent_officia
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["source"] == {
-        "record_count": 3,
+        "record_count": 6,
         "period_from": "2026-04",
         "period_to": "2026-05",
     }
@@ -122,8 +176,8 @@ def test_legacy_catalog_preview_is_aggregate_private_and_does_not_invent_officia
     assert "Private legacy person" not in serialized
 
     components = {item["source_field"]: item for item in body["component_candidates"]}
-    assert components["综合薪资"]["record_count"] == 3
-    assert components["综合薪资"]["nonzero_count"] == 3
+    assert components["综合薪资"]["record_count"] == 6
+    assert components["综合薪资"]["nonzero_count"] == 6
     assert components["综合薪资"]["classification"] == "NEEDS_HR_CONFIRMATION"
     assert components["补贴"]["record_count"] == 2
     assert components["补贴"]["nonzero_count"] == 1
@@ -132,13 +186,85 @@ def test_legacy_catalog_preview_is_aggregate_private_and_does_not_invent_officia
 
     assert body["grade_source_status"] == "OFFICIAL_MASTER_NOT_PRESENT"
     waiter = next(item for item in body["grade_candidates"] if item["position"] == "服务员")
-    assert waiter["record_count"] == 2
-    assert waiter["salary_sample_count"] == 2
+    assert waiter["record_count"] == 5
+    assert waiter["salary_sample_count"] == 5
     assert waiter["observed_median"] == "4200.00"
     assert waiter["is_official_grade"] is False
     assert "band_min" not in waiter
     assert "band_mid" not in waiter
     assert "band_max" not in waiter
+
+
+def test_legacy_grade_preview_omits_sub_threshold_positions_entirely(client, db_session):
+    """Fewer than five samples must not disclose a position or its exact counts."""
+    _user(db_session, "legacy-privacy-threshold-hr", "GROUP_HR")
+    headers = _headers(client, "legacy-privacy-threshold-hr")
+    for index in range(1, 5):
+        _legacy_record(
+            db_session,
+            period="2026-05",
+            emp_no=f"RARE-{index}",
+            name=f"Rare employee {index}",
+            position="稀有单人岗位",
+            comprehensive=f"{4000 + index * 100}.00",
+        )
+
+    response = client.get("/api/legacy-catalog/preview", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["grade_candidates"] == []
+    assert "稀有单人岗位" not in response.text
+
+
+def test_legacy_component_preview_covers_confirmed_real_old_system_fields(client, db_session):
+    """The reviewed 68,245-row legacy column names stay mapped to catalog semantics."""
+    _user(db_session, "legacy-real-field-hr", "GROUP_HR")
+    headers = _headers(client, "legacy-real-field-hr")
+    db_session.add(
+        SalaryRecord(
+            period="2026-05",
+            emp_no="REAL-FIELD-001",
+            name="Real field evidence",
+            store_name="Legacy store",
+            source=SalarySource.HISTORICAL,
+            fields={
+                "职位": "服务员",
+                "综合薪资": "4300.00",
+                "服务岗": "3000.00",
+                "留守休息补贴": "200.00",
+                "通岗补贴": "100.00",
+                "留年激励": "500.00",
+                "宿舍长奖励": "150.00",
+                "考勤扣罚": "50.00",
+                "绩效扣除": "80.00",
+                "法定补贴": "300.00",
+            },
+        )
+    )
+    db_session.flush()
+
+    response = client.get("/api/legacy-catalog/preview", headers=headers)
+
+    assert response.status_code == 200, response.text
+    candidates = {item["source_field"]: item for item in response.json()["component_candidates"]}
+    expected_types = {
+        "服务岗": "POSITION",
+        "留守休息补贴": "ALLOWANCE",
+        "通岗补贴": "ALLOWANCE",
+        "留年激励": "PERFORMANCE",
+        "宿舍长奖励": "PERFORMANCE",
+        "考勤扣罚": "DEDUCTION",
+        "绩效扣除": "DEDUCTION",
+    }
+    for source_field, component_type in expected_types.items():
+        assert candidates[source_field]["suggested_component_type"] == component_type
+        assert candidates[source_field]["classification"] == "NEEDS_HR_CONFIRMATION"
+        assert candidates[source_field]["importable"] is True
+
+    statutory = candidates["法定补贴"]
+    assert statutory["suggested_component_type"] is None
+    assert statutory["classification"] == "DERIVED_NOT_CATALOG_COMPONENT"
+    assert statutory["importable"] is False
 
 
 def test_legacy_catalog_preview_requires_global_import_permission(client, db_session):
@@ -150,6 +276,80 @@ def test_legacy_catalog_preview_requires_global_import_permission(client, db_ses
     )
 
     assert response.status_code == 403
+
+
+def test_legacy_component_apply_rejects_global_import_plus_scoped_structure_write(
+    client,
+    db_session,
+):
+    user = _mixed_scope_importer(
+        db_session,
+        username="legacy-component-scope",
+        scoped_permission=Perm.STRUCTURE_WRITE,
+    )
+    _legacy_record(
+        db_session,
+        period="2026-05",
+        emp_no="SCOPE-COMPONENT",
+        name="Scoped component evidence",
+        position="服务员",
+        comprehensive="4200.00",
+    )
+
+    response = client.post(
+        "/api/legacy-catalog/components/apply",
+        headers=_headers(client, user.username),
+        json={
+            "source_field": "综合薪资",
+            "expected_record_count": 1,
+            "confirmed_by_hr": True,
+            "reason": "Scope mixing must not authorize a global catalog mutation",
+            "component": {
+                "code": "SCOPED_LEGACY_COMPONENT",
+                "name": "Scoped legacy component",
+                "component_type": "COMPREHENSIVE",
+            },
+        },
+    )
+
+    assert response.status_code == 403, response.text
+
+
+def test_legacy_grade_apply_rejects_global_import_plus_scoped_grade_write(client, db_session):
+    user = _mixed_scope_importer(
+        db_session,
+        username="legacy-grade-scope",
+        scoped_permission=Perm.GRADE_WRITE,
+    )
+    for index in range(1, 6):
+        _legacy_record(
+            db_session,
+            period="2026-05",
+            emp_no=f"SCOPE-GRADE-{index}",
+            name=f"Scoped grade evidence {index}",
+            position="服务员",
+            comprehensive=f"{4000 + index * 100}.00",
+        )
+
+    response = client.post(
+        "/api/legacy-catalog/grades/apply",
+        headers=_headers(client, user.username),
+        json={
+            "source_position": "服务员",
+            "expected_record_count": 5,
+            "policy_confirmation": "HR_CONFIRMED",
+            "reason": "Scope mixing must not authorize a global grade mutation",
+            "grade": {"code": "SCOPED-P1", "name": "Scoped P1", "rank": 1},
+            "band": {
+                "band_min": "3800.00",
+                "band_mid": "4300.00",
+                "band_max": "5000.00",
+                "effective_from": "2026-07-01",
+            },
+        },
+    )
+
+    assert response.status_code == 403, response.text
 
 
 def test_confirmed_legacy_component_import_uses_real_source_count_and_audits_provenance(
@@ -202,6 +402,49 @@ def test_confirmed_legacy_component_import_uses_real_source_count_and_audits_pro
     assert event.detail["reason"] == "旧系统综合薪资字段经薪酬负责人核对"
 
 
+def test_legacy_component_source_field_cannot_be_reapplied_under_a_different_code(
+    client,
+    db_session,
+):
+    _user(db_session, "legacy-component-once-hr", "GROUP_HR")
+    headers = _headers(client, "legacy-component-once-hr")
+    _legacy_record(
+        db_session,
+        period="2026-05",
+        emp_no="SOURCE-ONCE-COMPONENT",
+        name="Source once component",
+        position="服务员",
+        comprehensive="4200.00",
+    )
+
+    def payload(code: str) -> dict:
+        return {
+            "source_field": "综合薪资",
+            "expected_record_count": 1,
+            "confirmed_by_hr": True,
+            "reason": "The legacy source field has one immutable catalog assignment",
+            "component": {
+                "code": code,
+                "name": code,
+                "component_type": "COMPREHENSIVE",
+            },
+        }
+
+    first = client.post(
+        "/api/legacy-catalog/components/apply",
+        headers=headers,
+        json=payload("LEGACY_SOURCE_PRIMARY"),
+    )
+    duplicate_source = client.post(
+        "/api/legacy-catalog/components/apply",
+        headers=headers,
+        json=payload("LEGACY_SOURCE_ALIAS"),
+    )
+
+    assert first.status_code == 201, first.text
+    assert duplicate_source.status_code == 409, duplicate_source.text
+
+
 @pytest.mark.parametrize(
     ("payload_update", "expected_status"),
     [
@@ -250,7 +493,9 @@ def test_confirmed_grade_import_keeps_historical_observations_distinct_from_poli
 ):
     hr = _user(db_session, "legacy-grade-hr", "GROUP_HR")
     headers = _headers(client, hr.username)
-    for index, salary in enumerate(("4000.00", "4200.00", "4400.00"), start=1):
+    for index, salary in enumerate(
+        ("4000.00", "4100.00", "4200.00", "4300.00", "4400.00"), start=1
+    ):
         _legacy_record(
             db_session,
             period="2026-05",
@@ -265,7 +510,7 @@ def test_confirmed_grade_import_keeps_historical_observations_distinct_from_poli
         headers=headers,
         json={
             "source_position": "服务员",
-            "expected_record_count": 3,
+            "expected_record_count": 5,
             "policy_confirmation": "HR_CONFIRMED",
             "reason": "人事确认服务员对应门店一职级，薪档采用现行政策",
             "grade": {"code": "STORE-P1", "name": "门店一职级", "rank": 10},
@@ -282,8 +527,8 @@ def test_confirmed_grade_import_keeps_historical_observations_distinct_from_poli
     assert response.json()["grade"]["code"] == "STORE-P1"
     assert response.json()["band"]["band_min"] == "3800.00"
     assert response.json()["observed_history"] == {
-        "record_count": 3,
-        "salary_sample_count": 3,
+        "record_count": 5,
+        "salary_sample_count": 5,
         "observed_median": "4200.00",
     }
     event = db_session.scalars(
@@ -297,6 +542,49 @@ def test_confirmed_grade_import_keeps_historical_observations_distinct_from_poli
         "band_max": "5000.00",
         "effective_from": "2026-07-01",
     }
+
+
+def test_legacy_position_cannot_be_reapplied_under_a_different_grade_code(client, db_session):
+    _user(db_session, "legacy-grade-once-hr", "GROUP_HR")
+    headers = _headers(client, "legacy-grade-once-hr")
+    for index in range(1, 6):
+        _legacy_record(
+            db_session,
+            period="2026-05",
+            emp_no=f"SOURCE-ONCE-GRADE-{index}",
+            name=f"Source once grade {index}",
+            position="服务员",
+            comprehensive=f"{4000 + index * 100}.00",
+        )
+
+    def payload(code: str, effective_from: str) -> dict:
+        return {
+            "source_position": "服务员",
+            "expected_record_count": 5,
+            "policy_confirmation": "HR_CONFIRMED",
+            "reason": "The legacy position has one immutable grade assignment",
+            "grade": {"code": code, "name": code, "rank": 1},
+            "band": {
+                "band_min": "3800.00",
+                "band_mid": "4300.00",
+                "band_max": "5000.00",
+                "effective_from": effective_from,
+            },
+        }
+
+    first = client.post(
+        "/api/legacy-catalog/grades/apply",
+        headers=headers,
+        json=payload("LEGACY-GRADE-PRIMARY", "2026-07-01"),
+    )
+    duplicate_source = client.post(
+        "/api/legacy-catalog/grades/apply",
+        headers=headers,
+        json=payload("LEGACY-GRADE-ALIAS", "2026-08-01"),
+    )
+
+    assert first.status_code == 201, first.text
+    assert duplicate_source.status_code == 409, duplicate_source.text
 
 
 def test_grade_import_requires_explicit_policy_confirmation_and_current_source_count(
@@ -377,4 +665,6 @@ def test_preview_ignores_new_system_payroll_results(client, db_session):
 
     assert response.status_code == 200, response.text
     assert response.json()["source"]["record_count"] == 1
-    assert {item["position"] for item in response.json()["grade_candidates"]} == {"服务员"}
+    assert response.json()["grade_candidates"] == []
+    assert "店长" not in response.text
+    assert "服务员" not in response.text

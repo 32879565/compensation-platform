@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const masterdataApi = vi.hoisted(() => ({
   createEmployee: vi.fn(),
   deleteEmployee: vi.fn(),
   fetchEmployees: vi.fn(),
+  fetchGrades: vi.fn(),
   fetchOrgUnits: vi.fn(),
   updateEmployee: vi.fn(),
 }))
@@ -15,6 +16,7 @@ const dingtalkApi = vi.hoisted(() => ({
   previewDingTalkEmployees: vi.fn(),
 }))
 const auth = vi.hoisted(() => ({ permissions: ['employee:write'] as string[] }))
+const salaryStructureDrawer = vi.hoisted(() => ({ render: vi.fn() }))
 
 vi.mock('../api/masterdata', () => masterdataApi)
 vi.mock('../api/dingtalk', () => dingtalkApi)
@@ -25,6 +27,23 @@ vi.mock('../auth/AuthContext', () => ({
   }),
 }))
 vi.mock('../components/TaxOpeningModal', () => ({ TaxOpeningModal: () => null }))
+vi.mock('../components/SalaryStructureDrawer', () => ({
+  default: (props: {
+    employee: { emp_no: string; id: number } | null
+    open: boolean
+    onClose: () => void
+  }) => {
+    salaryStructureDrawer.render(props)
+    return props.open ? (
+      <div role="dialog" aria-label="薪资结构抽屉">
+        <span>{props.employee?.emp_no}</span>
+        <button type="button" onClick={props.onClose}>
+          关闭薪资结构
+        </button>
+      </div>
+    ) : null
+  },
+}))
 
 import EmployeesPage, { isKnownSpecialPosition } from './EmployeesPage'
 
@@ -59,7 +78,7 @@ describe('EmployeesPage safe edits', () => {
           emp_no: 'E0017',
           name: '陈星',
           org_unit_id: 3,
-          job_grade_id: null,
+          job_grade_id: 102,
           employment_type: 'FULL_TIME',
           department: 'DINING',
           position_title: '店员',
@@ -79,6 +98,26 @@ describe('EmployeesPage safe edits', () => {
       page_size: 20,
     })
     masterdataApi.updateEmployee.mockResolvedValue({})
+    masterdataApi.fetchGrades.mockResolvedValue([
+      {
+        id: 101,
+        code: 'G01',
+        name: '初级职级',
+        rank: 1,
+        version: 1,
+        is_active: true,
+        deactivated_at: null,
+      },
+      {
+        id: 102,
+        code: 'G02',
+        name: '停用职级',
+        rank: 2,
+        version: 3,
+        is_active: false,
+        deactivated_at: '2026-06-30T10:00:00Z',
+      },
+    ])
     dingtalkApi.fetchDingTalkIntegration.mockResolvedValue({
       mode: 'sandbox',
       credentials_configured: true,
@@ -134,6 +173,75 @@ describe('EmployeesPage safe edits', () => {
     expect((apply as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(apply)
     expect(dingtalkApi.applyDingTalkEmployeeMatches).not.toHaveBeenCalled()
+  })
+
+  it('loads the full grade catalog and displays the assigned grade for grade readers', async () => {
+    auth.permissions = ['grade:read']
+
+    renderPage()
+
+    await waitFor(() => expect(masterdataApi.fetchGrades).toHaveBeenCalledWith({ status: 'all' }))
+    expect(await screen.findByRole('columnheader', { name: '职级' })).toBeTruthy()
+    expect(await screen.findByText(/G02.*停用职级/)).toBeTruthy()
+  })
+
+  it('lets editors assign an active grade while keeping the current inactive grade read-only', async () => {
+    auth.permissions = ['employee:write', 'grade:read']
+
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    const gradeSelect = await screen.findByLabelText('员工职级')
+    expect(screen.getByText(/G02.*停用职级.*已停用/)).toBeTruthy()
+
+    fireEvent.mouseDown(gradeSelect)
+    const inactiveOption = await screen.findByRole('option', {
+      name: /G02.*停用职级.*已停用/,
+    })
+    expect(inactiveOption.getAttribute('aria-disabled')).toBe('true')
+    fireEvent.click(await screen.findByRole('option', { name: /G01.*初级职级/ }))
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() =>
+      expect(masterdataApi.updateEmployee).toHaveBeenCalledWith(17, {
+        job_grade_id: 101,
+      }),
+    )
+  })
+
+  it('does not query or expose grades without grade read permission', async () => {
+    auth.permissions = ['employee:write']
+
+    renderPage()
+
+    await screen.findByText('E0017')
+    expect(masterdataApi.fetchGrades).not.toHaveBeenCalled()
+    expect(screen.queryByRole('columnheader', { name: '职级' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /编\s*辑/ }))
+    expect(screen.queryByLabelText('员工职级')).toBeNull()
+  })
+
+  it('opens and closes the selected employee salary structure drawer for salary readers', async () => {
+    auth.permissions = ['salary_structure:read']
+
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: '薪资结构' }))
+    const drawer = await screen.findByRole('dialog', { name: '薪资结构抽屉' })
+    expect(within(drawer).getByText('E0017')).toBeTruthy()
+    expect(salaryStructureDrawer.render).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        employee: expect.objectContaining({ id: 17 }),
+        open: true,
+      }),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭薪资结构' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '薪资结构抽屉' })).toBeNull())
+    expect(salaryStructureDrawer.render).toHaveBeenLastCalledWith(
+      expect.objectContaining({ open: false }),
+    )
   })
 })
 
