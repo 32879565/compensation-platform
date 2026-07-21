@@ -25,6 +25,34 @@ def _config_with_connection(connection) -> Config:
     return config
 
 
+def test_supplied_connection_does_not_commit_caller_owned_transaction(pg_engine) -> None:
+    """Alembic must not commit work owned by an ``engine.begin()`` caller."""
+
+    schema = f"alembic_outer_transaction_{uuid4().hex}"
+    with pg_engine.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+    try:
+        with pytest.raises(RuntimeError, match="active transaction"):
+            with pg_engine.begin() as connection:
+                connection.execute(text(f'SET search_path TO "{schema}", public'))
+                connection.execute(text("CREATE TABLE caller_owned_marker (id integer)"))
+
+                command.upgrade(_config_with_connection(connection), "head")
+
+        with pg_engine.connect() as connection:
+            assert (
+                connection.scalar(
+                    text("SELECT to_regclass(:qualified_name)"),
+                    {"qualified_name": f"{schema}.caller_owned_marker"},
+                )
+                is None
+            )
+    finally:
+        with pg_engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
 def test_fresh_legacy_runbook_loads_before_store_and_employee_backfills(pg_engine) -> None:
     """The documented S6 load order must produce linked real historical rows."""
 
