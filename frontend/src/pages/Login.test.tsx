@@ -7,6 +7,7 @@ vi.mock('../api/client', () => ({
   api: { post: vi.fn().mockRejectedValue(new Error('no session')) },
   setAccessToken: vi.fn(),
   getAccessToken: vi.fn(),
+  subscribeAuthSessionExpired: vi.fn(() => () => undefined),
 }))
 
 import { AuthProvider } from '../auth/AuthContext'
@@ -15,7 +16,7 @@ import Login from './Login'
 describe('Login 页', () => {
   it('渲染标题与登录按钮', async () => {
     render(
-      <MemoryRouter>
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <AuthProvider>
           <Login />
         </AuthProvider>

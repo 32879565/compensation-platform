@@ -19,6 +19,38 @@ class BatchStatus(enum.StrEnum):
     LOCKED = "LOCKED"  # 已锁定
 
 
+class CalculationStatus(enum.StrEnum):
+    """Read-model projection of calculation progress from ``BatchStatus``."""
+
+    PENDING = "PENDING"
+    CALCULATING = "CALCULATING"
+    CALCULATED = "CALCULATED"
+
+
+class StoreConfirmationStatus(enum.StrEnum):
+    """Read-model projection of the store review dimension."""
+
+    NOT_STARTED = "NOT_STARTED"
+    PENDING = "PENDING"
+    HAS_DISPUTE = "HAS_DISPUTE"
+    CONFIRMED = "CONFIRMED"
+
+
+class HrReviewStatus(enum.StrEnum):
+    """Read-model projection of final HR review progress."""
+
+    NOT_STARTED = "NOT_STARTED"
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+
+
+class LockStatus(enum.StrEnum):
+    """Read-model projection of the final lock dimension."""
+
+    UNLOCKED = "UNLOCKED"
+    LOCKED = "LOCKED"
+
+
 class PayrollBatch(Base, TimestampMixin):
     """月度薪资计算批次。一个薪资月份一个批次。"""
 
@@ -35,7 +67,41 @@ class PayrollBatch(Base, TimestampMixin):
         index=True,
     )
     calculated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hr_reviewed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    hr_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     locked_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # 解锁保留版本号（每次解锁+1，不覆盖历史 payroll_result）
     version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+
+    @property
+    def calculation_status(self) -> CalculationStatus:
+        if self.status == BatchStatus.DRAFT:
+            return CalculationStatus.PENDING
+        if self.status == BatchStatus.CALCULATING:
+            return CalculationStatus.CALCULATING
+        return CalculationStatus.CALCULATED
+
+    @property
+    def store_confirmation_status(self) -> StoreConfirmationStatus:
+        if self.status in {BatchStatus.DRAFT, BatchStatus.CALCULATING}:
+            return StoreConfirmationStatus.NOT_STARTED
+        if self.status == BatchStatus.PENDING_STORE_CONFIRM:
+            return StoreConfirmationStatus.PENDING
+        if self.status == BatchStatus.HAS_DISPUTE:
+            return StoreConfirmationStatus.HAS_DISPUTE
+        return StoreConfirmationStatus.CONFIRMED
+
+    @property
+    def hr_review_status(self) -> HrReviewStatus:
+        if self.status == BatchStatus.PENDING_HR:
+            return HrReviewStatus.PENDING
+        if self.status in {BatchStatus.CONFIRMED, BatchStatus.LOCKED}:
+            return HrReviewStatus.APPROVED
+        return HrReviewStatus.NOT_STARTED
+
+    @property
+    def lock_status(self) -> LockStatus:
+        if self.status == BatchStatus.LOCKED:
+            return LockStatus.LOCKED
+        return LockStatus.UNLOCKED

@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.auth.permissions import Perm
 from app.core.config import get_settings
 from app.core.security import (
     create_access_token,
@@ -23,8 +24,10 @@ from app.models.auth import (
     RolePermission,
     User,
     UserOrgScope,
+    UserReviewScope,
     UserRole,
 )
+from app.models.employee import Department
 from app.models.org import OrgUnit
 
 
@@ -101,6 +104,32 @@ def _has_global_scope(session: Session, user_id: int) -> bool:
     )
 
 
+def _has_global_permission_role(session: Session, user_id: int, permission: str) -> bool:
+    """Return whether a global role grants this *specific* permission.
+
+    ``Principal.org_scope`` is intentionally the union of every assigned role.
+    It therefore cannot safely decide payroll-review visibility: a user with a
+    global Finance role plus a local Store Manager role would otherwise inherit
+    unrestricted store-review access from Finance even though Finance does not
+    grant ``payroll:review``.
+    """
+    return (
+        session.execute(
+            select(Role.id)
+            .join(UserRole, UserRole.role_id == Role.id)
+            .join(RolePermission, RolePermission.role_id == Role.id)
+            .join(Permission, Permission.id == RolePermission.permission_id)
+            .where(
+                UserRole.user_id == user_id,
+                Role.is_global_scope.is_(True),
+                Permission.code == permission,
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
 def resolve_org_scope(session: Session, user_id: int) -> frozenset[int] | None:
     """返回用户可见 org_unit id 集合；None 表示不受限（全集团）。
 
@@ -108,6 +137,18 @@ def resolve_org_scope(session: Session, user_id: int) -> frozenset[int] | None:
     """
     if _has_global_scope(session, user_id):
         return None
+    return _assigned_org_scope(session, user_id)
+
+
+def _assigned_org_scope(session: Session, user_id: int) -> frozenset[int]:
+    """Resolve explicit user-org assignments without considering global roles.
+
+    This is intentionally separate from :func:`resolve_org_scope`.  A user
+    can hold a global role that grants one permission (for example
+    ``audit:read``) and a scoped role that grants another (for example
+    ``export:data``).  The latter must remain scoped rather than inheriting
+    unrestricted visibility merely because both roles belong to the same user.
+    """
     roots = [
         oid
         for (oid,) in session.execute(
@@ -115,9 +156,82 @@ def resolve_org_scope(session: Session, user_id: int) -> frozenset[int] | None:
         ).all()
     ]
     if not roots:
-        # 无全局角色且无范围配置：可见范围为空（fail-closed，什么也看不到）
+        # No explicit scope assignment: fail closed even when an unrelated
+        # global role is present on the same account.
         return frozenset()
     return _subtree_closure(session, roots)
+
+
+def resolve_permission_org_scope(
+    session: Session, principal: Principal, permission: str
+) -> frozenset[int] | None:
+    """Resolve scope for one authorization decision, fail-closed by default.
+
+    ``None`` is returned only when a *global role that itself grants
+    ``permission`` exists.  Otherwise explicit ``user_org_scope`` assignments
+    determine the visible subtree, including for users who also hold unrelated
+    global roles.  This prevents permission/scope mixing from widening a
+    local export, dashboard, or write permission to the whole group.
+    """
+    if _has_global_permission_role(session, principal.user_id, permission):
+        return None
+    return _assigned_org_scope(session, principal.user_id)
+
+
+def permission_org_scope_allows(
+    session: Session,
+    principal: Principal,
+    permission: str,
+    org_unit_id: int | None,
+) -> bool:
+    """Check one permission and its own organization grant as one decision.
+
+    A principal can receive different permissions from unrelated global and
+    scoped roles.  Checking ``has_permission`` and then reusing another
+    permission's scope would let those grants combine into authority that no
+    single role provides.  Legacy snapshots with no organization are visible
+    only to a global grant for this exact permission.
+    """
+    if not principal.has_permission(permission):
+        return False
+    scope = resolve_permission_org_scope(session, principal, permission)
+    return scope is None or (org_unit_id is not None and org_unit_id in scope)
+
+
+def resolve_review_scope(
+    session: Session, principal: Principal
+) -> frozenset[tuple[int, Department]]:
+    """Return the payroll-review scopes assigned to ``principal``.
+
+    Payroll review is deliberately never global, even for a principal with a
+    global organization role.  The specification requires every reviewer to
+    see and act only within explicit Store/Department assignments; final HR
+    approval is authorized separately by ``payroll:approve``.
+    """
+    rows = session.execute(
+        select(UserReviewScope.org_unit_id, UserReviewScope.department)
+        .join(OrgUnit, OrgUnit.id == UserReviewScope.org_unit_id)
+        .where(
+            UserReviewScope.user_id == principal.user_id,
+            OrgUnit.is_deleted.is_(False),
+        )
+    ).all()
+    return frozenset((org_unit_id, department) for org_unit_id, department in rows)
+
+
+def resolve_payroll_read_scope(
+    session: Session, principal: Principal
+) -> frozenset[tuple[int, Department]] | None:
+    """Return the payroll-result visibility scope for a principal.
+
+    Global Finance/Auditor payroll-read roles are intentionally global readers.
+    Store/region readers, on the other hand, are constrained to explicit review
+    assignments.  This is distinct from ``resolve_review_scope`` because global
+    payroll read must not grant global *review/confirmation* authority.
+    """
+    if _has_global_permission_role(session, principal.user_id, Perm.PAYROLL_READ):
+        return None
+    return resolve_review_scope(session, principal)
 
 
 def _subtree_closure(session: Session, roots: list[int]) -> frozenset[int]:

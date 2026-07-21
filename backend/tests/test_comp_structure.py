@@ -2,6 +2,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
 from app.comp.service import (
     BandStatus,
@@ -11,7 +12,12 @@ from app.comp.service import (
     set_component_amount,
     structure_total,
 )
-from app.models.comp import ComponentType, SalaryComponentDef
+from app.models.comp import (
+    AllowanceKind,
+    ComponentType,
+    EmployeeSalaryStructure,
+    SalaryComponentDef,
+)
 from app.models.employee import Employee
 from app.models.grade import JobGrade, SalaryBand
 from app.models.org import OrgType, OrgUnit
@@ -31,7 +37,12 @@ def emp_id(db_session):
 
 
 def _component(session, code, ctype=ComponentType.BASE):
-    c = SalaryComponentDef(code=code, name=code, component_type=ctype)
+    c = SalaryComponentDef(
+        code=code,
+        name=code,
+        component_type=ctype,
+        allowance_kind=AllowanceKind.FIXED if ctype is ComponentType.ALLOWANCE else None,
+    )
     session.add(c)
     session.flush()
     return c
@@ -77,7 +88,7 @@ def test_effective_dating_creates_new_record_closes_old(db_session, emp_id):
     assert hist[0].amount == Decimal("6000")
 
 
-def test_same_day_correction_updates_amount(db_session, emp_id):
+def test_same_day_correction_keeps_the_prior_record_as_history(db_session, emp_id):
     base = _component(db_session, "BASE")
     set_component_amount(
         db_session,
@@ -97,6 +108,43 @@ def test_same_day_correction_updates_amount(db_session, emp_id):
     recs = current_structure(db_session, emp_id, date(2026, 1, 1))
     assert len(recs) == 1
     assert recs[0].amount == Decimal("5500")
+    assert recs[0].revision == 2
+
+    history = list(
+        db_session.scalars(
+            select(EmployeeSalaryStructure)
+            .where(
+                EmployeeSalaryStructure.employee_id == emp_id,
+                EmployeeSalaryStructure.component_id == base.id,
+            )
+            .order_by(EmployeeSalaryStructure.revision)
+        )
+    )
+    assert [(record.amount, record.effective_to, record.revision) for record in history] == [
+        (Decimal("5000"), date(2026, 1, 1), 1),
+        (Decimal("5500"), None, 2),
+    ]
+
+
+def test_approved_same_day_noop_is_rejected_instead_of_losing_provenance(db_session, emp_id):
+    base = _component(db_session, "BASE")
+    set_component_amount(
+        db_session,
+        employee_id=emp_id,
+        component_id=base.id,
+        amount=Decimal("5000"),
+        effective_from=date(2026, 1, 1),
+    )
+
+    with pytest.raises(StructureError, match="must change"):
+        set_component_amount(
+            db_session,
+            employee_id=emp_id,
+            component_id=base.id,
+            amount=Decimal("5000"),
+            effective_from=date(2026, 1, 1),
+            source_adjustment_id=1,
+        )
 
 
 def test_backdated_effective_rejected(db_session, emp_id):

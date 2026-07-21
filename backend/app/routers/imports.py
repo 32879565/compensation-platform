@@ -6,16 +6,29 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.audit import service as audit
-from app.auth.deps import principal_scope, require_permission
+from app.auth.deps import require_permission
 from app.auth.permissions import Perm
-from app.auth.service import Principal
+from app.auth.service import Principal, resolve_permission_org_scope
 from app.db.session import get_session
 from app.importing.excel import read_salary_workbook
 from app.importing.service import ImportError_, confirm_import, stage_import
+from app.importing.store_aliases import STORE_ALIASES
 from app.models.salary import ImportBatch, ImportStagingRow, RowStatus
 from app.repositories.salary import SalaryRecordRepository
 
 router = APIRouter(prefix="/api/imports", tags=["imports"])
+
+
+def _require_global_importer(
+    principal: Principal = Depends(require_permission(Perm.IMPORT_RUN)),
+    session: Session = Depends(get_session),
+) -> Principal:
+    """Import staging is group-wide, so a local grant must not become global."""
+    if resolve_permission_org_scope(session, principal, Perm.IMPORT_RUN) is not None:
+        raise HTTPException(
+            status_code=403, detail="salary import requires global organization scope"
+        )
+    return principal
 
 
 class BatchSummary(BaseModel):
@@ -46,7 +59,7 @@ class StagingRowOut(BaseModel):
 async def upload_import(
     period: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
     file: UploadFile = File(...),
-    principal: Principal = Depends(require_permission(Perm.IMPORT_RUN)),
+    principal: Principal = Depends(_require_global_importer),
     session: Session = Depends(get_session),
 ) -> ImportBatch:
     if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
@@ -58,7 +71,7 @@ async def upload_import(
     if len(content) > _MAX_UPLOAD:
         raise HTTPException(status_code=413, detail="文件超过 20MB 上限")
     try:
-        result = read_salary_workbook(io.BytesIO(content), period=period)
+        result = read_salary_workbook(io.BytesIO(content), period=period, aliases=STORE_ALIASES)
     except Exception as exc:  # noqa: BLE001  解析失败以 400 反馈，不泄露内部堆栈
         raise HTTPException(status_code=400, detail=f"解析失败：{type(exc).__name__}") from None
     batch = stage_import(
@@ -70,7 +83,11 @@ async def upload_import(
         actor=(principal.user_id, principal.username),
         target_type="import_batch",
         target_id=batch.id,
-        detail={"filename": batch.filename, "rows": batch.total_rows, "errors": batch.error_rows},
+        detail={
+            "file_extension": (file.filename or "").rsplit(".", maxsplit=1)[-1].lower(),
+            "rows": batch.total_rows,
+            "errors": batch.error_rows,
+        },
     )
     session.commit()
     return batch
@@ -80,13 +97,25 @@ async def upload_import(
 def get_batch_rows(
     batch_id: int,
     only_errors: bool = False,
-    _p: Principal = Depends(require_permission(Perm.IMPORT_RUN)),
+    principal: Principal = Depends(_require_global_importer),
     session: Session = Depends(get_session),
 ) -> list[ImportStagingRow]:
+    if session.get(ImportBatch, batch_id) is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
     stmt = select(ImportStagingRow).where(ImportStagingRow.batch_id == batch_id)
     if only_errors:
         stmt = stmt.where(ImportStagingRow.status == RowStatus.ERROR)
-    return list(session.scalars(stmt.order_by(ImportStagingRow.row_index)).all())
+    response = list(session.scalars(stmt.order_by(ImportStagingRow.row_index)).all())
+    audit.record(
+        session,
+        action="import.staging_rows.view",
+        actor=(principal.user_id, principal.username),
+        target_type="import_batch",
+        target_id=batch_id,
+        detail={"only_errors": only_errors, "returned": len(response)},
+    )
+    session.commit()
+    return response
 
 
 class ConfirmResult(BaseModel):
@@ -96,7 +125,7 @@ class ConfirmResult(BaseModel):
 @router.post("/{batch_id}/confirm", response_model=ConfirmResult)
 def confirm_batch(
     batch_id: int,
-    principal: Principal = Depends(require_permission(Perm.IMPORT_RUN)),
+    principal: Principal = Depends(_require_global_importer),
     session: Session = Depends(get_session),
 ) -> ConfirmResult:
     batch = session.get(ImportBatch, batch_id)
@@ -152,13 +181,33 @@ def search_salary(
     principal: Principal = Depends(require_permission(Perm.SALARY_READ)),
     session: Session = Depends(get_session),
 ) -> SalaryRecordPage:
-    repo = SalaryRecordRepository(session, org_scope=principal_scope(principal))
+    repo = SalaryRecordRepository(
+        session,
+        org_scope=resolve_permission_org_scope(session, principal, Perm.SALARY_READ),
+    )
     result = repo.search(
         name=name, emp_no=emp_no, period=period, store=store, page=page, page_size=page_size
     )
-    return SalaryRecordPage(
+    response = SalaryRecordPage(
         items=[SalaryRecordOut.model_validate(r) for r in result.items],
         total=result.total,
         page=result.page,
         page_size=result.page_size,
     )
+    audit.record(
+        session,
+        action="salary.records.search",
+        actor=(principal.user_id, principal.username),
+        target_type="salary_record",
+        detail={
+            "has_name_filter": name is not None,
+            "has_emp_no_filter": emp_no is not None,
+            "has_period_filter": period is not None,
+            "has_store_filter": store is not None,
+            "page": page,
+            "page_size": page_size,
+            "returned": len(response.items),
+        },
+    )
+    session.commit()
+    return response

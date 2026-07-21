@@ -39,7 +39,7 @@ export default function Login() {
           薪酬一体化平台
         </Typography.Title>
         {error && <Alert type="error" message={error} style={{ marginBottom: 16 }} showIcon />}
-        <Form layout="vertical" onFinish={onFinish} disabled={submitting}>
+        <Form data-testid="login-form" layout="vertical" onFinish={onFinish} disabled={submitting}>
           <Form.Item
             name="username"
             label="用户名"
@@ -54,7 +54,13 @@ export default function Login() {
           >
             <Input.Password autoComplete="current-password" />
           </Form.Item>
-          <Button type="primary" htmlType="submit" block loading={submitting}>
+          <Button
+            data-testid="login-submit"
+            type="primary"
+            htmlType="submit"
+            block
+            loading={submitting}
+          >
             登录
           </Button>
         </Form>

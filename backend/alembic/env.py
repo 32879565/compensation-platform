@@ -5,13 +5,17 @@ from sqlalchemy import engine_from_config, pool
 import app.models  # noqa: F401  确保所有模型注册进 metadata
 from alembic import context
 from app.core.config import get_settings
+from app.db.alembic_url import escape_alembic_config_value
 from app.db.base import Base
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+config.set_main_option(
+    "sqlalchemy.url",
+    escape_alembic_config_value(get_settings().database_url),
+)
 target_metadata = Base.metadata
 
 
@@ -27,15 +31,26 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    # Integration tests (and deployment tooling that owns a transaction) can
+    # pass a live connection through Alembic's standard config attribute.
+    # Keep it separate from the normal engine path so production startup still
+    # obtains its URL exclusively from application configuration.
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        context.configure(
+            connection=supplied_connection, target_metadata=target_metadata, compare_type=True
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata, compare_type=True
-        )
+        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
         with context.begin_transaction():
             context.run_migrations()
 

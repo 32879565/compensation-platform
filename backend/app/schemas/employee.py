@@ -2,10 +2,26 @@ from __future__ import annotations
 
 from datetime import date
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from app.core.crypto import mask_bank_account, mask_id_card
 from app.models.employee import Department, Employee, EmployeeStatus, EmploymentType
+
+
+def validate_employee_lifecycle_dates(
+    *,
+    hire_date: date | None,
+    probation_end: date | None,
+    leave_date: date | None,
+) -> None:
+    """Validate the chronology of one merged employee lifecycle state."""
+
+    if hire_date is None:
+        raise ValueError("hire_date cannot be cleared")
+    if probation_end is not None and probation_end < hire_date:
+        raise ValueError("probation_end cannot be earlier than hire_date")
+    if leave_date is not None and leave_date < hire_date:
+        raise ValueError("leave_date cannot be earlier than hire_date")
 
 
 class EmployeeCreate(BaseModel):
@@ -17,11 +33,24 @@ class EmployeeCreate(BaseModel):
     department: Department = Department.OTHER
     position_title: str | None = Field(default=None, max_length=64)
     is_special_position: bool = False
-    hire_date: date | None = None
+    # New master-data records must have a labor-relationship start date.  The
+    # database remains nullable only so legacy imports can be repaired through
+    # the audited HR workflow; payroll fail-closes those rows in the meantime.
+    hire_date: date
     probation_end: date | None = None
+    leave_date: date | None = None
     social_city: str | None = Field(default=None, max_length=32)
     id_card: str | None = Field(default=None, max_length=64)
     bank_account: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_lifecycle_dates(self) -> EmployeeCreate:
+        validate_employee_lifecycle_dates(
+            hire_date=self.hire_date,
+            probation_end=self.probation_end,
+            leave_date=self.leave_date,
+        )
+        return self
 
 
 class EmployeeUpdate(BaseModel):
@@ -39,6 +68,21 @@ class EmployeeUpdate(BaseModel):
     social_city: str | None = Field(default=None, max_length=32)
     id_card: str | None = Field(default=None, max_length=64)
     bank_account: str | None = Field(default=None, max_length=64)
+
+    @field_validator(
+        "name",
+        "org_unit_id",
+        "employment_type",
+        "department",
+        "is_special_position",
+        "status",
+        "hire_date",
+    )
+    @classmethod
+    def reject_null_required_fields(cls, value: object, info: ValidationInfo) -> object:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be cleared")
+        return value
 
 
 class EmployeeOut(BaseModel):
@@ -58,6 +102,7 @@ class EmployeeOut(BaseModel):
     social_city: str | None
     id_card: str | None
     bank_account: str | None
+    dingtalk_linked: bool
 
     @classmethod
     def from_employee(cls, emp: Employee, *, reveal_pii: bool) -> EmployeeOut:
@@ -79,6 +124,7 @@ class EmployeeOut(BaseModel):
             social_city=emp.social_city,
             id_card=emp.id_card if reveal_pii else mask_id_card(emp.id_card),
             bank_account=(emp.bank_account if reveal_pii else mask_bank_account(emp.bank_account)),
+            dingtalk_linked=emp.dingtalk_user_id_hash is not None,
         )
 
 

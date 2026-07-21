@@ -27,10 +27,17 @@ dev = [
     "black>=24.4",
     "isort>=5.13",
     "mypy>=1.10",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+    "pip-tools>=7.4",
+]
+windows = [
+    # Testcontainers on local Windows uses the named-pipe Docker client.
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -55,6 +62,12 @@ extend-immutable-calls = [
     "fastapi.File",
     "app.auth.deps.require_permission",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic's generated DDL contains long SQL/column declarations.  Keep the
+# generated migrations import- and syntax-checked while applying line-length
+# policy to handwritten application and test code.
+"alembic/versions/*.py" = ["E501"]
 
 [tool.black]
 line-length = 100

@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -61,6 +62,7 @@ class BaseRepository[ModelT: Base]:
     def soft_delete(self, obj: ModelT) -> None:
         if isinstance(obj, SoftDeleteMixin):
             obj.is_deleted = True
+            obj.deleted_at = datetime.now(UTC)
             self.session.flush()
         else:  # pragma: no cover - 无软删列的模型不应走此路径
             raise TypeError(f"{self.model.__name__} 不支持软删除")

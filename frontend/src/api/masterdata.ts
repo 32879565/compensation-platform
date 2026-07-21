@@ -33,6 +33,7 @@ export interface Employee {
   social_city: string | null
   id_card: string | null
   bank_account: string | null
+  dingtalk_linked: boolean
 }
 
 export interface EmployeePage {

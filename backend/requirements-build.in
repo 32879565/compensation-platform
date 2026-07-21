@@ -1,0 +1,4 @@
+# PEP 517 tooling used when packaging the local application in CI and Docker.
+# Keep this aligned with [build-system].requires in pyproject.toml.
+setuptools==83.0.0
+wheel==0.47.0

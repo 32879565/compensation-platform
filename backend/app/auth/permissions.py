@@ -37,10 +37,12 @@ class Perm:
     ADJUSTMENT_READ = "adjustment:read"
     ADJUSTMENT_CREATE = "adjustment:create"
     ADJUSTMENT_APPROVE = "adjustment:approve"
+    APPROVAL_FLOW_MANAGE = "approval_flow:manage"
     BUDGET_READ = "budget:read"
     BUDGET_WRITE = "budget:write"
     DASHBOARD_READ = "dashboard:read"
     EXPORT_DATA = "export:data"
+    NOTIFICATION_MANAGE = "notification:manage"
     IMPORT_RUN = "import:run"
     SALARY_READ = "salary:read"
     AUDIT_READ = "audit:read"
@@ -75,10 +77,12 @@ PERMISSION_CATALOG: dict[str, str] = {
     Perm.ADJUSTMENT_READ: "查看调薪",
     Perm.ADJUSTMENT_CREATE: "发起调薪",
     Perm.ADJUSTMENT_APPROVE: "审批调薪",
+    Perm.APPROVAL_FLOW_MANAGE: "维护审批流程",
     Perm.BUDGET_READ: "查看预算",
     Perm.BUDGET_WRITE: "维护预算",
     Perm.DASHBOARD_READ: "查看看板",
     Perm.EXPORT_DATA: "导出数据",
+    Perm.NOTIFICATION_MANAGE: "管理薪酬通知",
     Perm.IMPORT_RUN: "导入薪资数据",
     Perm.SALARY_READ: "查询薪资记录",
     Perm.AUDIT_READ: "查看审计日志",
@@ -136,10 +140,12 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.ADJUSTMENT_READ,
             Perm.ADJUSTMENT_CREATE,
             Perm.ADJUSTMENT_APPROVE,
+            Perm.APPROVAL_FLOW_MANAGE,
             Perm.BUDGET_READ,
             Perm.BUDGET_WRITE,
             Perm.DASHBOARD_READ,
             Perm.EXPORT_DATA,
+            Perm.NOTIFICATION_MANAGE,
             Perm.IMPORT_RUN,
             Perm.SALARY_READ,
         ),
@@ -159,6 +165,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.PAYROLL_REVIEW,
             Perm.ADJUSTMENT_READ,
             Perm.ADJUSTMENT_CREATE,
+            Perm.ADJUSTMENT_APPROVE,
             Perm.BUDGET_READ,
             Perm.DASHBOARD_READ,
             Perm.SALARY_READ,
@@ -174,6 +181,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.ATTENDANCE_WRITE,
             Perm.PAYROLL_READ,
             Perm.PAYROLL_REVIEW,
+            Perm.ADJUSTMENT_CREATE,
             Perm.DASHBOARD_READ,
             Perm.SALARY_READ,
         ),

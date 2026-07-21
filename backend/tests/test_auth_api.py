@@ -27,11 +27,8 @@ def _make_user(session, username, password, role_codes=(), scope_org_ids=()):
 def client(db_session):
     from fastapi.testclient import TestClient
 
-    import app.auth.router as router_mod
     from app.db.session import get_session
     from app.main import app
-
-    router_mod._throttle._failures.clear()  # 清空限速状态，避免跨用例污染
 
     def _override():
         yield db_session
@@ -50,6 +47,7 @@ def test_login_success_sets_cookie_and_returns_token(client, db_session):
     assert body["access_token"]
     assert "employee:read" in body["permissions"]
     assert "comp_refresh" in resp.cookies
+    assert resp.headers["cache-control"] == "no-store"
 
 
 def test_login_wrong_password_401(client, db_session):
@@ -72,6 +70,20 @@ def test_login_lockout_after_max_failures(client, db_session):
     # 第 6 次即便口令正确也被限速拦截
     resp = client.post("/api/auth/login", json={"username": "hr", "password": "StrongPass123!"})
     assert resp.status_code == 429
+    assert resp.headers["retry-after"].isdigit()
+    assert resp.headers["cache-control"] == "no-store"
+
+
+def test_login_ip_lockout_applies_across_rotating_usernames(client, db_session):
+    _make_user(db_session, "hr", "StrongPass123!", ["GROUP_HR"])
+    for number in range(5):
+        response = client.post(
+            "/api/auth/login", json={"username": f"unknown-{number}", "password": "wrong"}
+        )
+        assert response.status_code == 401
+
+    blocked = client.post("/api/auth/login", json={"username": "hr", "password": "StrongPass123!"})
+    assert blocked.status_code == 429
 
 
 def test_me_requires_auth(client):
@@ -100,18 +112,27 @@ def test_refresh_happy_path(client, db_session):
     resp = client.post("/api/auth/refresh")
     assert resp.status_code == 200
     assert resp.json()["access_token"]
+    assert resp.headers["cache-control"] == "no-store"
 
 
-def test_refresh_without_cookie_401(client):
-    assert client.post("/api/auth/refresh").status_code == 401
+def test_refresh_without_cookie_is_a_guest_no_content_response(client):
+    response = client.post("/api/auth/refresh")
+    assert response.status_code == 204
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_logout_revokes_and_refresh_then_fails(client, db_session):
     _make_user(db_session, "hr", "StrongPass123!", ["GROUP_HR"])
     client.post("/api/auth/login", json={"username": "hr", "password": "StrongPass123!"})
+    refresh_token = client.cookies.get("comp_refresh")
+    assert refresh_token
     assert client.post("/api/auth/logout").status_code == 204
-    # 登出吊销后，用（已被清除的）cookie 刷新应失败
-    assert client.post("/api/auth/refresh").status_code == 401
+    # Replay the token that logout revoked.  A cookie that was merely cleared
+    # from this test client is correctly treated as a guest (204).
+    assert (
+        client.post("/api/auth/refresh", cookies={"comp_refresh": refresh_token}).status_code == 401
+    )
 
 
 def test_login_success_writes_audit(client, db_session):
@@ -124,12 +145,27 @@ def test_login_success_writes_audit(client, db_session):
     assert row.actor_username == "hr"
 
 
-def test_login_failure_writes_audit_without_password(client, db_session):
+def test_login_lockout_writes_audit_without_password(client, db_session):
     _make_user(db_session, "hr", "StrongPass123!", ["GROUP_HR"])
-    client.post("/api/auth/login", json={"username": "hr", "password": "wrong"})
+    for _ in range(5):
+        client.post("/api/auth/login", json={"username": "hr", "password": "wrong"})
     row = db_session.scalars(
-        select(AuditLog).where(AuditLog.action == "auth.login", AuditLog.result == "FAILURE")
+        select(AuditLog).where(AuditLog.action == "auth.login", AuditLog.result == "LOCKED")
     ).first()
     assert row is not None
     # 审计明细绝不含明文口令
     assert "wrong" not in str(row.detail)
+
+
+def test_repeated_locked_logins_do_not_append_an_audit_row(client, db_session):
+    _make_user(db_session, "hr", "StrongPass123!", ["GROUP_HR"])
+    for _ in range(5):
+        client.post("/api/auth/login", json={"username": "hr", "password": "wrong"})
+    before = db_session.scalars(select(AuditLog).where(AuditLog.action == "auth.login")).all()
+
+    for _ in range(3):
+        response = client.post("/api/auth/login", json={"username": "hr", "password": "wrong"})
+        assert response.status_code == 429
+
+    after = db_session.scalars(select(AuditLog).where(AuditLog.action == "auth.login")).all()
+    assert len(after) == len(before) == 1

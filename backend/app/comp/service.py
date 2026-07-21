@@ -7,15 +7,41 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.comp import ComponentType, EmployeeSalaryStructure, SalaryComponentDef
+from app.models.employee import Employee
 from app.models.grade import SalaryBand
+from app.payroll.guards import lock_payroll_input_mutation
 
 
 class StructureError(Exception):
     pass
+
+
+def lock_employee_salary_structure(session: Session, *, employee_id: int) -> Employee:
+    """Serialize all structure writes for one employee, including an empty gap.
+
+    Row locks on an existing open structure alone cannot protect the first
+    structure component: there is no row to lock yet.  The employee row is a
+    stable parent lock that closes that race for initial setup and approval
+    application alike.
+    """
+
+    # Batch calculation takes the payroll advisory lock before its employee
+    # cohort locks.  All structure writers use the same order to avoid a
+    # batch-versus-adjustment deadlock.
+    lock_payroll_input_mutation(session)
+    employee = session.scalars(
+        select(Employee)
+        .where(Employee.id == employee_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if employee is None:
+        raise StructureError("Employee does not exist")
+    return employee
 
 
 class BandStatus(enum.StrEnum):
@@ -49,25 +75,60 @@ def set_component_amount(
     component_id: int,
     amount: Decimal,
     effective_from: date,
+    source_adjustment_id: int | None = None,
+    source_reason: str | None = None,
+    source_attachment_url: str | None = None,
 ) -> EmployeeSalaryStructure:
     """生效日期化地设置组件金额：关闭旧开放记录、插入新开放记录。
 
     - 同日修正：直接改金额。
     - 生效日须不早于当前开放记录的生效日（不支持向历史中间插入）。
     """
+    lock_employee_salary_structure(session, employee_id=employee_id)
     open_rec = session.scalars(
-        select(EmployeeSalaryStructure).where(
+        select(EmployeeSalaryStructure)
+        .where(
             EmployeeSalaryStructure.employee_id == employee_id,
             EmployeeSalaryStructure.component_id == component_id,
             EmployeeSalaryStructure.effective_to.is_(None),
         )
+        .with_for_update()
     ).first()
 
     if open_rec is not None:
         if open_rec.effective_from == effective_from:
-            open_rec.amount = amount  # 同日修正
+            if open_rec.amount == amount:
+                if source_adjustment_id is not None:
+                    raise StructureError(
+                        "Approved salary adjustment must change the salary structure"
+                    )
+                return open_rec
+            # A same-day correction is a new revision, never an in-place
+            # overwrite.  A zero-length end date makes the superseded record
+            # ineligible for payroll while retaining the full value history.
+            open_rec.effective_to = effective_from
+            latest_revision = session.scalar(
+                select(func.coalesce(func.max(EmployeeSalaryStructure.revision), 0)).where(
+                    EmployeeSalaryStructure.employee_id == employee_id,
+                    EmployeeSalaryStructure.component_id == component_id,
+                    EmployeeSalaryStructure.effective_from == effective_from,
+                )
+            )
+            revision = int(latest_revision or 0) + 1
+            new_rec = EmployeeSalaryStructure(
+                employee_id=employee_id,
+                component_id=component_id,
+                amount=amount,
+                effective_from=effective_from,
+                effective_to=None,
+                revision=revision,
+                source_adjustment_id=source_adjustment_id,
+                source_reason=source_reason,
+                source_attachment_url=source_attachment_url,
+            )
+            session.add(new_rec)
             session.flush()
-            return open_rec
+            return new_rec
         if effective_from <= open_rec.effective_from:
             raise StructureError("生效日期须晚于当前生效记录的生效日")
         open_rec.effective_to = effective_from  # 关闭旧记录
@@ -78,6 +139,10 @@ def set_component_amount(
         amount=amount,
         effective_from=effective_from,
         effective_to=None,
+        revision=1,
+        source_adjustment_id=source_adjustment_id,
+        source_reason=source_reason,
+        source_attachment_url=source_attachment_url,
     )
     session.add(new_rec)
     session.flush()
@@ -142,5 +207,5 @@ def compa_ratio(
         status = BandStatus.UNDER
     else:
         status = BandStatus.IN_BAND
-    ratio = (total / band.band_mid) if band.band_mid else None
+    ratio = (total / band.band_mid) if band.band_mid != 0 else None
     return CompaResult(total, status, ratio, band.band_min, band.band_mid, band.band_max)

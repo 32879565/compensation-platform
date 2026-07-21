@@ -28,6 +28,24 @@ class EmployeeStatus(enum.StrEnum):
     SUSPENDED = "SUSPENDED"
 
 
+def requires_approved_attendance_days(position_title: str | None) -> bool:
+    """Return whether a named role must use HR-approved attendance days.
+
+    The explicit employee flag remains available for company-designated roles.
+    These named role families are mandatory in the payroll specification, so a
+    caller cannot accidentally opt them out by leaving that flag false.
+    """
+
+    if not position_title:
+        return False
+    normalized = "".join(position_title.split()).replace("（", "(").replace("）", ")")
+    if "洗碗" in normalized or normalized in {"寒假工", "暑假工"}:
+        return True
+    return ("店长" in normalized or "厨师长" in normalized) and (
+        "实习" in normalized or "储备" in normalized
+    )
+
+
 class Employee(Base, TimestampMixin, SoftDeleteMixin):
     """员工。emp_no 为全局唯一身份键（不变量3：绝不以姓名作身份）。
 
@@ -73,3 +91,9 @@ class Employee(Base, TimestampMixin, SoftDeleteMixin):
     # PII：库中密文、应用层明文（EncryptedString）
     id_card: Mapped[str | None] = mapped_column(EncryptedString(512), nullable=True)
     bank_account: Mapped[str | None] = mapped_column(EncryptedString(512), nullable=True)
+    # Keyed one-way digest only: the provider userid is never stored in
+    # plaintext or returned by the API.  It supports stable equality matching
+    # after names/job numbers change.
+    dingtalk_user_id_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True
+    )

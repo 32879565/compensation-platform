@@ -1,9 +1,21 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.crypto import EncryptedString
 from app.db.base import Base, SoftDeleteMixin, TimestampMixin
+from app.models.employee import Department
 
 
 class User(Base, TimestampMixin, SoftDeleteMixin):
@@ -19,6 +31,10 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     employee_id: Mapped[int | None] = mapped_column(
         ForeignKey("employee.id"), nullable=True, index=True
     )
+    # DingTalk's provider userid is a stable external identifier and therefore
+    # treated as PII.  API responses expose only a configured/not-configured
+    # capability bit; the value is decrypted only immediately before sending.
+    dingtalk_user_id: Mapped[str | None] = mapped_column(EncryptedString(512), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ACTIVE", server_default="ACTIVE"
     )
@@ -73,6 +89,25 @@ class UserOrgScope(Base):
     org_unit_id: Mapped[int] = mapped_column(ForeignKey("org_unit.id"), nullable=False, index=True)
 
 
+class UserReviewScope(Base):
+    """An explicit reviewer assignment for one organization-unit and department pair.
+
+    Reviewer access is intentionally distinct from the broader ``user_org_scope`` tree.
+    A non-global reviewer can access only rows explicitly assigned here.
+    """
+
+    __tablename__ = "user_review_scope"
+    __table_args__ = (
+        UniqueConstraint("user_id", "org_unit_id", "department", name="uq_user_review_scope"),
+    )
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("app_user.id"), nullable=False, index=True)
+    org_unit_id: Mapped[int] = mapped_column(ForeignKey("org_unit.id"), nullable=False, index=True)
+    department: Mapped[Department] = mapped_column(
+        Enum(Department, name="department"), nullable=False
+    )
+
+
 class RefreshToken(Base):
     """refresh token 的 sha256 摘要 + 生命周期。支持服务端吊销（不变量：会话可失效）。"""
 
@@ -83,3 +118,26 @@ class RefreshToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LoginThrottleBucket(Base):
+    """An opaque, short-lived, shared login-rate-limit bucket.
+
+    The key is a domain-separated HMAC digest rather than a raw client IP or
+    username.  It is deliberately ephemeral operational state, not an audit
+    trail; ``expires_at`` is indexed so request-time cleanup remains bounded.
+    """
+
+    __tablename__ = "login_throttle_bucket"
+    __table_args__ = (
+        CheckConstraint("failure_count > 0", name="ck_login_throttle_bucket_failure_count"),
+        UniqueConstraint("scope", "key_digest", name="uq_login_throttle_bucket_scope_digest"),
+        Index("ix_login_throttle_bucket_expires_at", "expires_at"),
+    )
+
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)
+    key_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

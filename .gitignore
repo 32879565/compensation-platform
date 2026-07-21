@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+backend/boot_out.txt
 *.pyc
 .venv/
 .pytest_cache/
@@ -12,6 +13,8 @@ htmlcov/
 # Node
 node_modules/
 dist/
+playwright-report/
+test-results/
 
 # 环境与密钥（不变量8：无明文口令落盘入仓）
 .env
@@ -25,6 +28,13 @@ dist/
 *.xlsx
 *.xls
 *.csv
+# PostgreSQL salary archives must be stored outside this repository.  Keeping
+# their paths ignored protects against an accidental `git add .` disclosure.
+backups/
+*.dump
+*.backup
+*.dump.sha256
+*.backup.sha256
 
 # IDE / OS
 .idea/

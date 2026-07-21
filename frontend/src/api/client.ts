@@ -2,6 +2,8 @@ import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios'
 
 // 内存中的 access token（不落 localStorage，降低 XSS 窃取风险）。
 let accessToken: string | null = null
+type SessionExpiredListener = () => void
+const sessionExpiredListeners = new Set<SessionExpiredListener>()
 
 export function setAccessToken(token: string | null): void {
   accessToken = token
@@ -9,6 +11,15 @@ export function setAccessToken(token: string | null): void {
 
 export function getAccessToken(): string | null {
   return accessToken
+}
+
+export function subscribeAuthSessionExpired(listener: SessionExpiredListener): () => void {
+  sessionExpiredListeners.add(listener)
+  return () => sessionExpiredListeners.delete(listener)
+}
+
+function notifyAuthSessionExpired(): void {
+  for (const listener of sessionExpiredListeners) listener()
 }
 
 export const api = axios.create({ baseURL: '/', withCredentials: true })
@@ -32,11 +43,16 @@ async function refreshAccessToken(): Promise<string | null> {
     refreshing = axios
       .post<RefreshResponse>('/api/auth/refresh', null, { withCredentials: true })
       .then((r) => {
-        setAccessToken(r.data.access_token)
-        return r.data.access_token
+        const token = r.data?.access_token
+        if (typeof token !== 'string' || !token.trim()) {
+          throw new Error('Refresh response did not contain an access token')
+        }
+        setAccessToken(token)
+        return token
       })
       .catch(() => {
         setAccessToken(null)
+        notifyAuthSessionExpired()
         return null
       })
       .finally(() => {

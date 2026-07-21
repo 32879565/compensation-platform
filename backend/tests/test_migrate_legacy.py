@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.importing.migrate_legacy import migrate_rows
+from app.importing.migrate_legacy import LegacyMigrationError, migrate_rows
 from app.models.org import OrgType, OrgUnit
 from app.models.salary import SalaryRecord, SalarySource
 
@@ -23,10 +23,9 @@ def test_migrate_rows_maps_and_reconciles(db_session):
             "综合薪资": "5000",
         },
         {"月份": "2026-05", "姓名": "李四", "门店": "未知店", "合计工资": "3,000"},
-        {"月份": "缺失", "门店": "广州店"},  # 无姓名 → 跳过
     ]
     report = migrate_rows(db_session, legacy)
-    assert report.written == 2  # 第三条缺姓名被跳过
+    assert report.written == 2
     assert report.matched_org == 1  # 只有广州店匹配到组织
     assert report.total_cost == Decimal("8000")  # 5000 + 3000（对账）
     assert report.periods == {"2026-05": 2}
@@ -39,7 +38,20 @@ def test_migrate_rows_maps_and_reconciles(db_session):
     assert zhang.fields["合计工资"] == "5000"
 
 
-def test_migrate_skips_rows_without_store_or_name(db_session):
-    legacy = [{"月份": "2026-05", "姓名": "张三"}]  # 无门店
-    report = migrate_rows(db_session, legacy)
-    assert report.written == 0
+def test_migrate_rejects_malformed_rows_without_partial_write(db_session):
+    legacy = [
+        {"月份": "2026-05", "姓名": "张三", "门店": "广州店", "合计工资": "5000"},
+        {"月份": "2026-05", "姓名": "李四"},  # 无门店
+    ]
+
+    with pytest.raises(LegacyMigrationError, match=r"第 2 行.*缺少门店"):
+        migrate_rows(db_session, legacy)
+
+    assert db_session.query(SalaryRecord).count() == 0
+
+
+def test_migrate_rejects_unparseable_legacy_total(db_session):
+    legacy = [{"月份": "2026-05", "姓名": "张三", "门店": "广州店", "合计工资": "五千"}]
+
+    with pytest.raises(LegacyMigrationError, match=r"第 1 行.*合计工资"):
+        migrate_rows(db_session, legacy)

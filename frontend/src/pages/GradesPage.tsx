@@ -2,9 +2,15 @@ import { useQuery } from '@tanstack/react-query'
 import { Card, Table } from 'antd'
 
 import { fetchGrades, type JobGrade } from '../api/masterdata'
+import { useAuth } from '../auth/AuthContext'
 
 export default function GradesPage() {
-  const { data, isLoading } = useQuery({ queryKey: ['grades'], queryFn: fetchGrades })
+  const { user } = useAuth()
+  const queryScope = user?.username ?? 'anonymous'
+  const { data, isLoading } = useQuery({
+    queryKey: ['grades', queryScope],
+    queryFn: fetchGrades,
+  })
 
   const columns = [
     { title: '编码', dataIndex: 'code' },

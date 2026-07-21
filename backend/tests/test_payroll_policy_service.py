@@ -147,6 +147,23 @@ def test_employment_months_start_with_the_hire_month_not_january() -> None:
     assert service._tax_employment_months_to_date(employee, date(2026, 7, 1)) == 3
 
 
+def test_carry_input_preserves_deferred_obligations_when_unpaid_wage_is_zero() -> None:
+    result = SimpleNamespace(
+        carry_forward=Decimal("0"),
+        deferred_deductions=Decimal("25"),
+        deferred_deposit=Decimal("600"),
+        lines=[],
+        input_snapshot={},
+        deposit=Decimal("0"),
+    )
+
+    assert service._carry_input_from_result(result) == (
+        Decimal("0"),
+        Decimal("25"),
+        Decimal("600"),
+    )
+
+
 def test_tax_history_requires_every_prior_employment_month_or_an_opening_balance() -> None:
     assert service._tax_history_coverage_error(TaxYearToDate(), employment_months=1) is None
     assert (
@@ -193,9 +210,12 @@ def test_locked_tax_history_requires_every_period_after_an_audited_opening() -> 
     employee = SimpleNamespace(hire_date=date(2026, 1, 1))
     opening = SimpleNamespace(through_period="2026-02")
 
-    assert service._tax_history_period_coverage_error(
-        employee=employee,
-        on_date=date(2026, 5, 1),
-        opening=opening,
-        locked_periods={"2026-04"},
-    ) == "Locked tax history is missing employment period 2026-03."
+    assert (
+        service._tax_history_period_coverage_error(
+            employee=employee,
+            on_date=date(2026, 5, 1),
+            opening=opening,
+            locked_periods={"2026-04"},
+        )
+        == "Locked tax history is missing employment period 2026-03."
+    )

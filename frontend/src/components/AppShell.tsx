@@ -3,50 +3,37 @@ import type { ReactNode } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 
 import { useAuth } from '../auth/AuthContext'
-import { Perm } from '../auth/permissions'
-
-interface MenuDef {
-  key: string // 同时作为路由路径片段
-  label: string
-  permission: string
-}
-
-// 菜单项按权限过滤：无权限的模块不渲染（前端门禁，真正的授权在后端强制）。
-const MENU: MenuDef[] = [
-  { key: 'dashboard', label: '看板', permission: Perm.DASHBOARD_READ },
-  { key: 'org', label: '组织', permission: Perm.ORG_READ },
-  { key: 'employees', label: '员工', permission: Perm.EMPLOYEE_READ },
-  { key: 'grades', label: '职级薪档', permission: Perm.GRADE_READ },
-  { key: 'components', label: '薪资组件', permission: 'salary_structure:read' },
-  { key: 'attendance', label: '考勤', permission: Perm.ATTENDANCE_READ },
-  { key: 'payroll', label: '核算', permission: Perm.PAYROLL_READ },
-  { key: 'adjustment', label: '调薪', permission: Perm.ADJUSTMENT_READ },
-  { key: 'budget', label: '预算', permission: Perm.BUDGET_READ },
-  { key: 'payslip', label: '我的工资条', permission: Perm.PAYSLIP_READ_SELF },
-  { key: 'audit', label: '审计日志', permission: Perm.AUDIT_READ },
-  { key: 'users', label: '用户权限', permission: Perm.USER_MANAGE },
-]
+import { NAV_ITEMS } from '../auth/navigation'
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { user, logout, hasPermission } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
 
-  const items = MENU.filter((m) => hasPermission(m.permission)).map((m) => ({
+  const items = NAV_ITEMS.filter((m) =>
+    typeof m.permission === 'string'
+      ? hasPermission(m.permission)
+      : m.permission.some((permission) => hasPermission(permission)),
+  ).map((m) => ({
     key: m.key,
-    label: m.label,
+    label: <span data-testid={`nav-${m.key}`}>{m.label}</span>,
   }))
   const selectedKey = location.pathname.split('/')[1] || 'dashboard'
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout data-testid="app-shell" style={{ minHeight: '100vh' }}>
       <Layout.Header
         style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
       >
         <Typography.Text style={{ color: '#fff', fontSize: 18 }}>薪酬一体化平台</Typography.Text>
-        <span style={{ color: '#fff' }}>
+        <span data-testid="current-username" style={{ color: '#fff' }}>
           {user?.username}
-          <Button type="link" style={{ color: '#fff' }} onClick={() => void logout()}>
+          <Button
+            data-testid="logout"
+            type="link"
+            style={{ color: '#fff' }}
+            onClick={() => void logout().catch(() => undefined)}
+          >
             退出
           </Button>
         </span>

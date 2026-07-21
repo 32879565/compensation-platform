@@ -1,23 +1,60 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit import service as audit
-from app.auth.deps import principal_scope, require_permission
+from app.auth.deps import require_permission
 from app.auth.permissions import Perm
-from app.auth.service import Principal
+from app.auth.service import Principal, resolve_permission_org_scope
 from app.db.session import get_session
 from app.models.org import OrgUnit
+from app.models.payroll_batch import PayrollBatch
+from app.models.payroll_result import BatchConfirmation, PayrollResult
+from app.payroll.guards import lock_payroll_input_mutation
 from app.repositories.org import OrgUnitRepository
 from app.schemas.org import OrgTreeNode, OrgUnitCreate, OrgUnitOut, OrgUnitUpdate
 
 router = APIRouter(prefix="/api/org", tags=["org"])
 
 
-def _repo(session: Session, principal: Principal) -> OrgUnitRepository:
-    return OrgUnitRepository(session, org_scope=principal_scope(principal))
+def _repo(session: Session, principal: Principal, permission: str) -> OrgUnitRepository:
+    return OrgUnitRepository(
+        session,
+        org_scope=resolve_permission_org_scope(session, principal, permission),
+    )
+
+
+def _ensure_org_not_in_active_payroll(session: Session, org_unit_id: int) -> None:
+    """Keep an active review scope reachable until its batch is settled.
+
+    Review-scope resolution deliberately hides soft-deleted stores.  Payroll
+    results remain eligible for a future correction-round rerun even after
+    lock, so deleting their store would either hide a required review action or
+    make that rerun impossible.  Stores with any payroll history are retained
+    as master-data records instead of being soft-deleted.
+    """
+    lock_payroll_input_mutation(session)
+    session.scalars(select(PayrollBatch.id).with_for_update()).all()
+    blocked = session.scalar(
+        select(PayrollBatch.id)
+        .outerjoin(PayrollResult, PayrollResult.batch_id == PayrollBatch.id)
+        .outerjoin(BatchConfirmation, BatchConfirmation.batch_id == PayrollBatch.id)
+        .where(
+            or_(
+                PayrollResult.org_unit_id == org_unit_id,
+                BatchConfirmation.org_unit_id == org_unit_id,
+            ),
+        )
+        .limit(1)
+    )
+    if blocked is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="参与未结算薪资批次的门店不能删除；请先完成或更正该批次",
+        )
 
 
 @router.get("/tree", response_model=list[OrgTreeNode])
@@ -25,7 +62,7 @@ def get_tree(
     principal: Principal = Depends(require_permission(Perm.ORG_READ)),
     session: Session = Depends(get_session),
 ) -> list[OrgTreeNode]:
-    units = _repo(session, principal).all_visible()
+    units = _repo(session, principal, Perm.ORG_READ).all_visible()
 
     def _node(u: OrgUnit) -> OrgTreeNode:
         # 只取标量字段构造，绝不经 ORM children 关系（会绕过组织范围拉全量后代）
@@ -56,7 +93,7 @@ def list_units(
     principal: Principal = Depends(require_permission(Perm.ORG_READ)),
     session: Session = Depends(get_session),
 ) -> list[OrgUnit]:
-    return _repo(session, principal).all_visible()
+    return _repo(session, principal, Perm.ORG_READ).all_visible()
 
 
 @router.post("", response_model=OrgUnitOut, status_code=status.HTTP_201_CREATED)
@@ -65,7 +102,7 @@ def create_unit(
     principal: Principal = Depends(require_permission(Perm.ORG_WRITE)),
     session: Session = Depends(get_session),
 ) -> OrgUnit:
-    repo = _repo(session, principal)
+    repo = _repo(session, principal, Perm.ORG_WRITE)
     if body.parent_id is not None and repo.get(body.parent_id) is None:
         raise HTTPException(status_code=404, detail="上级组织不存在或不可见")
     unit = OrgUnit(
@@ -99,7 +136,7 @@ def update_unit(
     principal: Principal = Depends(require_permission(Perm.ORG_WRITE)),
     session: Session = Depends(get_session),
 ) -> OrgUnit:
-    repo = _repo(session, principal)
+    repo = _repo(session, principal, Perm.ORG_WRITE)
     unit = repo.get(unit_id)
     if unit is None:
         raise HTTPException(status_code=404, detail="组织不存在或不可见")
@@ -131,10 +168,11 @@ def delete_unit(
     principal: Principal = Depends(require_permission(Perm.ORG_WRITE)),
     session: Session = Depends(get_session),
 ) -> None:
-    repo = _repo(session, principal)
+    repo = _repo(session, principal, Perm.ORG_WRITE)
     unit = repo.get(unit_id)
     if unit is None:
         raise HTTPException(status_code=404, detail="组织不存在或不可见")
+    _ensure_org_not_in_active_payroll(session, unit.id)
     repo.soft_delete(unit)
     audit.record(
         session,

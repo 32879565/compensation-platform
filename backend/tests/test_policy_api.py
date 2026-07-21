@@ -8,6 +8,7 @@ from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserRole
 from app.models.payroll_batch import BatchStatus, PayrollBatch
+from app.models.payroll_policy import PayrollPolicy
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -28,11 +29,8 @@ def _user(session, username: str, roles: list[str]) -> User:
 def client(db_session):
     from fastapi.testclient import TestClient
 
-    import app.auth.router as router_mod
     from app.db.session import get_session
     from app.main import app
-
-    router_mod._throttle._failures.clear()
 
     def _override():
         yield db_session
@@ -184,19 +182,33 @@ def test_finalized_policy_is_immutable_and_a_newer_effective_policy_wins(client,
     assert resolved.json()["id"] == second["id"]
 
 
-def test_reopened_current_batch_allows_an_explicit_successor_policy(client, db_session):
+def test_reopened_affected_batches_allow_an_explicit_successor_policy(client, db_session):
     _user(db_session, "hr", ["GROUP_HR"])
     headers = _token(client, "hr")
     original = client.post("/api/payroll-policies", headers=headers, json=_body()).json()
-    assert client.post(f"/api/payroll-policies/{original['id']}/finalize", headers=headers).status_code == 200
-    db_session.add(
-        PayrollBatch(
-            period="2026-05",
-            attendance_start=date(2026, 5, 1),
-            attendance_end=date(2026, 5, 31),
-            status=BatchStatus.DRAFT,
-            version=2,
-        )
+    assert (
+        client.post(f"/api/payroll-policies/{original['id']}/finalize", headers=headers).status_code
+        == 200
+    )
+    # A multi-period correction is reopened newest-to-oldest, so each
+    # affected period is now a draft in a later review round.
+    db_session.add_all(
+        [
+            PayrollBatch(
+                period="2026-05",
+                attendance_start=date(2026, 5, 1),
+                attendance_end=date(2026, 5, 31),
+                status=BatchStatus.DRAFT,
+                version=2,
+            ),
+            PayrollBatch(
+                period="2026-06",
+                attendance_start=date(2026, 6, 1),
+                attendance_end=date(2026, 6, 30),
+                status=BatchStatus.DRAFT,
+                version=2,
+            ),
+        ]
     )
     db_session.flush()
 
@@ -214,9 +226,79 @@ def test_reopened_current_batch_allows_an_explicit_successor_policy(client, db_s
     assert finalized.status_code == 200, finalized.text
 
 
-def test_policy_finalization_requires_explicit_treatment_for_all_derived_income(
-    client, db_session
-):
+def test_pending_downstream_batch_blocks_successor_policy_correction(client, db_session):
+    _user(db_session, "hr", ["GROUP_HR"])
+    headers = _token(client, "hr")
+    original = client.post("/api/payroll-policies", headers=headers, json=_body()).json()
+    assert (
+        client.post(f"/api/payroll-policies/{original['id']}/finalize", headers=headers).status_code
+        == 200
+    )
+    db_session.add_all(
+        [
+            PayrollBatch(
+                period="2026-05",
+                attendance_start=date(2026, 5, 1),
+                attendance_end=date(2026, 5, 31),
+                status=BatchStatus.DRAFT,
+                version=2,
+            ),
+            PayrollBatch(
+                period="2026-06",
+                attendance_start=date(2026, 6, 1),
+                attendance_end=date(2026, 6, 30),
+                status=BatchStatus.PENDING_HR,
+                version=1,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    successor = client.post(
+        "/api/payroll-policies",
+        headers=headers,
+        json=_body(effective_from="2026-05-01"),
+    )
+    assert successor.status_code == 201, successor.text
+
+    finalized = client.post(
+        f"/api/payroll-policies/{successor.json()['id']}/finalize", headers=headers
+    )
+
+    assert finalized.status_code == 409
+
+
+def test_policy_effective_date_must_be_the_first_day_of_a_payroll_month(client, db_session):
+    _user(db_session, "hr", ["GROUP_HR"])
+    headers = _token(client, "hr")
+
+    created = client.post(
+        "/api/payroll-policies",
+        headers=headers,
+        json=_body(effective_from="2026-05-15"),
+    )
+
+    assert created.status_code == 422
+    assert "first" in created.json()["detail"][0]["msg"].lower()
+
+
+def test_legacy_mid_month_draft_cannot_be_finalized(client, db_session):
+    _user(db_session, "hr", ["GROUP_HR"])
+    headers = _token(client, "hr")
+    created = client.post("/api/payroll-policies", headers=headers, json=_body())
+    assert created.status_code == 201, created.text
+    draft = db_session.get(PayrollPolicy, created.json()["id"])
+    assert draft is not None
+    draft.effective_from = date(2026, 5, 15)
+    db_session.flush()
+
+    finalized = client.post(f"/api/payroll-policies/{draft.id}/finalize", headers=headers)
+
+    assert finalized.status_code == 409
+    assert "first" in finalized.json()["detail"].lower()
+
+
+def test_policy_finalization_requires_explicit_treatment_for_all_derived_income(client, db_session):
     _user(db_session, "hr", ["GROUP_HR"])
     headers = _token(client, "hr")
     body = _body()

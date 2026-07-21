@@ -29,6 +29,12 @@ class ContributionKind(StrEnum):
     HOUSING = "HOUSING"
 
 
+# These are calculation-line codes produced by the engine, rather than legal
+# classifications.  Whether each line is taxable or belongs in either base is
+# deliberately supplied by the effective city policy.
+DERIVED_INCOME_CODES = frozenset({"OVERTIME", "HOLIDAY"})
+
+
 @dataclass(frozen=True)
 class ContributionRule:
     kind: ContributionKind
@@ -75,6 +81,16 @@ class TaxPolicyInput:
 
 
 @dataclass(frozen=True)
+class DerivedIncomeRule:
+    """Policy-defined treatment for an engine-derived earnings line."""
+
+    code: str
+    taxable: bool
+    in_social_base: bool
+    in_housing_base: bool
+
+
+@dataclass(frozen=True)
 class PayrollPolicyContext:
     """The exact, finalized policy selected for one employee payroll input."""
 
@@ -83,6 +99,7 @@ class PayrollPolicyContext:
     effective_from: date
     social_policy: SocialInsurancePolicyInput
     tax_policy: TaxPolicyInput
+    derived_income_rules: tuple[DerivedIncomeRule, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -194,6 +211,32 @@ def validate_social_insurance_policy(policy: SocialInsurancePolicyInput) -> None
     """Validate a policy before it is persisted or finalized."""
 
     _validated_social_rules(policy)
+
+
+def validate_derived_income_rules(
+    rules: tuple[DerivedIncomeRule, ...], *, require_complete: bool = False
+) -> None:
+    """Validate the explicit treatment for known engine-derived earnings."""
+
+    seen: set[str] = set()
+    for rule in rules:
+        if rule.code not in DERIVED_INCOME_CODES:
+            raise PolicyValidationError(f"unsupported derived income code: {rule.code!r}.")
+        if rule.code in seen:
+            raise PolicyValidationError("derived income policy has duplicate codes.")
+        seen.add(rule.code)
+        if (
+            not isinstance(rule.taxable, bool)
+            or not isinstance(rule.in_social_base, bool)
+            or not isinstance(rule.in_housing_base, bool)
+        ):
+            raise PolicyValidationError("derived income policy flags must be boolean.")
+    if require_complete and seen != DERIVED_INCOME_CODES:
+        missing = ", ".join(sorted(DERIVED_INCOME_CODES - seen))
+        raise PolicyValidationError(
+            "derived income policy must explicitly classify every calculation line; "
+            f"missing: {missing}."
+        )
 
 
 def _validated_tax_brackets(policy: TaxPolicyInput) -> tuple[TaxBracket, ...]:

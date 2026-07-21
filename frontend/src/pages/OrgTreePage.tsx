@@ -3,6 +3,7 @@ import { Card, Spin, Tree } from 'antd'
 import type { DataNode } from 'antd/es/tree'
 
 import { fetchOrgTree, type OrgTreeNode } from '../api/masterdata'
+import { useAuth } from '../auth/AuthContext'
 
 const TYPE_LABEL: Record<OrgTreeNode['type'], string> = {
   GROUP: '集团',
@@ -19,7 +20,12 @@ function toTreeData(nodes: OrgTreeNode[]): DataNode[] {
 }
 
 export default function OrgTreePage() {
-  const { data, isLoading } = useQuery({ queryKey: ['orgTree'], queryFn: fetchOrgTree })
+  const { user } = useAuth()
+  const queryScope = user?.username ?? 'anonymous'
+  const { data, isLoading } = useQuery({
+    queryKey: ['orgTree', queryScope],
+    queryFn: fetchOrgTree,
+  })
 
   if (isLoading) return <Spin />
 

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -7,6 +7,7 @@ from app.models.comp import AllowanceKind, ComponentType, SalaryComponentDef
 from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 from app.models.payroll_batch import BatchStatus, PayrollBatch
+from app.models.payroll_result import AdjustmentRecord
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -107,3 +108,54 @@ def test_payroll_batch_status_and_unique_period(db_session):
     )
     with pytest.raises(IntegrityError):
         db_session.flush()
+
+
+def test_payroll_batch_persists_hr_review_metadata(db_session):
+    reviewed_at = datetime(2026, 5, 31, 18, 30, tzinfo=UTC)
+    batch = PayrollBatch(
+        period="2026-06",
+        attendance_start=date(2026, 5, 26),
+        attendance_end=date(2026, 6, 25),
+        status=BatchStatus.CONFIRMED,
+        hr_reviewed_by=77,
+        hr_reviewed_at=reviewed_at,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    db_session.refresh(batch)
+
+    assert batch.hr_reviewed_by == 77
+    assert batch.hr_reviewed_at == reviewed_at
+
+
+def test_adjustment_record_persists_its_batch_review_round(db_session):
+    store = OrgUnit(code="ROUND", name="Round Store", type=OrgType.STORE, city="Guangzhou")
+    db_session.add(store)
+    db_session.flush()
+    employee = Employee(emp_no="ROUND-E1", name="Round Employee", org_unit_id=store.id)
+    batch = PayrollBatch(
+        period="2026-07",
+        attendance_start=date(2026, 6, 26),
+        attendance_end=date(2026, 7, 25),
+        version=3,
+    )
+    db_session.add_all([employee, batch])
+    db_session.flush()
+    adjustment = AdjustmentRecord(
+        batch_id=batch.id,
+        batch_version=3,
+        employee_id=employee.id,
+        item="ATTEND_WAGE",
+        before_value={"actual_days": "20"},
+        after_value={"actual_days": "21"},
+        reason="Approved attendance evidence",
+        applicant_id=10,
+        approver_id=77,
+        attachment_url=None,
+        recompute_result={"batch_version": 3, "gross": "5000.00"},
+    )
+    db_session.add(adjustment)
+    db_session.flush()
+    db_session.refresh(adjustment)
+
+    assert adjustment.batch_version == 3

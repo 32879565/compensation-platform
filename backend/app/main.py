@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -6,7 +6,9 @@ from app.audit.middleware import ClientIpMiddleware
 from app.auth.router import router as auth_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
+from app.core.metrics import RequestMetrics, RequestMetricsMiddleware
 from app.db.session import engine
+from app.routers.approval import router as approval_router
 from app.routers.attendance import router as attendance_router
 from app.routers.attendance_schedule import router as attendance_schedule_router
 from app.routers.audit import router as audit_router
@@ -15,7 +17,10 @@ from app.routers.budget import router as budget_router
 from app.routers.comp import router as comp_router
 from app.routers.comp import structure_router
 from app.routers.dashboard import router as dashboard_router
+from app.routers.dingtalk import router as dingtalk_router
+from app.routers.dingtalk_sync import router as dingtalk_sync_router
 from app.routers.employee import router as employee_router
+from app.routers.employee_tax import router as employee_tax_router
 from app.routers.export import router as export_router
 from app.routers.grade import router as grade_router
 from app.routers.holiday import router as holiday_router
@@ -23,6 +28,7 @@ from app.routers.imports import router as imports_router
 from app.routers.imports import salary_router
 from app.routers.org import router as org_router
 from app.routers.payroll import router as payroll_router
+from app.routers.payroll_adjustment import router as payroll_adjustment_router
 from app.routers.payroll_policy import router as payroll_policy_router
 from app.routers.payslip import router as payslip_router
 from app.routers.users import router as users_router
@@ -42,11 +48,33 @@ def create_app() -> FastAPI:
         openapi_url="/api/openapi.json" if settings.debug else None,
     )
     app.add_middleware(ClientIpMiddleware)
+    request_metrics = RequestMetrics()
+    app.state.request_metrics = request_metrics
+    app.add_middleware(RequestMetricsMiddleware, metrics=request_metrics)
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        """Expose aggregate operational metrics only on the backend listener."""
+        return Response(
+            content=request_metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4",
+        )
 
     @app.get("/health")
-    @app.get("/api/health")
     def health() -> dict[str, str]:
+        # The ordinary liveness endpoint is intentionally stable. It never
+        # exposes an E2E identifier, including when an isolated E2E stack runs.
         return {"status": "ok"}
+
+    @app.get("/api/health")
+    def api_health() -> dict[str, str]:
+        response = {"status": "ok"}
+        # Marker values identify a disposable test stack; they are deliberately
+        # not secrets. Production does not configure one and receives the
+        # unchanged health response above.
+        if settings.e2e_target_marker:
+            response["e2e_target_marker"] = settings.e2e_target_marker
+        return response
 
     @app.get("/health/ready")
     @app.get("/api/health/ready")
@@ -65,11 +93,13 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(org_router)
     app.include_router(employee_router)
+    app.include_router(employee_tax_router)
     app.include_router(grade_router)
     app.include_router(imports_router)
     app.include_router(salary_router)
     app.include_router(comp_router)
     app.include_router(structure_router)
+    app.include_router(approval_router)
     app.include_router(attendance_router)
     app.include_router(attendance_schedule_router)
     app.include_router(holiday_router)
@@ -78,6 +108,9 @@ def create_app() -> FastAPI:
     app.include_router(budget_router)
     app.include_router(dashboard_router)
     app.include_router(export_router)
+    app.include_router(dingtalk_router)
+    app.include_router(dingtalk_sync_router)
+    app.include_router(payroll_adjustment_router)
     app.include_router(payroll_router)
     app.include_router(payslip_router)
     app.include_router(batch_router)

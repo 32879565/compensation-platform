@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -53,9 +54,10 @@ def parse_money(raw: Any) -> Decimal | None:
         return None
     if isinstance(raw, (int, float, Decimal)):
         try:
-            return Decimal(str(raw))
+            value = Decimal(str(raw))
         except (InvalidOperation, ValueError):
             return None
+        return value if value.is_finite() else None
     s = str(raw).strip()
     for sym in _CURRENCY:
         s = s.replace(sym, "")
@@ -68,15 +70,23 @@ def parse_money(raw: Any) -> Decimal | None:
     if m:
         s = "-" + m.group(1)
     try:
-        return Decimal(s)
+        value = Decimal(s)
     except InvalidOperation:
         return None
+    return value if value.is_finite() else None
 
 
 def normalize_emp_no(raw: object) -> str | None:
     """把工号占位符（无/-/／/N/A/0 等）归一化为 None，避免误当身份键。"""
     if raw is None:
         return None
+    if isinstance(raw, (int, float, Decimal)):
+        try:
+            numeric = Decimal(str(raw))
+        except InvalidOperation:
+            return None
+        if not numeric.is_finite() or numeric == 0:
+            return None
     s = str(raw).strip()
     if s in _PLACEHOLDER_TOKENS:
         return None
@@ -156,8 +166,14 @@ def infer_month(text: str, default_month: str | None = None) -> str | None:
     return default_month
 
 
-def standard_store_name(store_name: str, aliases: dict[str, str]) -> str:
-    return aliases.get(store_name, store_name)
+def standard_store_name(store_name: str, aliases: Mapping[str, str]) -> str:
+    """Resolve a store alias to its canonical name without allowing alias loops."""
+    canonical = store_name
+    seen: set[str] = set()
+    while canonical in aliases and canonical not in seen:
+        seen.add(canonical)
+        canonical = aliases[canonical]
+    return canonical
 
 
 def normalize_store_name(store_name: Any) -> str:
@@ -194,11 +210,12 @@ class SalaryRow:
     money: dict[str, Decimal | None] = field(default_factory=dict)
 
     def identity_key(self) -> tuple:
-        # 不变量3：优先工号，但仍含门店维度——同工号跨店是拆分发薪的两条真实记录，
-        # 不能合并；同工号同店才是重复。占位工号已在读取阶段归一为 None。
+        # 不变量3：员工工号在全局唯一，当前导入的身份只能是 (计薪周期, 工号)。
+        # 门店是归属/展示字段，不能被混入身份键而让同一个员工在同一周期有两条工资。
         if self.emp_no:
-            return (self.period, "no", self.emp_no, self.store_name)
-        return (self.period, "name", self.name, self.store_name)
+            return (self.period, self.emp_no)
+        # 缺工号行绝不能自动按姓名归并；这个回退键仅供诊断，dedupe_rows 会保留每行。
+        return (self.period, None, self.name, self.store_name)
 
 
 def is_shadow_row(row: SalaryRow) -> bool:
@@ -226,16 +243,21 @@ def _best_sort_key(row: SalaryRow) -> tuple:
 
 
 def dedupe_rows(rows: list[SalaryRow]) -> list[SalaryRow]:
-    """按 identity_key 去重（含门店维度）。
+    """按 ``(period, emp_no)`` 去重。
 
-    修复旧 bug：
-    - 键含门店 → 同名不同店员工不再被误删。
-    - 单条记录无条件保留 → 不因看似影子行而删除唯一真实记录。
-    - 多条同键时才做影子行淘汰并按金额取最优一条。
+    无工号的实际薪资行不按姓名去重，保留给暂存校验/人工认领，避免静默丢失
+    来源行。仅当同名同店组中存在可识别的影子行时，才安全地移除该影子行。
+    有工号时同一周期的重复行做影子行淘汰并按金额取最优一条。
     """
     groups: dict[tuple, list[SalaryRow]] = {}
     for row in rows:
-        groups.setdefault(row.identity_key(), []).append(row)
+        # 无工号时这个分组只用于识别可安全丢弃的影子行，绝不能把两个实际薪资行合并。
+        key = (
+            row.identity_key()
+            if row.emp_no
+            else ("unidentified", row.period, row.name, row.store_name)
+        )
+        groups.setdefault(key, []).append(row)
 
     cleaned: list[SalaryRow] = []
     for group in groups.values():
@@ -243,6 +265,11 @@ def dedupe_rows(rows: list[SalaryRow]) -> list[SalaryRow]:
             cleaned.append(group[0])
             continue
         real = [r for r in group if not is_shadow_row(r)]
+        if not group[0].emp_no:
+            # Retain every non-shadow unidentified line for manual review.  If the group is an
+            # obvious shadow + actual-row pair, retaining the shadow adds no information.
+            cleaned.extend(real if real else group)
+            continue
         candidates = real or group
         candidates.sort(key=_best_sort_key, reverse=True)
         cleaned.append(candidates[0])

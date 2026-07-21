@@ -1,8 +1,20 @@
 """集中导入所有模型，确保 Base.metadata 完整（供 Alembic autogenerate 与 create_all）。"""
 
+from app.models.approval import (
+    ApprovalAction,
+    ApprovalActionType,
+    ApprovalBusinessType,
+    ApprovalFlow,
+    ApprovalInstance,
+    ApprovalInstanceStatus,
+    ApprovalStep,
+    SalaryAdjustment,
+    SalaryAdjustmentStatus,
+)
 from app.models.attendance import AttendanceRecord, ExpectedAttendanceRule, PerformanceRecord
 from app.models.audit import AuditLog
 from app.models.auth import (
+    LoginThrottleBucket,
     Permission,
     RefreshToken,
     Role,
@@ -19,17 +31,36 @@ from app.models.comp import (
     EmployeeSalaryStructure,
     SalaryComponentDef,
 )
+from app.models.dingtalk import (
+    AppealCorrectionWorkStatus,
+    AppealStatus,
+    CompAppeal,
+    CompAppealCorrectionWorkItem,
+    DingTalkAttendanceSnapshot,
+    DingTalkAttendanceSync,
+    DingTalkAttendanceSyncStatus,
+    DingTalkDelivery,
+    DingTalkDeliveryKind,
+    DingTalkDeliveryStatus,
+)
 from app.models.employee import Department, Employee, EmployeeStatus, EmploymentType
 from app.models.grade import JobGrade, SalaryBand
 from app.models.holiday import HolidayCalendarPeriod, HolidayWorkRecord, StatutoryHolidayDate
 from app.models.org import OrgType, OrgUnit
+from app.models.payroll_adjustment import (
+    MonthlyPayrollAdjustment,
+    MonthlyPayrollAdjustmentRevision,
+    PayrollAdjustmentType,
+)
 from app.models.payroll_batch import BatchStatus, PayrollBatch
-from app.models.payroll_policy import EmployeeTaxDeduction, PayrollPolicy
+from app.models.payroll_policy import EmployeeTaxDeduction, EmployeeTaxYtdOpening, PayrollPolicy
 from app.models.payroll_result import (
     AdjustmentRecord,
     BatchConfirmation,
     CompDispute,
     ConfirmStatus,
+    DisputeEvent,
+    DisputeEventType,
     DisputeStatus,
     PayrollResult,
 )
@@ -64,6 +95,7 @@ __all__ = [
     "UserOrgScope",
     "UserReviewScope",
     "RefreshToken",
+    "LoginThrottleBucket",
     "AuditLog",
     "LaborBudget",
     "SalaryRecord",
@@ -73,6 +105,8 @@ __all__ = [
     "ImportStatus",
     "RowStatus",
     "SalaryComponentDef",
+    "SalaryAdjustment",
+    "SalaryAdjustmentStatus",
     "EmployeeSalaryStructure",
     "ComponentType",
     "AttendanceRecord",
@@ -80,14 +114,37 @@ __all__ = [
     "PerformanceRecord",
     "Department",
     "AllowanceKind",
+    "ApprovalAction",
+    "ApprovalActionType",
+    "ApprovalBusinessType",
+    "ApprovalFlow",
+    "ApprovalInstance",
+    "ApprovalInstanceStatus",
+    "ApprovalStep",
     "PayrollBatch",
     "BatchStatus",
+    "MonthlyPayrollAdjustment",
+    "MonthlyPayrollAdjustmentRevision",
+    "PayrollAdjustmentType",
     "PayrollPolicy",
     "EmployeeTaxDeduction",
+    "EmployeeTaxYtdOpening",
     "PayrollResult",
     "BatchConfirmation",
     "CompDispute",
+    "DisputeEvent",
+    "DisputeEventType",
     "AdjustmentRecord",
     "ConfirmStatus",
     "DisputeStatus",
+    "DingTalkDelivery",
+    "DingTalkDeliveryKind",
+    "DingTalkDeliveryStatus",
+    "DingTalkAttendanceSnapshot",
+    "DingTalkAttendanceSync",
+    "DingTalkAttendanceSyncStatus",
+    "CompAppeal",
+    "AppealStatus",
+    "CompAppealCorrectionWorkItem",
+    "AppealCorrectionWorkStatus",
 ]

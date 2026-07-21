@@ -11,6 +11,9 @@ os.environ.setdefault(
 os.environ.setdefault("COMP_SECRET_KEY", "test-secret-key-only-for-tests-not-production")
 os.environ.setdefault("COMP_ENCRYPTION_KEY", "test-encryption-key-only-for-tests")
 os.environ.setdefault("COMP_COOKIE_SECURE", "false")
+# A developer's backend/.env may opt into docs.  Tests exercise the secure
+# production default regardless of that local convenience setting.
+os.environ["COMP_DEBUG"] = "false"
 
 # 与 S4 迁移一致的 audit_log append-only 触发器（create_all 不会建触发器，
 # 测试里手动补上以保真）。
@@ -37,20 +40,26 @@ def pg_engine() -> Iterator[object]:
         from testcontainers.postgres import PostgresContainer
     except ImportError:  # pragma: no cover
         pytest.skip("testcontainers 未安装")
-
+    from docker.errors import DockerException
     from sqlalchemy import create_engine, text
 
     import app.models  # noqa: F401  触发所有模型注册进 Base.metadata
     from app.db.base import Base
 
-    with PostgresContainer("postgres:16", driver="psycopg") as pg:
-        engine = create_engine(pg.get_connection_url(), future=True)
-        Base.metadata.create_all(engine)
-        with engine.begin() as conn:
-            for stmt in _AUDIT_APPEND_ONLY_SQL:
-                conn.execute(text(stmt))
-        yield engine
-        engine.dispose()
+    try:
+        with PostgresContainer("postgres:16", driver="psycopg") as pg:
+            engine = create_engine(pg.get_connection_url(), future=True)
+            Base.metadata.create_all(engine)
+            with engine.begin() as conn:
+                for stmt in _AUDIT_APPEND_ONLY_SQL:
+                    conn.execute(text(stmt))
+            yield engine
+            engine.dispose()
+    except DockerException as exc:
+        # Local Windows development machines often have the Docker Python
+        # client installed while the daemon/npipe integration is unavailable.
+        # That is an environment skip, not an application test failure.
+        pytest.skip(f"Docker unavailable for PostgreSQL integration tests: {exc}")
 
 
 @pytest.fixture

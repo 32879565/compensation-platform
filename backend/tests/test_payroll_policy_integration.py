@@ -210,6 +210,27 @@ def test_policy_and_tax_context_round_trip_through_the_immutable_input_snapshot(
     assert restored.structure[0].in_housing_base is True
 
 
+def test_missing_policy_snapshot_keeps_audited_tax_context_for_an_errored_result() -> None:
+    original = _input(payroll_policy=None, tax_employment_months=None)
+
+    snapshot = batch_service._input_snapshot(original, [])
+    payroll_tax = snapshot["payroll_tax"]
+    assert isinstance(payroll_tax, dict)
+    assert payroll_tax["schema_version"] == 2
+    assert payroll_tax["policy"] is None
+
+    restored, missing = batch_service._input_from_snapshot(
+        SimpleNamespace(rule_version="v4", input_snapshot=snapshot), {}
+    )
+
+    assert missing == []
+    assert restored.payroll_policy is None
+    assert restored.monthly_special_deduction == original.monthly_special_deduction
+    assert restored.tax_ytd == original.tax_ytd
+    assert restored.tax_employment_months == original.tax_employment_months
+    assert restored.tax_opening == original.tax_opening
+
+
 def test_v2_snapshot_without_policy_context_remains_recomputable() -> None:
     legacy = _input(
         payroll_policy=None,

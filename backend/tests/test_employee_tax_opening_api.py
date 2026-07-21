@@ -1,6 +1,7 @@
 """Audited employee tax-opening management API coverage."""
 
 from datetime import date
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
@@ -10,6 +11,8 @@ from app.core.security import hash_password
 from app.models.auth import Role, User, UserRole
 from app.models.employee import Employee
 from app.models.org import OrgType, OrgUnit
+from app.models.payroll_batch import BatchStatus, PayrollBatch
+from app.models.payroll_result import PayrollResult
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -18,11 +21,8 @@ pytestmark = pytest.mark.usefixtures("pg_engine")
 def client(db_session):
     from fastapi.testclient import TestClient
 
-    import app.auth.router as router_mod
     from app.db.session import get_session
     from app.main import app
-
-    router_mod._throttle._failures.clear()
 
     def _override():
         yield db_session
@@ -116,10 +116,220 @@ def test_hr_can_create_finalize_and_supersede_an_audited_tax_opening(client, db_
         headers=headers,
     )
     assert replacement_finalized.status_code == 200, replacement_finalized.text
-    openings = client.get(
-        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers
-    )
+    openings = client.get(f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers)
     assert openings.status_code == 200
     assert [item["revision"] for item in openings.json()] == [2, 1]
     assert openings.json()[0]["superseded_at"] is None
     assert openings.json()[1]["superseded_at"] is not None
+
+
+def test_all_reopened_affected_batches_allow_a_tax_opening_correction(client, db_session):
+    _user(db_session, "hr")
+    employee = _employee(db_session)
+    headers = _headers(client, "hr")
+    db_session.add_all(
+        [
+            PayrollBatch(
+                period="2026-05",
+                attendance_start=date(2026, 5, 1),
+                attendance_end=date(2026, 5, 31),
+                status=BatchStatus.DRAFT,
+                version=2,
+            ),
+            PayrollBatch(
+                period="2026-06",
+                attendance_start=date(2026, 6, 1),
+                attendance_end=date(2026, 6, 30),
+                status=BatchStatus.DRAFT,
+                version=2,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    created = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers, json=_body()
+    )
+    assert created.status_code == 201, created.text
+
+    finalized = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings/{created.json()['id']}/finalize",
+        headers=headers,
+    )
+
+    assert finalized.status_code == 200, finalized.text
+
+
+def test_pending_downstream_batch_blocks_a_tax_opening_correction(client, db_session):
+    _user(db_session, "hr")
+    employee = _employee(db_session)
+    headers = _headers(client, "hr")
+    db_session.add_all(
+        [
+            PayrollBatch(
+                period="2026-05",
+                attendance_start=date(2026, 5, 1),
+                attendance_end=date(2026, 5, 31),
+                status=BatchStatus.DRAFT,
+                version=2,
+            ),
+            PayrollBatch(
+                period="2026-06",
+                attendance_start=date(2026, 6, 1),
+                attendance_end=date(2026, 6, 30),
+                status=BatchStatus.PENDING_HR,
+                version=1,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    created = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers, json=_body()
+    )
+    assert created.status_code == 201, created.text
+
+    finalized = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings/{created.json()['id']}/finalize",
+        headers=headers,
+    )
+
+    assert finalized.status_code == 409
+
+
+def test_tax_opening_correction_ignores_history_outside_its_tax_year(client, db_session):
+    _user(db_session, "hr")
+    employee = _employee(db_session)
+    employee.hire_date = date(2025, 1, 1)
+    headers = _headers(client, "hr")
+    previous_year = PayrollBatch(
+        period="2025-12",
+        attendance_start=date(2025, 12, 1),
+        attendance_end=date(2025, 12, 31),
+        status=BatchStatus.LOCKED,
+        version=1,
+    )
+    next_year = PayrollBatch(
+        period="2027-01",
+        attendance_start=date(2027, 1, 1),
+        attendance_end=date(2027, 1, 31),
+        status=BatchStatus.PENDING_HR,
+        version=1,
+    )
+    db_session.add_all([previous_year, next_year])
+    db_session.flush()
+    db_session.add(
+        PayrollResult(
+            batch_id=previous_year.id,
+            employee_id=employee.id,
+            batch_version=1,
+            version=1,
+            org_unit_id=employee.org_unit_id,
+            department=employee.department,
+            actual_attendance_days=Decimal("20"),
+            statutory_holiday_days=Decimal("0"),
+            statutory_holiday_worked_days=Decimal("0"),
+            gross=Decimal("1000"),
+            deposit=Decimal("0"),
+            net=Decimal("1000"),
+            carry_forward=Decimal("0"),
+            deferred_deductions=Decimal("0"),
+            deferred_deposit=Decimal("0"),
+            rule_version="v4",
+            input_snapshot={},
+            lines=[],
+            exceptions=[],
+            warnings=[],
+            has_error=False,
+        )
+    )
+    db_session.flush()
+    created = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers, json=_body()
+    )
+    assert created.status_code == 201, created.text
+
+    finalized = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings/{created.json()['id']}/finalize",
+        headers=headers,
+    )
+
+    assert finalized.status_code == 200, finalized.text
+
+
+def test_finalization_revalidates_a_draft_after_hire_date_changes(client, db_session):
+    _user(db_session, "hr")
+    employee = _employee(db_session)
+    headers = _headers(client, "hr")
+    created = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers, json=_body()
+    )
+    assert created.status_code == 201, created.text
+    employee.hire_date = date(2026, 3, 1)
+    db_session.flush()
+
+    finalized = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings/{created.json()['id']}/finalize",
+        headers=headers,
+    )
+
+    assert finalized.status_code == 422
+
+
+def test_successor_draft_cannot_change_its_predecessor_tax_year(client, db_session):
+    _user(db_session, "hr")
+    employee = _employee(db_session)
+    headers = _headers(client, "hr")
+    original = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers, json=_body()
+    )
+    assert original.status_code == 201, original.text
+    assert (
+        client.post(
+            f"/api/employees/{employee.id}/tax-ytd-openings/{original.json()['id']}/finalize",
+            headers=headers,
+        ).status_code
+        == 200
+    )
+    successor = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings/{original.json()['id']}/supersede",
+        headers=headers,
+        json=_body(taxable_income="41000", evidence_ref="migration://corrected-ytd"),
+    )
+    assert successor.status_code == 201, successor.text
+    changed_year = _body()
+    changed_year["tax_year"] = 2027
+    changed_year["through_period"] = "2027-04"
+
+    patched = client.patch(
+        f"/api/employees/{employee.id}/tax-ytd-openings/{successor.json()['id']}",
+        headers=headers,
+        json=changed_year,
+    )
+
+    assert patched.status_code == 422
+
+
+def test_initial_draft_tax_year_collision_returns_conflict(client, db_session):
+    _user(db_session, "hr")
+    employee = _employee(db_session)
+    headers = _headers(client, "hr")
+    first = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers, json=_body()
+    )
+    assert first.status_code == 201, first.text
+    next_year = _body()
+    next_year["tax_year"] = 2027
+    next_year["through_period"] = "2027-04"
+    second = client.post(
+        f"/api/employees/{employee.id}/tax-ytd-openings", headers=headers, json=next_year
+    )
+    assert second.status_code == 201, second.text
+
+    conflict = client.patch(
+        f"/api/employees/{employee.id}/tax-ytd-openings/{second.json()['id']}",
+        headers=headers,
+        json=_body(),
+    )
+
+    assert conflict.status_code == 409

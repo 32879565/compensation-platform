@@ -24,6 +24,9 @@ _SENSITIVE_KEY_HINTS = (
     "id_card",
     "bank",
     "ssn",
+    "attachment",
+    "url",
+    "uri",
 )
 _REDACTED = "***"
 

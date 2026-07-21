@@ -1,26 +1,32 @@
+import pytest
+from sqlalchemy import select
+
 from app.auth.throttle import LoginThrottle
+from app.models.auth import LoginThrottleBucket
+
+pytestmark = pytest.mark.usefixtures("pg_engine")
 
 
-def test_lock_after_max_failures():
-    t = LoginThrottle(max_failures=3, lockout_minutes=15)
-    assert t.is_locked("1.1.1.1", "bob") is False
+def test_ip_lock_after_max_failures(db_session) -> None:
+    throttle = LoginThrottle(max_failures=3, lockout_minutes=15)
+    assert throttle.check(db_session, "1.1.1.1", "bob").ip_locked is False
     for _ in range(3):
-        t.record_failure("1.1.1.1", "bob")
-    assert t.is_locked("1.1.1.1", "bob") is True
+        throttle.record_failure(db_session, "1.1.1.1", "bob")
+    assert throttle.check(db_session, "1.1.1.1", "bob").ip_locked is True
 
 
-def test_reset_clears_lock():
-    t = LoginThrottle(max_failures=2, lockout_minutes=15)
-    t.record_failure("1.1.1.1", "bob")
-    t.record_failure("1.1.1.1", "bob")
-    assert t.is_locked("1.1.1.1", "bob") is True
-    t.reset("1.1.1.1", "bob")
-    assert t.is_locked("1.1.1.1", "bob") is False
+def test_success_clears_credential_buckets_but_preserves_source_bucket(db_session) -> None:
+    throttle = LoginThrottle(max_failures=3, lockout_minutes=15)
+    throttle.record_failure(db_session, "1.1.1.1", "bob", account_id=7)
+
+    throttle.reset_after_success(db_session, "1.1.1.1", "bob", account_id=7)
+
+    assert [bucket.scope for bucket in db_session.scalars(select(LoginThrottleBucket))] == ["IP"]
 
 
-def test_per_key_isolation():
-    t = LoginThrottle(max_failures=1, lockout_minutes=15)
-    t.record_failure("1.1.1.1", "bob")
-    assert t.is_locked("1.1.1.1", "bob") is True
-    assert t.is_locked("2.2.2.2", "bob") is False  # 不同 IP 不受影响
-    assert t.is_locked("1.1.1.1", "alice") is False  # 不同账号不受影响
+def test_source_lock_applies_across_usernames_without_affecting_other_ips(db_session) -> None:
+    throttle = LoginThrottle(max_failures=1, lockout_minutes=15)
+    throttle.record_failure(db_session, "1.1.1.1", "alice")
+
+    assert throttle.check(db_session, "1.1.1.1", "bob").ip_locked is True
+    assert throttle.check(db_session, "2.2.2.2", "alice").ip_locked is False

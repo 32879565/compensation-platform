@@ -5,13 +5,13 @@ name: compensation-platform
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-comp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请先 cp deploy/.env.example deploy/.env 并设置强口令}
       POSTGRES_DB: ${POSTGRES_DB:-compensation}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${COMP_POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -19,6 +19,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - app_network
     restart: unless-stopped
 
   backend:
@@ -29,26 +31,80 @@ services:
       COMP_ENCRYPTION_KEY: ${COMP_ENCRYPTION_KEY:?COMP_ENCRYPTION_KEY 未设置：请在 deploy/.env 配置强随机密钥}
       COMP_COOKIE_SECURE: ${COMP_COOKIE_SECURE:-true}
       COMP_DEBUG: ${COMP_DEBUG:-false}
+      # sandbox is fail-safe: credentials may be verified/configured without
+      # allowing any salary notification to leave the application.
+      COMP_DINGTALK_MODE: ${COMP_DINGTALK_MODE:-sandbox}
+      COMP_DINGTALK_APP_ID: ${COMP_DINGTALK_APP_ID:-}
+      COMP_DINGTALK_CLIENT_ID: ${COMP_DINGTALK_CLIENT_ID:-}
+      COMP_DINGTALK_CLIENT_SECRET: ${COMP_DINGTALK_CLIENT_SECRET:-}
+      COMP_DINGTALK_AGENT_ID: ${COMP_DINGTALK_AGENT_ID:-}
+      COMP_DINGTALK_READ_SYNC_ENABLED: ${COMP_DINGTALK_READ_SYNC_ENABLED:-false}
+      COMP_DINGTALK_PUBLIC_BASE_URL: ${COMP_DINGTALK_PUBLIC_BASE_URL:-}
+      # Empty by default. Only an intentionally disposable browser-E2E stack
+      # sets this non-secret identifier for /api/health verification.
+      COMP_E2E_TARGET_MARKER: ${COMP_E2E_TARGET_MARKER:-}
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${COMP_BACKEND_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
       interval: 5s
       timeout: 3s
       retries: 10
+      # The entrypoint applies migrations before Uvicorn starts. Do not mark a
+      # healthy-but-upgrading instance unhealthy during that bounded startup.
+      start_period: 90s
+    networks:
+      - app_network
     restart: unless-stopped
 
   frontend:
     build: ../frontend
     ports:
-      - "127.0.0.1:8080:80"
+      - "127.0.0.1:${COMP_FRONTEND_PORT:-8080}:80"
     depends_on:
       backend:
         condition: service_healthy
+    networks:
+      app_network:
+        # Backend trusts forwarded headers only from this proxy address.
+        ipv4_address: 172.30.0.10
+    restart: unless-stopped
+
+  gateway:
+    image: caddy:2.8-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
+    profiles: ["production"]
+    environment:
+      # Required when the production profile is enabled. An empty value makes
+      # Caddy fail closed instead of accidentally serving a default site.
+      COMP_PUBLIC_HOST: ${COMP_PUBLIC_HOST:-}
+      COMP_ACME_EMAIL: ${COMP_ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend:
+        condition: service_started
+    networks:
+      app_network:
+        # The frontend accepts external forwarding headers only from here.
+        ipv4_address: 172.30.0.11
     restart: unless-stopped
 
 volumes:
   pgdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  app_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

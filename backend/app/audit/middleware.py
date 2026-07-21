@@ -1,7 +1,8 @@
 """把客户端真实 IP 放入请求上下文，供审计使用。
 
-uvicorn --proxy-headers 已把 request.client.host 还原为真实客户端 IP
-（Dockerfile CMD 已配置），此处直接取用。
+uvicorn --proxy-headers only accepts forwarded headers from the fixed frontend
+proxy address configured in deploy/docker-compose.yml. This middleware can
+therefore use request.client.host without trusting a client-supplied header.
 """
 
 from __future__ import annotations

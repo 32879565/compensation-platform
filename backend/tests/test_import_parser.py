@@ -1,7 +1,10 @@
+import io
 from decimal import Decimal
 
 import pytest
+from openpyxl import Workbook
 
+from app.importing.excel import read_salary_workbook
 from app.importing.parser import (
     SalaryRow,
     auto_store_aliases,
@@ -13,6 +16,20 @@ from app.importing.parser import (
     parse_money,
     standard_store_name,
 )
+from app.routers.attendance import _parse_attendance_import_rows
+
+
+def test_attendance_import_parser_rejects_duplicate_emp_no_across_sheets():
+    workbook = Workbook()
+    first = workbook.active
+    first.append(["工号", "应出勤", "实出勤"])
+    first.append(["E1", 22, 22])
+    second = workbook.create_sheet("second")
+    second.append(["工号", "应出勤", "实出勤"])
+    second.append(["E1", 21, 21])
+
+    with pytest.raises(ValueError, match="E1"):
+        _parse_attendance_import_rows(workbook)
 
 
 # ---------------- parse_money（不变量1/2：Decimal + 失败不归零）----------------
@@ -38,6 +55,23 @@ def test_parse_money_success(raw, expected):
 @pytest.mark.parametrize("raw", [None, "", "  ", "abc", "8%", "无", "-", "3500元整"])
 def test_parse_money_failure_returns_none_not_zero(raw):
     # 关键修复：无法解析返回 None（上层报错），绝不返回 0
+    assert parse_money(raw) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        "NaN",
+        "Infinity",
+        "-Infinity",
+    ],
+)
+def test_parse_money_rejects_non_finite_decimal_values(raw):
     assert parse_money(raw) is None
 
 
@@ -90,6 +124,22 @@ def test_store_alias_and_normalize():
 def test_auto_store_aliases():
     names = {"万科", "万科店", "广州店"}
     assert auto_store_aliases(names) == {"万科": "万科店"}
+
+
+def test_workbook_applies_legacy_store_aliases_by_default():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "万科"
+    sheet.append(["万科月工资表"])
+    sheet.append(["工号", "姓名", "合计工资"])
+    sheet.append(["E1", "张三", 5000])
+    source = io.BytesIO()
+    workbook.save(source)
+    source.seek(0)
+
+    result = read_salary_workbook(source, period="2026-05")
+
+    assert result.rows[0].store_name == "天河智慧城店"
 
 
 # ---------------- infer_month ----------------
@@ -176,14 +226,26 @@ def test_placeholder_emp_no_does_not_collapse_distinct_people():
 
 
 def test_same_emp_no_cross_store_kept_separate():
-    # 同工号跨店（调店拆分发薪）是两条真实记录，不能合并
+    # 员工工号全局唯一；当前导入的身份键必须始终是 (周期, 工号)，不能把门店
+    # 混入键中而让同一员工在同一周期写入两份工资记录。
     rows = [
         _row("张三", "广州店", emp_no="E1", 合计工资=3000),
         _row("张三", "深圳店", emp_no="E1", 合计工资=2500),
     ]
     result = dedupe_rows(rows)
-    assert len(result) == 2
-    assert sum(r.money["合计工资"] for r in result) == Decimal("5500")
+    assert len(result) == 1
+    assert result[0].identity_key() == ("2026-05", "E1")
+
+
+def test_dedupe_does_not_use_name_as_an_identity_when_emp_no_is_missing():
+    # 无工号的当前行会在暂存校验阶段变成可操作的错误；这里不能按姓名静默合并，
+    # 否则人工认领时会丢失原始行。
+    rows = [
+        _row("张三", "广州店", 合计工资=3000),
+        _row("张三", "广州店", 合计工资=2500),
+    ]
+
+    assert len(dedupe_rows(rows)) == 2
 
 
 def test_full_width_minus_parsed():

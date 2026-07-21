@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
@@ -17,10 +18,13 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models.org import OrgUnit
+from app.importing.parser import clean_text, normalize_store_name, parse_money, standard_store_name
+from app.importing.store_aliases import STORE_ALIASES
+from app.models.org import OrgType, OrgUnit
 from app.models.salary import SalaryRecord, SalarySource
 
 _META_KEYS = {"月份", "姓名", "门店", "标准门店", "工作表", "来源文件"}
+_PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 
 @dataclass
@@ -32,6 +36,87 @@ class MigrationReport:
     total_cost: Decimal  # 合计工资总额（对账用）
 
 
+class LegacyMigrationError(ValueError):
+    """The legacy cache contains rows that cannot safely be migrated."""
+
+    def __init__(self, issues: list[str]):
+        self.issues = issues
+        super().__init__(f"历史薪资迁移校验失败：{'；'.join(issues)}")
+
+
+@dataclass(frozen=True)
+class _LegacyRow:
+    period: str
+    name: str
+    store_name: str
+    fields: dict
+    total_cost: Decimal
+
+
+def _canonical_store_name(row: dict) -> str:
+    raw_store = row.get("标准门店") or row.get("门店")
+    return standard_store_name(normalize_store_name(raw_store), STORE_ALIASES)
+
+
+def _validate_legacy_rows(legacy_rows: list[dict]) -> list[_LegacyRow]:
+    """Validate every source row before creating any ORM objects.
+
+    This deliberately aggregates all malformed row diagnostics and fails before the first
+    insert.  A historic migration is an auditable conversion, not a best-effort import.
+    """
+    issues: list[str] = []
+    normalized: list[_LegacyRow] = []
+    for row_index, row in enumerate(legacy_rows, start=1):
+        if not isinstance(row, dict):
+            issues.append(f"第 {row_index} 行不是对象记录")
+            continue
+
+        period = clean_text(row.get("月份"))
+        name = clean_text(row.get("姓名"))
+        store_name = _canonical_store_name(row)
+        row_issues: list[str] = []
+        if not period:
+            row_issues.append("缺少月份")
+        elif not _PERIOD_RE.fullmatch(period):
+            row_issues.append(f"月份格式无效『{period}』")
+        if not name:
+            row_issues.append("缺少姓名")
+        if not store_name:
+            row_issues.append("缺少门店")
+
+        raw_total = row.get("合计工资")
+        total_cost = Decimal(0)
+        if raw_total not in (None, ""):
+            parsed_total = parse_money(raw_total)
+            if parsed_total is None:
+                row_issues.append(f"合计工资无法解析『{clean_text(raw_total)}』")
+            else:
+                total_cost = parsed_total
+
+        if row_issues:
+            issues.append(f"第 {row_index} 行" + "、".join(row_issues))
+            continue
+
+        fields = {
+            key: value
+            for key, value in row.items()
+            if key not in _META_KEYS and value not in (None, "")
+        }
+        normalized.append(
+            _LegacyRow(
+                period=period,
+                name=name,
+                store_name=store_name,
+                fields=fields,
+                total_cost=total_cost,
+            )
+        )
+
+    if issues:
+        raise LegacyMigrationError(issues)
+    return normalized
+
+
 def load_legacy_rows(sqlite_path: str) -> list[dict]:
     conn = sqlite3.connect(sqlite_path)
     try:
@@ -40,15 +125,26 @@ def load_legacy_rows(sqlite_path: str) -> list[dict]:
         conn.close()
     if not row:
         return []
-    payload = json.loads(row[0])
-    return payload.get("rows", [])
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise LegacyMigrationError(["salary_cache payload 不是有效 JSON"]) from exc
+    if not isinstance(payload, dict):
+        raise LegacyMigrationError(["salary_cache payload 必须是对象"])
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise LegacyMigrationError(["salary_cache payload 缺少 rows 数组"])
+    return rows
 
 
 def migrate_rows(session: Session, legacy_rows: list[dict]) -> MigrationReport:
+    normalized_rows = _validate_legacy_rows(legacy_rows)
     org_by_name = {
         name: oid
         for oid, name in session.execute(
-            select(OrgUnit.id, OrgUnit.name).where(OrgUnit.is_deleted.is_(False))
+            select(OrgUnit.id, OrgUnit.name).where(
+                OrgUnit.is_deleted.is_(False), OrgUnit.type == OrgType.STORE
+            )
         ).all()
     }
     written = 0
@@ -56,35 +152,24 @@ def migrate_rows(session: Session, legacy_rows: list[dict]) -> MigrationReport:
     periods: dict[str, int] = {}
     total_cost = Decimal(0)
 
-    for r in legacy_rows:
-        period = r.get("月份")
-        name = r.get("姓名")
-        store = r.get("标准门店") or r.get("门店")
-        if not period or not name or not store:
-            continue
-        fields = {k: v for k, v in r.items() if k not in _META_KEYS and v not in (None, "")}
-        org_id = org_by_name.get(store)
+    for row in normalized_rows:
+        org_id = org_by_name.get(row.store_name)
         if org_id is not None:
             matched += 1
         session.add(
             SalaryRecord(
-                period=period,
+                period=row.period,
                 emp_no=None,
-                name=name,
-                store_name=store,
+                name=row.name,
+                store_name=row.store_name,
                 org_unit_id=org_id,
                 source=SalarySource.HISTORICAL,
-                fields=fields,
+                fields=row.fields,
             )
         )
         written += 1
-        periods[period] = periods.get(period, 0) + 1
-        cost = fields.get("合计工资")
-        if cost:
-            try:
-                total_cost += Decimal(str(cost).replace(",", ""))
-            except Exception:  # noqa: BLE001  对账容错，异常值不计入
-                pass
+        periods[row.period] = periods.get(row.period, 0) + 1
+        total_cost += row.total_cost
 
     session.flush()
     return MigrationReport(

@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Button,
+  Checkbox,
+  Alert,
   Form,
   Input,
   Modal,
@@ -24,6 +26,13 @@ import {
 } from '../api/masterdata'
 import { useAuth } from '../auth/AuthContext'
 import { Perm } from '../auth/permissions'
+import { TaxOpeningModal } from '../components/TaxOpeningModal'
+import {
+  applyDingTalkEmployeeMatches,
+  fetchDingTalkIntegration,
+  previewDingTalkEmployees,
+  type DingTalkEmployeePreview,
+} from '../api/dingtalk'
 
 const EMPLOYMENT_LABELS: Record<Employee['employment_type'], string> = {
   FULL_TIME: '全职',
@@ -31,18 +40,60 @@ const EMPLOYMENT_LABELS: Record<Employee['employment_type'], string> = {
   LABOR: '劳务',
 }
 
+const PII_FIELDS = new Set<keyof Employee>(['id_card', 'bank_account'])
+
+function normalizedFormValue(value: unknown): unknown {
+  return value === '' ? null : value
+}
+
+function isMaskedPii(value: unknown): boolean {
+  return typeof value === 'string' && /[*•]/.test(value)
+}
+
+export function isKnownSpecialPosition(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const normalized = value.replace(/\s/g, '').replaceAll('（', '(').replaceAll('）', ')')
+  if (normalized.includes('洗碗') || normalized === '寒假工' || normalized === '暑假工') return true
+  return (
+    (normalized.includes('店长') || normalized.includes('厨师长')) &&
+    (normalized.includes('实习') || normalized.includes('储备'))
+  )
+}
+
+export function buildEmployeeUpdatePayload(
+  employee: Employee,
+  values: Partial<Employee>,
+): Partial<Employee> {
+  const changed: Partial<Employee> = {}
+  for (const [rawKey, value] of Object.entries(values)) {
+    const key = rawKey as keyof Employee
+    if (PII_FIELDS.has(key)) {
+      if (value === undefined || value === null || value === '' || isMaskedPii(value)) continue
+    } else if (normalizedFormValue(value) === normalizedFormValue(employee[key])) {
+      continue
+    }
+    Object.assign(changed, { [key]: value })
+  }
+  return changed
+}
+
 export default function EmployeesPage() {
-  const { hasPermission } = useAuth()
-  const canWrite = hasPermission(Perm.EMPLOYEE_WRITE)
+  const { user, hasPermission } = useAuth()
+  const queryScope = user?.username ?? 'anonymous'
+  const canManageEmployees = hasPermission(Perm.EMPLOYEE_WRITE)
+  const canManageTaxOpenings = hasPermission(Perm.POLICY_WRITE)
+  const canSyncDingTalk = hasPermission(Perm.NOTIFICATION_MANAGE)
   const qc = useQueryClient()
 
   const [name, setName] = useState('')
   const [page, setPage] = useState(1)
   const [editing, setEditing] = useState<Employee | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
+  const [taxOpeningEmployee, setTaxOpeningEmployee] = useState<Employee | null>(null)
+  const [directoryPreview, setDirectoryPreview] = useState<DingTalkEmployeePreview | null>(null)
   const [form] = Form.useForm()
 
-  const orgsQuery = useQuery({ queryKey: ['orgUnits'], queryFn: fetchOrgUnits })
+  const orgsQuery = useQuery({ queryKey: ['orgUnits', queryScope], queryFn: fetchOrgUnits })
   const orgName = useMemo(() => {
     const map = new Map<number, string>()
     ;(orgsQuery.data ?? []).forEach((o: OrgUnit) => map.set(o.id, o.name))
@@ -50,24 +101,32 @@ export default function EmployeesPage() {
   }, [orgsQuery.data])
 
   const empQuery = useQuery({
-    queryKey: ['employees', name, page],
+    queryKey: ['employees', queryScope, name, page],
     queryFn: () => fetchEmployees({ name: name || undefined, page, page_size: 20 }),
+  })
+  const dingtalkIntegrationQuery = useQuery({
+    queryKey: ['dingtalkIntegration', queryScope],
+    queryFn: fetchDingTalkIntegration,
+    enabled: canSyncDingTalk,
   })
 
   const saveMutation = useMutation({
     mutationFn: async (values: Partial<Employee>) => {
-      if (editing) return updateEmployee(editing.id, values)
+      if (editing) return updateEmployee(editing.id, buildEmployeeUpdatePayload(editing, values))
       return createEmployee(values)
     },
     onSuccess: () => {
       message.success('已保存')
       setModalOpen(false)
       setEditing(null)
-      void qc.invalidateQueries({ queryKey: ['employees'] })
+      void qc.invalidateQueries({ queryKey: ['employees', queryScope] })
     },
     onError: (e: unknown) => {
-      const status = (e as { response?: { status?: number } }).response?.status
-      message.error(status === 409 ? '工号已存在' : status === 404 ? '所属组织不可见' : '保存失败')
+      const response = (e as { response?: { status?: number; data?: { detail?: string } } })
+        .response
+      message.error(
+        response?.data?.detail ?? (response?.status === 404 ? '所属组织不可见' : '保存失败'),
+      )
     },
   })
 
@@ -75,9 +134,28 @@ export default function EmployeesPage() {
     mutationFn: deleteEmployee,
     onSuccess: () => {
       message.success('已删除')
-      void qc.invalidateQueries({ queryKey: ['employees'] })
+      void qc.invalidateQueries({ queryKey: ['employees', queryScope] })
     },
   })
+  const directoryPreviewMutation = useMutation({
+    mutationFn: previewDingTalkEmployees,
+    onSuccess: setDirectoryPreview,
+    onError: (error: unknown) => message.error(errorMessage(error)),
+  })
+  const directoryApplyMutation = useMutation({
+    mutationFn: applyDingTalkEmployeeMatches,
+    onSuccess: (result) => {
+      message.success(`已建立 ${result.linked} 个钉钉员工绑定`)
+      setDirectoryPreview(null)
+      void qc.invalidateQueries({ queryKey: ['employees', queryScope] })
+    },
+    onError: (error: unknown) => message.error(errorMessage(error)),
+  })
+
+  function errorMessage(error: unknown): string {
+    const detail = (error as { response?: { data?: { detail?: unknown } } }).response?.data?.detail
+    return typeof detail === 'string' ? detail : '钉钉目录读取失败'
+  }
 
   function openCreate() {
     setEditing(null)
@@ -87,7 +165,11 @@ export default function EmployeesPage() {
 
   function openEdit(emp: Employee) {
     setEditing(emp)
-    form.setFieldsValue(emp)
+    const safeFields: Partial<Employee> = { ...emp }
+    delete safeFields.id_card
+    delete safeFields.bank_account
+    form.resetFields()
+    form.setFieldsValue({ ...safeFields, id_card: undefined, bank_account: undefined })
     setModalOpen(true)
   }
 
@@ -105,25 +187,62 @@ export default function EmployeesPage() {
       render: (t: Employee['employment_type']) => EMPLOYMENT_LABELS[t],
     },
     {
+      title: '职位',
+      dataIndex: 'position_title',
+      render: (title: string | null) => title || '未填写',
+    },
+    {
+      title: '出勤核算',
+      dataIndex: 'is_special_position',
+      render: (special: boolean, employee: Employee) =>
+        special ? (
+          <Tag color="purple">特殊岗位 · 审批天数</Tag>
+        ) : (
+          <Tag>
+            {employee.department === 'DINING'
+              ? '厅面 · 9小时/天'
+              : employee.department === 'KITCHEN'
+                ? '厨房 · 9.5小时/天'
+                : '按岗位规则'}
+          </Tag>
+        ),
+    },
+    {
       title: '状态',
       dataIndex: 'status',
       render: (s: string) => <Tag color={s === 'ACTIVE' ? 'green' : 'default'}>{s}</Tag>,
     },
+    {
+      title: '钉钉',
+      dataIndex: 'dingtalk_linked',
+      render: (linked: boolean) => (
+        <Tag color={linked ? 'blue' : 'default'}>{linked ? '已绑定' : '未绑定'}</Tag>
+      ),
+    },
     { title: '身份证', dataIndex: 'id_card' },
-    ...(canWrite
+    ...(canManageEmployees || canManageTaxOpenings
       ? [
           {
             title: '操作',
             render: (_: unknown, emp: Employee) => (
               <Space>
-                <Button size="small" onClick={() => openEdit(emp)}>
-                  编辑
-                </Button>
-                <Popconfirm title="确认删除？" onConfirm={() => deleteMutation.mutate(emp.id)}>
-                  <Button size="small" danger>
-                    删除
+                {canManageEmployees && (
+                  <>
+                    <Button size="small" onClick={() => openEdit(emp)}>
+                      编辑
+                    </Button>
+                    <Popconfirm title="确认删除？" onConfirm={() => deleteMutation.mutate(emp.id)}>
+                      <Button size="small" danger>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  </>
+                )}
+                {canManageTaxOpenings && (
+                  <Button size="small" onClick={() => setTaxOpeningEmployee(emp)}>
+                    个税开账
                   </Button>
-                </Popconfirm>
+                )}
               </Space>
             ),
           },
@@ -133,7 +252,7 @@ export default function EmployeesPage() {
 
   return (
     <div>
-      <Space style={{ marginBottom: 16 }}>
+      <Space wrap style={{ marginBottom: 16 }}>
         <Input.Search
           placeholder="按姓名搜索"
           allowClear
@@ -143,34 +262,65 @@ export default function EmployeesPage() {
           }}
           style={{ width: 240 }}
         />
-        {canWrite && (
+        {canManageEmployees && (
           <Button type="primary" onClick={openCreate}>
             新增员工
           </Button>
         )}
+        {canSyncDingTalk && dingtalkIntegrationQuery.data && (
+          <Button
+            disabled={!dingtalkIntegrationQuery.data.read_sync_ready}
+            loading={directoryPreviewMutation.isPending}
+            onClick={() => directoryPreviewMutation.mutate()}
+          >
+            预览钉钉员工
+          </Button>
+        )}
       </Space>
-      <Table
-        rowKey="id"
-        loading={empQuery.isLoading}
-        columns={columns}
-        dataSource={empQuery.data?.items ?? []}
-        pagination={{
-          current: page,
-          pageSize: 20,
-          total: empQuery.data?.total ?? 0,
-          onChange: setPage,
-          showTotal: (t) => `共 ${t} 人`,
-        }}
-      />
+      {canSyncDingTalk &&
+      dingtalkIntegrationQuery.data &&
+      !dingtalkIntegrationQuery.data.read_sync_ready ? (
+        <Alert
+          message="钉钉只读同步尚未启用；消息推送仍保持 sandbox。"
+          showIcon
+          style={{ marginBottom: 16 }}
+          type="info"
+        />
+      ) : null}
+      <div role="region" aria-label="员工岗位目录" tabIndex={0} style={{ overflowX: 'auto' }}>
+        <Table
+          rowKey="id"
+          loading={empQuery.isLoading}
+          columns={columns}
+          dataSource={empQuery.data?.items ?? []}
+          scroll={{ x: 1380 }}
+          pagination={{
+            current: page,
+            pageSize: 20,
+            total: empQuery.data?.total ?? 0,
+            onChange: setPage,
+            showTotal: (t) => `共 ${t} 人`,
+          }}
+        />
+      </div>
       <Modal
         title={editing ? '编辑员工' : '新增员工'}
         open={modalOpen}
         onCancel={() => setModalOpen(false)}
         onOk={() => form.submit()}
         confirmLoading={saveMutation.isPending}
-        destroyOnClose
+        destroyOnHidden
       >
-        <Form form={form} layout="vertical" onFinish={(v) => saveMutation.mutate(v)}>
+        <Form
+          form={form}
+          layout="vertical"
+          onFinish={(v) => saveMutation.mutate(v)}
+          onValuesChange={(changed) => {
+            if (isKnownSpecialPosition(changed.position_title)) {
+              form.setFieldValue('is_special_position', true)
+            }
+          }}
+        >
           <Form.Item name="emp_no" label="工号" rules={[{ required: true }]}>
             <Input disabled={!!editing} />
           </Form.Item>
@@ -200,13 +350,33 @@ export default function EmployeesPage() {
               ]}
             />
           </Form.Item>
-          <Form.Item name="is_special_position" label="特殊岗位(按天数核算)" valuePropName="checked">
-            <Select
-              options={[
-                { value: false, label: '否（按工时折算）' },
-                { value: true, label: '是（应出勤−休息天数）' },
-              ]}
-            />
+          <Form.Item
+            name="position_title"
+            label="职位名称"
+            rules={[{ max: 64, message: '职位名称最多 64 个字符' }]}
+            extra="请填写实际职位；店长（实习/储备）、厨师长（实习/储备）、洗碗岗位、寒假工、暑假工及公司指定的其他职位需同时勾选特殊岗位。"
+          >
+            <Input placeholder="例如：储备店长、洗碗、暑假工" maxLength={64} />
+          </Form.Item>
+          <Form.Item
+            name="hire_date"
+            label="入职日期"
+            rules={[{ required: true, message: '请填写入职日期' }]}
+          >
+            <Input type="date" />
+          </Form.Item>
+          {editing && (
+            <Form.Item name="leave_date" label="离职日期">
+              <Input type="date" />
+            </Form.Item>
+          )}
+          <Form.Item
+            name="is_special_position"
+            label="特殊岗位(按天数核算)"
+            valuePropName="checked"
+            initialValue={false}
+          >
+            <Checkbox>是，按审批确认的实际出勤天数核算</Checkbox>
           </Form.Item>
           <Form.Item name="social_city" label="社保城市">
             <Input />
@@ -218,6 +388,79 @@ export default function EmployeesPage() {
             <Input />
           </Form.Item>
         </Form>
+      </Modal>
+      <TaxOpeningModal
+        employee={taxOpeningEmployee}
+        open={taxOpeningEmployee !== null}
+        onClose={() => setTaxOpeningEmployee(null)}
+      />
+      <Modal
+        title="钉钉员工目录预览"
+        open={directoryPreview !== null}
+        width={900}
+        onCancel={() => setDirectoryPreview(null)}
+        footer={[
+          <Button key="cancel" onClick={() => setDirectoryPreview(null)}>
+            取消
+          </Button>,
+          <Button
+            key="apply"
+            type="primary"
+            disabled={!directoryPreview?.matched || directoryPreview.truncated}
+            loading={directoryApplyMutation.isPending}
+            onClick={() => {
+              if (directoryPreview && !directoryPreview.truncated) {
+                directoryApplyMutation.mutate()
+              }
+            }}
+          >
+            确认绑定安全匹配项
+          </Button>,
+        ]}
+      >
+        {directoryPreview ? (
+          <>
+            <Alert
+              message="只绑定已有稳定标识、唯一工号或唯一姓名；重名人员不会自动绑定。"
+              showIcon
+              style={{ marginBottom: 16 }}
+              type="info"
+            />
+            {directoryPreview.truncated ? (
+              <Alert
+                message="预览结果不完整，已阻止确认绑定。请缩小钉钉目录范围或调整同步上限后重新预览。"
+                showIcon
+                style={{ marginBottom: 16 }}
+                type="error"
+              />
+            ) : null}
+            <p>
+              钉钉共 {directoryPreview.total_remote_users} 人；可安全匹配 {directoryPreview.matched}{' '}
+              人； 重名/冲突 {directoryPreview.ambiguous} 人；未匹配 {directoryPreview.unmatched}{' '}
+              人。
+            </p>
+            <Table
+              rowKey="employee_id"
+              size="small"
+              pagination={{ pageSize: 10 }}
+              dataSource={directoryPreview.items}
+              columns={[
+                { title: '工号', dataIndex: 'emp_no' },
+                { title: '本地姓名', dataIndex: 'local_name' },
+                { title: '钉钉姓名', dataIndex: 'dingtalk_name' },
+                { title: '钉钉工号', dataIndex: 'dingtalk_job_number', render: (v) => v ?? '—' },
+                {
+                  title: '匹配依据',
+                  dataIndex: 'match_method',
+                  render: (method) =>
+                    ({ STABLE_ID: '已有绑定', JOB_NUMBER: '唯一工号', UNIQUE_NAME: '唯一姓名' })[
+                      method as 'STABLE_ID' | 'JOB_NUMBER' | 'UNIQUE_NAME'
+                    ],
+                },
+              ]}
+            />
+          </>
+        ) : null}
       </Modal>
     </div>
   )

@@ -10,11 +10,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -29,9 +29,11 @@ from app.payroll.guards import lock_payroll_input_mutation
 from app.payroll.social_tax import (
     ContributionKind,
     ContributionRule,
+    DerivedIncomeRule,
     SocialInsurancePolicyInput,
     TaxBracket,
     TaxPolicyInput,
+    validate_derived_income_rules,
     validate_social_insurance_policy,
     validate_tax_policy,
 )
@@ -63,6 +65,17 @@ class TaxBracketBody(BaseModel):
     quick_deduction: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
 
 
+class DerivedIncomeRuleBody(BaseModel):
+    """City-policy treatment of an earnings line calculated by the engine."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["OVERTIME", "HOLIDAY"]
+    taxable: bool
+    in_social_base: bool
+    in_housing_base: bool
+
+
 class PayrollPolicyCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -71,6 +84,7 @@ class PayrollPolicyCreate(BaseModel):
     social_rules: list[SocialRuleBody] = Field(min_length=1)
     monthly_basic_deduction: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
     tax_brackets: list[TaxBracketBody] = Field(min_length=1)
+    derived_income_rules: list[DerivedIncomeRuleBody] = Field(default_factory=list)
 
     @field_validator("city")
     @classmethod
@@ -78,6 +92,13 @@ class PayrollPolicyCreate(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("city must not be blank")
+        return value
+
+    @field_validator("effective_from")
+    @classmethod
+    def effective_date_is_month_start(cls, value: date) -> date:
+        if value.day != 1:
+            raise ValueError("effective_from must be the first day of a payroll month")
         return value
 
 
@@ -93,6 +114,7 @@ class PayrollPolicyUpdate(BaseModel):
         default=None, ge=0, max_digits=14, decimal_places=2
     )
     tax_brackets: list[TaxBracketBody] | None = Field(default=None, min_length=1)
+    derived_income_rules: list[DerivedIncomeRuleBody] | None = None
 
     @field_validator("city")
     @classmethod
@@ -102,6 +124,13 @@ class PayrollPolicyUpdate(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("city must not be blank")
+        return value
+
+    @field_validator("effective_from")
+    @classmethod
+    def effective_date_is_month_start(cls, value: date | None) -> date | None:
+        if value is not None and value.day != 1:
+            raise ValueError("effective_from must be the first day of a payroll month")
         return value
 
     @model_validator(mode="after")
@@ -120,6 +149,7 @@ class PayrollPolicyOut(BaseModel):
     social_rules: list[SocialRuleBody]
     monthly_basic_deduction: Decimal
     tax_brackets: list[TaxBracketBody]
+    derived_income_rules: list[DerivedIncomeRuleBody]
     is_finalized: bool
     finalized_by: int | None
     finalized_at: datetime | None
@@ -137,7 +167,8 @@ def _policy_input(
     social_rules: Sequence[dict[str, Any]],
     monthly_basic_deduction: Decimal,
     tax_brackets: Sequence[dict[str, Any]],
-) -> tuple[SocialInsurancePolicyInput, TaxPolicyInput]:
+    derived_income_rules: Sequence[dict[str, Any]],
+) -> tuple[SocialInsurancePolicyInput, TaxPolicyInput, tuple[DerivedIncomeRule, ...]]:
     """Convert persisted JSON only at the trusted, validated API boundary."""
 
     social = SocialInsurancePolicyInput(
@@ -168,7 +199,16 @@ def _policy_input(
             for bracket in tax_brackets
         ),
     )
-    return social, tax
+    derived = tuple(
+        DerivedIncomeRule(
+            code=str(rule["code"]),
+            taxable=rule["taxable"],
+            in_social_base=rule["in_social_base"],
+            in_housing_base=rule["in_housing_base"],
+        )
+        for rule in derived_income_rules
+    )
+    return social, tax, derived
 
 
 def _validate_policy(
@@ -177,17 +217,21 @@ def _validate_policy(
     social_rules: Sequence[dict[str, Any]],
     monthly_basic_deduction: Decimal,
     tax_brackets: Sequence[dict[str, Any]],
+    derived_income_rules: Sequence[dict[str, Any]],
+    require_complete_derived_income: bool = False,
     status_code: int = status.HTTP_422_UNPROCESSABLE_CONTENT,
 ) -> None:
     try:
-        social, tax = _policy_input(
+        social, tax, derived = _policy_input(
             city=city,
             social_rules=social_rules,
             monthly_basic_deduction=monthly_basic_deduction,
             tax_brackets=tax_brackets,
+            derived_income_rules=derived_income_rules,
         )
         validate_social_insurance_policy(social)
         validate_tax_policy(tax)
+        validate_derived_income_rules(derived, require_complete=require_complete_derived_income)
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise HTTPException(
             status_code=status_code, detail=f"Invalid payroll policy: {exc}"
@@ -202,29 +246,46 @@ def _serialize_tax_brackets(items: Sequence[TaxBracketBody]) -> list[dict[str, A
     return [item.model_dump(mode="json") for item in items]
 
 
+def _serialize_derived_income_rules(
+    items: Sequence[DerivedIncomeRuleBody],
+) -> list[dict[str, Any]]:
+    return [item.model_dump(mode="json") for item in items]
+
+
 def _period_for_policy(effective_from: date) -> str:
     return f"{effective_from.year:04d}-{effective_from.month:02d}"
 
 
+def _require_month_start(effective_from: date, *, status_code: int) -> None:
+    if effective_from.day != 1:
+        raise HTTPException(
+            status_code=status_code,
+            detail="Payroll policy effective date must be the first day of a payroll month",
+        )
+
+
 def _started_batch_exists(session: Session, effective_from: date) -> bool:
-    """A later policy must be final before any affected batch begins its round."""
+    """Block policy finalization unless all affected history is reopened.
+
+    Reopening a multi-period correction is performed newest-to-oldest.  Every
+    affected period is therefore an isolated draft before a policy successor
+    can be finalized; any non-draft batch still has a mutable/approved result
+    that must be reopened first.
+    """
 
     lock_payroll_input_mutation(session)
-    return (
-        session.scalar(
-            select(PayrollBatch.id)
-            .where(
-                PayrollBatch.period >= _period_for_policy(effective_from),
-                or_(
-                    PayrollBatch.status != BatchStatus.DRAFT,
-                    PayrollBatch.version > 1,
-                ),
-            )
-            .with_for_update()
-            .limit(1)
-        )
-        is not None
-    )
+    first_period = _period_for_policy(effective_from)
+    batches = session.scalars(
+        select(PayrollBatch)
+        .where(PayrollBatch.period >= first_period)
+        .order_by(PayrollBatch.period)
+        .with_for_update()
+    ).all()
+    for batch in batches:
+        if batch.status == BatchStatus.DRAFT:
+            continue
+        return True
+    return False
 
 
 def _out(policy: PayrollPolicy) -> PayrollPolicyOut:
@@ -302,11 +363,14 @@ def create_policy(
 ) -> PayrollPolicyOut:
     social_rules = _serialize_social_rules(body.social_rules)
     tax_brackets = _serialize_tax_brackets(body.tax_brackets)
+    derived_income_rules = _serialize_derived_income_rules(body.derived_income_rules)
+    _require_month_start(body.effective_from, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
     _validate_policy(
         city=body.city,
         social_rules=social_rules,
         monthly_basic_deduction=body.monthly_basic_deduction,
         tax_brackets=tax_brackets,
+        derived_income_rules=derived_income_rules,
     )
     policy = PayrollPolicy(
         city=body.city,
@@ -314,6 +378,7 @@ def create_policy(
         social_rules=social_rules,
         monthly_basic_deduction=body.monthly_basic_deduction,
         tax_brackets=tax_brackets,
+        derived_income_rules=derived_income_rules,
         created_by=principal.user_id,
     )
     session.add(policy)
@@ -366,17 +431,25 @@ def update_policy(
         if "tax_brackets" in changes
         else policy.tax_brackets
     )
+    derived_income_rules = (
+        _serialize_derived_income_rules(changes["derived_income_rules"])
+        if "derived_income_rules" in changes
+        else policy.derived_income_rules
+    )
+    _require_month_start(effective_from, status_code=status.HTTP_409_CONFLICT)
     _validate_policy(
         city=city,
         social_rules=social_rules,
         monthly_basic_deduction=monthly_basic_deduction,
         tax_brackets=tax_brackets,
+        derived_income_rules=derived_income_rules,
     )
     policy.city = city
     policy.effective_from = effective_from
     policy.social_rules = social_rules
     policy.monthly_basic_deduction = monthly_basic_deduction
     policy.tax_brackets = tax_brackets
+    policy.derived_income_rules = derived_income_rules
     try:
         session.flush()
     except IntegrityError:
@@ -407,6 +480,9 @@ def finalize_policy(
     principal: Principal = Depends(require_permission(Perm.POLICY_WRITE)),
     session: Session = Depends(get_session),
 ) -> PayrollPolicyOut:
+    # Match the batch-run/source-write locking order before taking the policy
+    # row lock, preventing a successor policy from racing a batch snapshot.
+    lock_payroll_input_mutation(session)
     policy = session.scalars(
         select(PayrollPolicy).where(PayrollPolicy.id == policy_id).with_for_update()
     ).first()
@@ -414,11 +490,14 @@ def finalize_policy(
         raise HTTPException(status_code=404, detail="Payroll policy does not exist")
     if policy.is_finalized:
         raise HTTPException(status_code=409, detail="Payroll policy is already finalized")
+    _require_month_start(policy.effective_from, status_code=status.HTTP_409_CONFLICT)
     _validate_policy(
         city=policy.city,
         social_rules=policy.social_rules,
         monthly_basic_deduction=policy.monthly_basic_deduction,
         tax_brackets=policy.tax_brackets,
+        derived_income_rules=policy.derived_income_rules,
+        require_complete_derived_income=True,
         status_code=status.HTTP_409_CONFLICT,
     )
     if _started_batch_exists(session, policy.effective_from):

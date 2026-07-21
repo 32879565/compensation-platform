@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import IO
@@ -21,6 +22,7 @@ from app.importing.header_rules import (
 )
 from app.importing.parser import (
     SalaryRow,
+    auto_store_aliases,
     clean_text,
     normalize_emp_no,
     normalize_header,
@@ -28,6 +30,7 @@ from app.importing.parser import (
     parse_money,
     standard_store_name,
 )
+from app.importing.store_aliases import STORE_ALIASES
 
 _SUMMARY_KEYWORDS = ("汇总", "总表", "合计", "初版", "一厅面")
 _INVALID_STORE_TITLES = {"", "序号", "门店", "Sheet1", "`", "姓名"}
@@ -91,9 +94,11 @@ def read_salary_workbook(
     source: str | IO[bytes],
     *,
     period: str,
-    aliases: dict[str, str] | None = None,
+    aliases: Mapping[str, str] | None = None,
 ) -> ReadResult:
-    aliases = aliases or {}
+    # The legacy mappings are part of the import contract.  Explicit mappings are an overlay
+    # so a deployment can add a newly approved alias without losing the baseline catalogue.
+    aliases = {**STORE_ALIASES, **(aliases or {})}
     month = int(period.split("-")[1]) if "-" in period else None
     wb = load_workbook(source, read_only=True, data_only=True)
     rows: list[SalaryRow] = []
@@ -151,5 +156,13 @@ def read_salary_workbook(
                     money=money,  # type: ignore[arg-type]
                 )
             )
+    # Preserve the old parser's low-risk automatic ``X`` → ``X店`` repair as well.  It runs
+    # after all sheets are available, so an alias can be inferred from a canonical sibling.
+    automatic_aliases = auto_store_aliases({row.store_name for row in rows if row.store_name})
+    for row in rows:
+        row.store_name = standard_store_name(
+            automatic_aliases.get(row.store_name, row.store_name), aliases
+        )
+
     wb.close()
     return ReadResult(rows=rows, warnings=warnings)

@@ -58,3 +58,16 @@ def require_permission(permission: str) -> Callable[[Principal], Principal]:
         return principal
 
     return _dep
+
+
+def require_any_permission(*permissions: str) -> Callable[[Principal], Principal]:
+    """Require at least one explicit permission for a shared read-only resource."""
+    if not permissions:
+        raise ValueError("At least one permission is required")
+
+    def _dep(principal: Principal = Depends(get_current_principal)) -> Principal:
+        if not any(principal.has_permission(permission) for permission in permissions):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
+        return principal
+
+    return _dep
