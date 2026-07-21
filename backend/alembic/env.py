@@ -25,6 +25,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         compare_type=True,
+        transaction_per_migration=True,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -37,8 +38,21 @@ def run_migrations_online() -> None:
     # obtains its URL exclusively from application configuration.
     supplied_connection = config.attributes.get("connection")
     if supplied_connection is not None:
+        # An Alembic autocommit block must commit the current transaction
+        # before it can run DDL such as CREATE INDEX CONCURRENTLY.  Never let
+        # that transition commit a transaction owned by the caller (for
+        # example an ``engine.begin()`` context); require an idle connection
+        # so the migration context owns every transaction it creates.
+        if supplied_connection.in_transaction():
+            raise RuntimeError(
+                "Alembic cannot use a supplied connection with an active transaction; "
+                "pass an idle connection or let Alembic create its own connection."
+            )
         context.configure(
-            connection=supplied_connection, target_metadata=target_metadata, compare_type=True
+            connection=supplied_connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            transaction_per_migration=True,
         )
         with context.begin_transaction():
             context.run_migrations()
@@ -50,7 +64,12 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            transaction_per_migration=True,
+        )
         with context.begin_transaction():
             context.run_migrations()
 
