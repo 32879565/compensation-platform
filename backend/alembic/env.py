@@ -48,14 +48,25 @@ def run_migrations_online() -> None:
                 "Alembic cannot use a supplied connection with an active transaction; "
                 "pass an idle connection or let Alembic create its own connection."
             )
-        context.configure(
-            connection=supplied_connection,
-            target_metadata=target_metadata,
-            compare_type=True,
-            transaction_per_migration=True,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+        try:
+            context.configure(
+                connection=supplied_connection,
+                target_metadata=target_metadata,
+                compare_type=True,
+                transaction_per_migration=True,
+            )
+            with context.begin_transaction():
+                context.run_migrations()
+
+            # A no-op migration still queries alembic_version, which autobegins
+            # a transaction without a revision step to close it.  The idle-entry
+            # guard makes that residual transaction Alembic-owned and safe to end.
+            if supplied_connection.in_transaction():
+                supplied_connection.commit()
+        except BaseException:
+            if supplied_connection.in_transaction():
+                supplied_connection.rollback()
+            raise
         return
 
     connectable = engine_from_config(
