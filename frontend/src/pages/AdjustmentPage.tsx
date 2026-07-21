@@ -229,7 +229,7 @@ export default function AdjustmentPage() {
   })
   const componentsQuery = useQuery({
     queryKey: ['adjustmentComponents', queryScope],
-    queryFn: fetchComponents,
+    queryFn: () => fetchComponents(),
     enabled: canCreate,
   })
   const detailQuery = useQuery({

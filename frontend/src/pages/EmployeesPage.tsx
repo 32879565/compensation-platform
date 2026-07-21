@@ -13,19 +13,23 @@ import {
   Tag,
   message,
 } from 'antd'
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState, type KeyboardEvent } from 'react'
 
 import {
   createEmployee,
   deleteEmployee,
   fetchEmployees,
+  fetchGrades,
   fetchOrgUnits,
   updateEmployee,
   type Employee,
+  type EmployeeCreateInput,
+  type EmployeeUpdateFields,
   type OrgUnit,
 } from '../api/masterdata'
 import { useAuth } from '../auth/AuthContext'
 import { Perm } from '../auth/permissions'
+import SalaryStructureDrawer from '../components/SalaryStructureDrawer'
 import { TaxOpeningModal } from '../components/TaxOpeningModal'
 import {
   applyDingTalkEmployeeMatches,
@@ -40,7 +44,57 @@ const EMPLOYMENT_LABELS: Record<Employee['employment_type'], string> = {
   LABOR: '劳务',
 }
 
-const PII_FIELDS = new Set<keyof Employee>(['id_card', 'bank_account'])
+type EmployeeFormValues = Partial<EmployeeCreateInput> & Pick<EmployeeUpdateFields, 'status'>
+type EmployeeSaveRequest = {
+  values: EmployeeFormValues
+  editing: Employee | null
+}
+
+const PII_FIELDS = new Set<keyof EmployeeUpdateFields>(['id_card', 'bank_account'])
+const EMPLOYEE_UPDATE_FIELDS = [
+  'name',
+  'org_unit_id',
+  'job_grade_id',
+  'employment_type',
+  'department',
+  'position_title',
+  'is_special_position',
+  'status',
+  'hire_date',
+  'probation_end',
+  'leave_date',
+  'social_city',
+  'id_card',
+  'bank_account',
+] as const satisfies readonly (keyof EmployeeUpdateFields)[]
+
+const EMPLOYEE_CREATE_OPTIONAL_FIELDS = [
+  'job_grade_id',
+  'employment_type',
+  'department',
+  'position_title',
+  'is_special_position',
+  'probation_end',
+  'leave_date',
+  'social_city',
+  'id_card',
+  'bank_account',
+] as const satisfies readonly (keyof EmployeeCreateInput)[]
+
+const HORIZONTAL_SCROLL_STEP = 80
+
+function handleHorizontalRegionKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+  if (event.key === 'ArrowRight') {
+    event.preventDefault()
+    event.currentTarget.scrollLeft += HORIZONTAL_SCROLL_STEP
+  } else if (event.key === 'ArrowLeft') {
+    event.preventDefault()
+    event.currentTarget.scrollLeft = Math.max(
+      0,
+      event.currentTarget.scrollLeft - HORIZONTAL_SCROLL_STEP,
+    )
+  }
+}
 
 function normalizedFormValue(value: unknown): unknown {
   return value === '' ? null : value
@@ -48,6 +102,19 @@ function normalizedFormValue(value: unknown): unknown {
 
 function isMaskedPii(value: unknown): boolean {
   return typeof value === 'string' && /[*•]/.test(value)
+}
+
+function employeeApiError(error: unknown): { status?: number; detail?: string } {
+  if (typeof error !== 'object' || error === null) return {}
+  const response = (error as { response?: unknown }).response
+  if (typeof response !== 'object' || response === null) return {}
+  const { status, data } = response as { status?: unknown; data?: unknown }
+  const detail =
+    typeof data === 'object' && data !== null ? (data as { detail?: unknown }).detail : undefined
+  return {
+    status: typeof status === 'number' ? status : undefined,
+    detail: typeof detail === 'string' ? detail : undefined,
+  }
 }
 
 export function isKnownSpecialPosition(value: unknown): boolean {
@@ -62,13 +129,14 @@ export function isKnownSpecialPosition(value: unknown): boolean {
 
 export function buildEmployeeUpdatePayload(
   employee: Employee,
-  values: Partial<Employee>,
-): Partial<Employee> {
-  const changed: Partial<Employee> = {}
-  for (const [rawKey, value] of Object.entries(values)) {
-    const key = rawKey as keyof Employee
+  values: EmployeeFormValues,
+): EmployeeUpdateFields {
+  const changed: EmployeeUpdateFields = {}
+  for (const key of EMPLOYEE_UPDATE_FIELDS) {
+    const value = values[key]
+    if (value === undefined) continue
     if (PII_FIELDS.has(key)) {
-      if (value === undefined || value === null || value === '' || isMaskedPii(value)) continue
+      if (value === null || value === '' || isMaskedPii(value)) continue
     } else if (normalizedFormValue(value) === normalizedFormValue(employee[key])) {
       continue
     }
@@ -77,12 +145,33 @@ export function buildEmployeeUpdatePayload(
   return changed
 }
 
+function buildEmployeeCreatePayload(values: EmployeeFormValues): EmployeeCreateInput {
+  const { emp_no: empNo, name, org_unit_id: orgUnitId, hire_date: hireDate } = values
+  if (!empNo || !name || orgUnitId === undefined || !hireDate) {
+    throw new Error('请完整填写工号、姓名、所属组织和入职日期')
+  }
+
+  const payload: EmployeeCreateInput = {
+    emp_no: empNo,
+    name,
+    org_unit_id: orgUnitId,
+    hire_date: hireDate,
+  }
+  for (const key of EMPLOYEE_CREATE_OPTIONAL_FIELDS) {
+    const value = values[key]
+    if (value !== undefined) Object.assign(payload, { [key]: value })
+  }
+  return payload
+}
+
 export default function EmployeesPage() {
   const { user, hasPermission } = useAuth()
   const queryScope = user?.username ?? 'anonymous'
   const canManageEmployees = hasPermission(Perm.EMPLOYEE_WRITE)
   const canManageTaxOpenings = hasPermission(Perm.POLICY_WRITE)
   const canSyncDingTalk = hasPermission(Perm.NOTIFICATION_MANAGE)
+  const canReadGrades = hasPermission(Perm.GRADE_READ)
+  const canReadSalaryStructures = hasPermission(Perm.STRUCTURE_READ)
   const qc = useQueryClient()
 
   const [name, setName] = useState('')
@@ -90,8 +179,10 @@ export default function EmployeesPage() {
   const [editing, setEditing] = useState<Employee | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
   const [taxOpeningEmployee, setTaxOpeningEmployee] = useState<Employee | null>(null)
+  const [salaryStructureEmployee, setSalaryStructureEmployee] = useState<Employee | null>(null)
   const [directoryPreview, setDirectoryPreview] = useState<DingTalkEmployeePreview | null>(null)
-  const [form] = Form.useForm()
+  const [form] = Form.useForm<EmployeeFormValues>()
+  const saveInFlightRef = useRef(false)
 
   const orgsQuery = useQuery({ queryKey: ['orgUnits', queryScope], queryFn: fetchOrgUnits })
   const orgName = useMemo(() => {
@@ -104,6 +195,23 @@ export default function EmployeesPage() {
     queryKey: ['employees', queryScope, name, page],
     queryFn: () => fetchEmployees({ name: name || undefined, page, page_size: 20 }),
   })
+  const employeesReadReady =
+    !empQuery.isLoading && !empQuery.isFetching && !empQuery.isError && empQuery.data !== undefined
+  const gradesQuery = useQuery({
+    queryKey: ['grades', queryScope, 'all'],
+    queryFn: () => fetchGrades({ status: 'all' }),
+    enabled: canReadGrades,
+  })
+  const gradeById = useMemo(
+    () => new Map((gradesQuery.data ?? []).map((grade) => [grade.id, grade])),
+    [gradesQuery.data],
+  )
+  const gradesReadReady =
+    !canReadGrades ||
+    (!gradesQuery.isLoading &&
+      !gradesQuery.isFetching &&
+      !gradesQuery.isError &&
+      gradesQuery.data !== undefined)
   const dingtalkIntegrationQuery = useQuery({
     queryKey: ['dingtalkIntegration', queryScope],
     queryFn: fetchDingTalkIntegration,
@@ -111,30 +219,62 @@ export default function EmployeesPage() {
   })
 
   const saveMutation = useMutation({
-    mutationFn: async (values: Partial<Employee>) => {
-      if (editing) return updateEmployee(editing.id, buildEmployeeUpdatePayload(editing, values))
-      return createEmployee(values)
+    mutationFn: async ({ values, editing: editingSnapshot }: EmployeeSaveRequest) => {
+      if (!employeesReadReady) {
+        throw new Error('员工目录正在刷新，已禁止使用旧数据提交')
+      }
+      if (editingSnapshot) {
+        const changes = buildEmployeeUpdatePayload(editingSnapshot, values)
+        if (Object.hasOwn(changes, 'job_grade_id') && !gradesReadReady) {
+          throw new Error('职级目录尚未完整读取，已禁止修改员工职级')
+        }
+        return updateEmployee(editingSnapshot.id, {
+          ...changes,
+          expected_version: editingSnapshot.version,
+        })
+      }
+      if (values.job_grade_id != null && !gradesReadReady) {
+        throw new Error('职级目录尚未完整读取，已禁止分配员工职级')
+      }
+      return createEmployee(buildEmployeeCreatePayload(values))
     },
-    onSuccess: () => {
+    onSuccess: async () => {
       message.success('已保存')
       setModalOpen(false)
       setEditing(null)
-      void qc.invalidateQueries({ queryKey: ['employees', queryScope] })
+      form.resetFields()
+      await qc.invalidateQueries({ queryKey: ['employees', queryScope] })
     },
-    onError: (e: unknown) => {
-      const response = (e as { response?: { status?: number; data?: { detail?: string } } })
-        .response
+    onError: async (e: unknown, request) => {
+      const { status, detail } = employeeApiError(e)
+      const isEditingConflict = status === 409 && request.editing !== null
+      if (isEditingConflict) {
+        form.resetFields()
+        setModalOpen(false)
+        setEditing(null)
+      }
       message.error(
-        response?.data?.detail ?? (response?.status === 404 ? '所属组织不可见' : '保存失败'),
+        detail ?? (e instanceof Error ? e.message : status === 404 ? '所属组织不可见' : '保存失败'),
       )
+      if (isEditingConflict) {
+        await qc.invalidateQueries({ queryKey: ['employees', queryScope] })
+      }
+    },
+    onSettled: () => {
+      saveInFlightRef.current = false
     },
   })
 
   const deleteMutation = useMutation({
-    mutationFn: deleteEmployee,
-    onSuccess: () => {
+    mutationFn: async (employeeId: number) => {
+      if (!employeesReadReady) {
+        throw new Error('员工目录正在刷新，已禁止使用旧数据删除')
+      }
+      return deleteEmployee(employeeId)
+    },
+    onSuccess: async () => {
       message.success('已删除')
-      void qc.invalidateQueries({ queryKey: ['employees', queryScope] })
+      await qc.invalidateQueries({ queryKey: ['employees', queryScope] })
     },
   })
   const directoryPreviewMutation = useMutation({
@@ -158,16 +298,29 @@ export default function EmployeesPage() {
   }
 
   function openCreate() {
+    if (!employeesReadReady) return
     setEditing(null)
     form.resetFields()
     setModalOpen(true)
   }
 
   function openEdit(emp: Employee) {
+    if (!employeesReadReady) return
     setEditing(emp)
-    const safeFields: Partial<Employee> = { ...emp }
-    delete safeFields.id_card
-    delete safeFields.bank_account
+    const safeFields: EmployeeFormValues = {
+      emp_no: emp.emp_no,
+      name: emp.name,
+      org_unit_id: emp.org_unit_id,
+      job_grade_id: emp.job_grade_id,
+      employment_type: emp.employment_type,
+      department: emp.department,
+      position_title: emp.position_title,
+      is_special_position: emp.is_special_position,
+      hire_date: emp.hire_date ?? undefined,
+      probation_end: emp.probation_end,
+      leave_date: emp.leave_date,
+      social_city: emp.social_city,
+    }
     form.resetFields()
     form.setFieldsValue({ ...safeFields, id_card: undefined, bank_account: undefined })
     setModalOpen(true)
@@ -191,6 +344,27 @@ export default function EmployeesPage() {
       dataIndex: 'position_title',
       render: (title: string | null) => title || '未填写',
     },
+    ...(canReadGrades
+      ? [
+          {
+            title: '职级',
+            dataIndex: 'job_grade_id',
+            render: (gradeId: number | null) => {
+              if (gradeId === null) return <Tag>未分配</Tag>
+              const grade = gradeById.get(gradeId)
+              if (!grade) return <Tag color="default">职级目录不可用</Tag>
+              return (
+                <Space size={4}>
+                  <span>
+                    {grade.code} · {grade.name}
+                  </span>
+                  {!grade.is_active && <Tag color="default">已停用</Tag>}
+                </Space>
+              )
+            },
+          },
+        ]
+      : []),
     {
       title: '出勤核算',
       dataIndex: 'is_special_position',
@@ -220,7 +394,7 @@ export default function EmployeesPage() {
       ),
     },
     { title: '身份证', dataIndex: 'id_card' },
-    ...(canManageEmployees || canManageTaxOpenings
+    ...(canManageEmployees || canManageTaxOpenings || canReadSalaryStructures
       ? [
           {
             title: '操作',
@@ -228,11 +402,23 @@ export default function EmployeesPage() {
               <Space>
                 {canManageEmployees && (
                   <>
-                    <Button size="small" onClick={() => openEdit(emp)}>
+                    <Button
+                      size="small"
+                      disabled={
+                        !employeesReadReady || saveMutation.isPending || deleteMutation.isPending
+                      }
+                      onClick={() => openEdit(emp)}
+                    >
                       编辑
                     </Button>
                     <Popconfirm title="确认删除？" onConfirm={() => deleteMutation.mutate(emp.id)}>
-                      <Button size="small" danger>
+                      <Button
+                        size="small"
+                        danger
+                        disabled={
+                          !employeesReadReady || saveMutation.isPending || deleteMutation.isPending
+                        }
+                      >
                         删除
                       </Button>
                     </Popconfirm>
@@ -241,6 +427,11 @@ export default function EmployeesPage() {
                 {canManageTaxOpenings && (
                   <Button size="small" onClick={() => setTaxOpeningEmployee(emp)}>
                     个税开账
+                  </Button>
+                )}
+                {canReadSalaryStructures && (
+                  <Button size="small" onClick={() => setSalaryStructureEmployee(emp)}>
+                    薪资结构
                   </Button>
                 )}
               </Space>
@@ -263,7 +454,11 @@ export default function EmployeesPage() {
           style={{ width: 240 }}
         />
         {canManageEmployees && (
-          <Button type="primary" onClick={openCreate}>
+          <Button
+            type="primary"
+            disabled={!employeesReadReady || saveMutation.isPending || deleteMutation.isPending}
+            onClick={openCreate}
+          >
             新增员工
           </Button>
         )}
@@ -287,34 +482,56 @@ export default function EmployeesPage() {
           type="info"
         />
       ) : null}
-      <div role="region" aria-label="员工岗位目录" tabIndex={0} style={{ overflowX: 'auto' }}>
-        <Table
-          rowKey="id"
-          loading={empQuery.isLoading}
-          columns={columns}
-          dataSource={empQuery.data?.items ?? []}
-          scroll={{ x: 1380 }}
-          pagination={{
-            current: page,
-            pageSize: 20,
-            total: empQuery.data?.total ?? 0,
-            onChange: setPage,
-            showTotal: (t) => `共 ${t} 人`,
-          }}
-        />
+      <div
+        role="region"
+        aria-label="员工岗位目录"
+        tabIndex={0}
+        style={{ overflowX: 'auto' }}
+        onKeyDown={handleHorizontalRegionKeyDown}
+      >
+        <div style={{ minWidth: 1380 }}>
+          <Table
+            rowKey="id"
+            loading={empQuery.isLoading}
+            columns={columns}
+            dataSource={empQuery.data?.items ?? []}
+            pagination={{
+              current: page,
+              pageSize: 20,
+              total: empQuery.data?.total ?? 0,
+              onChange: setPage,
+              showTotal: (t) => `共 ${t} 人`,
+            }}
+          />
+        </div>
       </div>
       <Modal
         title={editing ? '编辑员工' : '新增员工'}
         open={modalOpen}
-        onCancel={() => setModalOpen(false)}
-        onOk={() => form.submit()}
+        onCancel={() => {
+          if (saveInFlightRef.current || saveMutation.isPending) return
+          form.resetFields()
+          setModalOpen(false)
+          setEditing(null)
+        }}
+        onOk={() => {
+          if (!saveInFlightRef.current) form.submit()
+        }}
         confirmLoading={saveMutation.isPending}
+        cancelButtonProps={{ disabled: saveMutation.isPending }}
+        closable={!saveMutation.isPending}
+        maskClosable={!saveMutation.isPending}
         destroyOnHidden
       >
-        <Form
+        <Form<EmployeeFormValues>
           form={form}
           layout="vertical"
-          onFinish={(v) => saveMutation.mutate(v)}
+          clearOnDestroy
+          onFinish={(v) => {
+            if (saveInFlightRef.current) return
+            saveInFlightRef.current = true
+            saveMutation.mutate({ values: v, editing })
+          }}
           onValuesChange={(changed) => {
             if (isKnownSpecialPosition(changed.position_title)) {
               form.setFieldValue('is_special_position', true)
@@ -334,6 +551,7 @@ export default function EmployeesPage() {
                 .map((o) => ({ value: o.id, label: o.name }))}
               showSearch
               optionFilterProp="label"
+              virtual={false}
             />
           </Form.Item>
           <Form.Item name="employment_type" label="用工类型" initialValue="FULL_TIME">
@@ -350,6 +568,41 @@ export default function EmployeesPage() {
               ]}
             />
           </Form.Item>
+          {canReadGrades && (
+            <>
+              {gradesQuery.isError && (
+                <Alert
+                  message="职级目录加载失败，已禁止修改职级"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  type="error"
+                />
+              )}
+              <Form.Item name="job_grade_id" label="员工职级">
+                <Select
+                  allowClear
+                  onChange={(value) =>
+                    form.setFieldValue('job_grade_id', value === 0 ? null : (value ?? null))
+                  }
+                  disabled={!gradesReadReady}
+                  loading={gradesQuery.isLoading || gradesQuery.isFetching}
+                  options={[
+                    { value: 0, label: '未分配职级' },
+                    ...(gradesQuery.data ?? []).map((grade) => ({
+                      value: grade.id,
+                      label: `${grade.code} · ${grade.name}${grade.is_active ? '' : '（已停用）'}`,
+                      disabled: !grade.is_active,
+                      'aria-disabled': !grade.is_active,
+                    })),
+                  ]}
+                  optionFilterProp="label"
+                  placeholder={gradesQuery.isError ? '职级目录不可用' : '请选择启用职级'}
+                  showSearch
+                  virtual={false}
+                />
+              </Form.Item>
+            </>
+          )}
           <Form.Item
             name="position_title"
             label="职位名称"
@@ -393,6 +646,11 @@ export default function EmployeesPage() {
         employee={taxOpeningEmployee}
         open={taxOpeningEmployee !== null}
         onClose={() => setTaxOpeningEmployee(null)}
+      />
+      <SalaryStructureDrawer
+        employee={salaryStructureEmployee}
+        open={salaryStructureEmployee !== null}
+        onClose={() => setSalaryStructureEmployee(null)}
       />
       <Modal
         title="钉钉员工目录预览"

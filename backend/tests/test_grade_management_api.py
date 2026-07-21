@@ -8,6 +8,7 @@ from sqlalchemy import select
 from app.auth.bootstrap import seed_rbac
 from app.auth.permissions import Perm
 from app.core.security import hash_password
+from app.models.audit import AuditLog
 from app.models.auth import Permission, Role, RolePermission, User, UserOrgScope, UserRole
 from app.models.org import OrgType, OrgUnit
 
@@ -411,7 +412,7 @@ def test_inactive_grade_blocks_new_assignments_and_bands_but_not_existing_employ
     reassignment = client.patch(
         f"/api/employees/{ungraded.json()['id']}",
         headers=hr_headers,
-        json={"job_grade_id": grade["id"]},
+        json={"job_grade_id": grade["id"], "expected_version": ungraded.json()["version"]},
     )
     assert reassignment.status_code == 409
 
@@ -430,6 +431,83 @@ def test_inactive_grade_blocks_new_assignments_and_bands_but_not_existing_employ
     assert unrelated_edit.status_code == 200
     assert unrelated_edit.json()["name"] == "Existing employee renamed"
     assert unrelated_edit.json()["job_grade_id"] == grade["id"]
+
+
+def test_employee_grade_assignment_rejects_stale_version(client, hr_headers, store_id):
+    first_grade = _create_grade(client, hr_headers, code="RACE-P1", rank=1)
+    second_grade = _create_grade(client, hr_headers, code="RACE-P2", rank=2)
+    employee = _create_employee(
+        client,
+        hr_headers,
+        emp_no="GRADE-RACE",
+        store_id=store_id,
+    ).json()
+
+    first = client.patch(
+        f"/api/employees/{employee['id']}",
+        headers=hr_headers,
+        json={"job_grade_id": first_grade["id"], "expected_version": employee["version"]},
+    )
+    stale = client.patch(
+        f"/api/employees/{employee['id']}",
+        headers=hr_headers,
+        json={"job_grade_id": second_grade["id"], "expected_version": employee["version"]},
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["version"] == employee["version"] + 1
+    assert stale.status_code == 409, stale.text
+    refreshed = client.get(f"/api/employees/{employee['id']}", headers=hr_headers)
+    assert refreshed.json()["job_grade_id"] == first_grade["id"]
+
+
+def test_employee_grade_assignment_history_is_reconstructable(
+    client, db_session, hr_headers, store_id
+):
+    first_grade = _create_grade(client, hr_headers, code="AUDIT-P1", rank=1)
+    second_grade = _create_grade(client, hr_headers, code="AUDIT-P2", rank=2)
+    created = _create_employee(
+        client,
+        hr_headers,
+        emp_no="GRADE-AUDIT",
+        store_id=store_id,
+        job_grade_id=first_grade["id"],
+    )
+    assert created.status_code == 201, created.text
+    employee = created.json()
+
+    promoted = client.patch(
+        f"/api/employees/{employee['id']}",
+        headers=hr_headers,
+        json={"job_grade_id": second_grade["id"], "expected_version": employee["version"]},
+    )
+    assert promoted.status_code == 200, promoted.text
+    unassigned = client.patch(
+        f"/api/employees/{employee['id']}",
+        headers=hr_headers,
+        json={"job_grade_id": None, "expected_version": promoted.json()["version"]},
+    )
+    assert unassigned.status_code == 200, unassigned.text
+
+    entries = list(
+        db_session.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.target_type == "employee",
+                AuditLog.target_id == employee["id"],
+            )
+            .order_by(AuditLog.id)
+        ).all()
+    )
+    assert entries[0].action == "employee.create"
+    assert entries[0].detail["job_grade_id"] == first_grade["id"]
+    assert [entry.detail["job_grade_assignment"] for entry in entries[1:]] == [
+        {
+            "before_grade_id": first_grade["id"],
+            "after_grade_id": second_grade["id"],
+        },
+        {"before_grade_id": second_grade["id"], "after_grade_id": None},
+    ]
 
 
 def test_salary_band_parent_must_exist(client, hr_headers):

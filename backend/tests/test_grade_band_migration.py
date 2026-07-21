@@ -102,6 +102,15 @@ def test_grade_band_head_enforces_database_integrity(pg_engine) -> None:
             """
             INSERT INTO salary_band
                 (job_grade_id, band_min, band_mid, band_max, effective_from)
+            VALUES (:grade_id, 'NaN'::numeric, 'NaN'::numeric, 'NaN'::numeric, '2026-05-01')
+            """,
+            {"grade_id": grade_id},
+        )
+        _assert_integrity_error(
+            connection,
+            """
+            INSERT INTO salary_band
+                (job_grade_id, band_min, band_mid, band_max, effective_from)
             VALUES (:grade_id, -1, 4000, 5000, '2026-02-01')
             """,
             {"grade_id": grade_id},
@@ -131,6 +140,7 @@ def test_grade_band_head_enforces_database_integrity(pg_engine) -> None:
     [
         ("duplicate", r"(?i)salary_band.*duplicate"),
         ("invalid", r"(?i)salary_band.*invalid"),
+        ("nan", r"(?i)salary_band.*invalid"),
     ],
 )
 def test_grade_band_upgrade_fails_closed_on_dirty_legacy_data(
@@ -162,11 +172,22 @@ def test_grade_band_upgrade_fails_closed_on_dirty_legacy_data(
                     """),
                 {"grade_id": grade_id},
             )
-        else:
+        elif dirty_data == "invalid":
             connection.execute(
                 text("""
                     UPDATE salary_band
                     SET band_min = -1, band_mid = 6000, band_max = 5000
+                    WHERE job_grade_id = :grade_id
+                    """),
+                {"grade_id": grade_id},
+            )
+        else:
+            connection.execute(
+                text("""
+                    UPDATE salary_band
+                    SET band_min = 'NaN'::numeric,
+                        band_mid = 'NaN'::numeric,
+                        band_max = 'NaN'::numeric
                     WHERE job_grade_id = :grade_id
                     """),
                 {"grade_id": grade_id},

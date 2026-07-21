@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const gradeApi = vi.hoisted(() => ({
@@ -22,15 +22,7 @@ vi.mock('../auth/AuthContext', () => ({
   }),
 }))
 vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
-  default: ({
-    open,
-    mode,
-    onApplied,
-  }: {
-    open: boolean
-    mode: string
-    onApplied: () => void
-  }) => {
+  default: ({ open, mode, onApplied }: { open: boolean; mode: string; onApplied: () => void }) => {
     legacyReview.onApplied = onApplied
     return open ? (
       <div role="dialog" aria-label={`旧系统真实数据-${mode}`}>
@@ -77,6 +69,14 @@ async function submitLifecycleAction(row: HTMLElement, name: '停用' | '恢复'
   const dialog = await screen.findByRole('dialog', { name: `${name}职级` })
   fireEvent.change(within(dialog).getByLabelText(`${name}原因`), { target: { value: reason } })
   fireEvent.click(within(dialog).getByRole('button', { name: /OK|确\s*定|确认/i }))
+}
+
+function pressEscape(dialog: HTMLElement) {
+  const wrapper = dialog.closest<HTMLElement>('.ant-modal-wrap')
+  if (!wrapper) throw new Error('modal wrapper did not render')
+  const event = new KeyboardEvent('keydown', { bubbles: true, key: 'Escape', code: 'Escape' })
+  Object.defineProperty(event, 'keyCode', { value: 27 })
+  fireEvent(wrapper, event)
 }
 
 describe('GradesPage', () => {
@@ -150,6 +150,49 @@ describe('GradesPage', () => {
     )
   })
 
+  it('does not close the create modal with Escape while creation is pending', async () => {
+    let resolveCreate: ((value: Record<string, never>) => void) | undefined
+    let form: HTMLFormElement | null = null
+    let replayedSubmit = false
+    gradeApi.createGrade.mockImplementation(() => {
+      if (!replayedSubmit) {
+        replayedSubmit = true
+        if (!form) throw new Error('grade create form was not captured')
+        fireEvent.submit(form)
+      }
+      return new Promise<Record<string, never>>((resolve) => {
+        resolveCreate = resolve
+      })
+    })
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: '新增职级' }))
+    const dialog = await screen.findByRole('dialog', { name: '新增职级' })
+    fireEvent.change(within(dialog).getByLabelText('职级编码'), { target: { value: 'M2' } })
+    fireEvent.change(within(dialog).getByLabelText('职级名称'), { target: { value: '高级主管' } })
+    fireEvent.change(within(dialog).getByLabelText('级别'), { target: { value: '20' } })
+    form = dialog.querySelector('form')
+    if (!form) throw new Error('grade create form did not render')
+    const submit = within(dialog).getByRole('button', { name: /OK|确\s*定/i })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(gradeApi.createGrade).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole('button', { name: /Cancel|取\s*消/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
+    )
+    pressEscape(dialog)
+    expect(screen.getByRole('dialog', { name: '新增职级' })).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: '编辑职级' })).toBeNull()
+
+    if (!resolveCreate) throw new Error('grade creation did not start')
+    resolveCreate({})
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '新增职级' })).toBeNull())
+  })
+
   it('opens reviewed legacy grades only for import-capable writers and refreshes after apply', async () => {
     auth.permissions = ['grade:write', 'import:run']
     const { queryClient } = renderPage()
@@ -196,6 +239,47 @@ describe('GradesPage', () => {
     )
   })
 
+  it('does not close the edit modal with Escape while updating is pending', async () => {
+    let resolveUpdate: ((value: Record<string, never>) => void) | undefined
+    let form: HTMLFormElement | null = null
+    let replayedSubmit = false
+    gradeApi.updateGrade.mockImplementation(() => {
+      if (!replayedSubmit) {
+        replayedSubmit = true
+        if (!form) throw new Error('grade edit form was not captured')
+        fireEvent.submit(form)
+      }
+      return new Promise<Record<string, never>>((resolve) => {
+        resolveUpdate = resolve
+      })
+    })
+    renderPage()
+
+    const row = (await screen.findByText('门店主管')).closest('tr') as HTMLTableRowElement
+    fireEvent.click(within(row).getByRole('button', { name: '编辑' }))
+    const dialog = await screen.findByRole('dialog', { name: '编辑职级' })
+    form = dialog.querySelector('form')
+    if (!form) throw new Error('grade edit form did not render')
+    const submit = within(dialog).getByRole('button', { name: /OK|确\s*定/i })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(gradeApi.updateGrade).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole('button', { name: /Cancel|取\s*消/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
+    )
+    pressEscape(dialog)
+    expect(screen.getByRole('dialog', { name: '编辑职级' })).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: '停用职级' })).toBeNull()
+
+    if (!resolveUpdate) throw new Error('grade update did not start')
+    resolveUpdate({})
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '编辑职级' })).toBeNull())
+  })
+
   it('loads salary bands only on demand and renders the min-mid-max salary rail', async () => {
     renderPage()
 
@@ -211,6 +295,23 @@ describe('GradesPage', () => {
     expect(screen.getAllByText(/5,?000\.00/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/7,?000\.00/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/9,?000\.00/).length).toBeGreaterThan(0)
+  })
+
+  it('uses the refreshed grade state and blocks new bands after concurrent deactivation', async () => {
+    gradeApi.fetchGrades
+      .mockResolvedValueOnce([activeGrade])
+      .mockResolvedValue([{ ...activeGrade, is_active: false, version: 3 }])
+    const { queryClient } = renderPage()
+
+    const row = (await screen.findByText('门店主管')).closest('tr')
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '查看薪档' }))
+    expect(await screen.findByRole('button', { name: '新增薪档' })).toBeTruthy()
+
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: ['grades', 'grade-editor'] })
+    })
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: '新增薪档' })).toBeNull())
   })
 
   it('adds an effective-dated salary band from the selected grade', async () => {
@@ -238,6 +339,98 @@ describe('GradesPage', () => {
     )
   })
 
+  it('closes stale band context and refreshes grades after a 409 conflict', async () => {
+    gradeApi.createSalaryBand.mockRejectedValue({
+      response: { status: 409, data: { detail: '职级已停用，请刷新后重试' } },
+    })
+    renderPage()
+
+    const row = (await screen.findByText('门店主管')).closest('tr')
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '查看薪档' }))
+    fireEvent.click(await screen.findByRole('button', { name: '新增薪档' }))
+    const dialog = await screen.findByRole('dialog', { name: '新增薪档' })
+    fireEvent.change(within(dialog).getByLabelText('生效日期'), {
+      target: { value: '2026-11-01' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('最低薪资'), { target: { value: '6000' } })
+    fireEvent.change(within(dialog).getByLabelText('中位薪资'), { target: { value: '8000' } })
+    fireEvent.change(within(dialog).getByLabelText('最高薪资'), { target: { value: '10000' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() => expect(gradeApi.createSalaryBand).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '新增薪档' })).toBeNull())
+    expect(screen.queryByText('M1 薪档')).toBeNull()
+    expect(await screen.findByText('职级已停用，请刷新后重试')).toBeTruthy()
+    await waitFor(() => expect(gradeApi.fetchGrades.mock.calls.length).toBeGreaterThan(1))
+  })
+
+  it('clears salary band amounts and date after cancelling the modal', async () => {
+    renderPage()
+
+    const row = (await screen.findByText('门店主管')).closest('tr')
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '查看薪档' }))
+    fireEvent.click(await screen.findByRole('button', { name: '新增薪档' }))
+    const firstDialog = await screen.findByRole('dialog', { name: '新增薪档' })
+    fireEvent.change(within(firstDialog).getByLabelText('生效日期'), {
+      target: { value: '2026-09-01' },
+    })
+    fireEvent.change(within(firstDialog).getByLabelText('最低薪资'), { target: { value: '6100' } })
+    fireEvent.change(within(firstDialog).getByLabelText('中位薪资'), { target: { value: '8100' } })
+    fireEvent.change(within(firstDialog).getByLabelText('最高薪资'), { target: { value: '10100' } })
+    fireEvent.click(within(firstDialog).getByRole('button', { name: /Cancel|取\s*消/i }))
+    fireEvent.click(screen.getByRole('button', { name: '新增薪档' }))
+    const nextDialog = await screen.findByRole('dialog', { name: '新增薪档' })
+
+    ;['生效日期', '最低薪资', '中位薪资', '最高薪资'].forEach((label) => {
+      expect((within(nextDialog).getByLabelText(label) as HTMLInputElement).value).toBe('')
+    })
+    expect(gradeApi.createSalaryBand).not.toHaveBeenCalled()
+  })
+
+  it('locks the salary band modal and prevents duplicate finish events while creation is pending', async () => {
+    let resolveCreate: ((value: Record<string, never>) => void) | undefined
+    gradeApi.createSalaryBand.mockImplementation(
+      () =>
+        new Promise<Record<string, never>>((resolve) => {
+          resolveCreate = resolve
+        }),
+    )
+    renderPage()
+
+    const row = (await screen.findByText('门店主管')).closest('tr')
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '查看薪档' }))
+    fireEvent.click(await screen.findByRole('button', { name: '新增薪档' }))
+    const dialog = await screen.findByRole('dialog', { name: '新增薪档' })
+    fireEvent.change(within(dialog).getByLabelText('生效日期'), {
+      target: { value: '2026-10-01' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('最低薪资'), { target: { value: '6200' } })
+    fireEvent.change(within(dialog).getByLabelText('中位薪资'), { target: { value: '8200' } })
+    fireEvent.change(within(dialog).getByLabelText('最高薪资'), { target: { value: '10200' } })
+    const cancel = within(dialog).getByRole('button', { name: /Cancel|取\s*消/i })
+    const submit = within(dialog).getByRole('button', { name: /OK|确\s*定/i })
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(gradeApi.createSalaryBand).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect((cancel as HTMLButtonElement).disabled).toBe(true))
+    expect((submit as HTMLButtonElement).disabled).toBe(true)
+    expect(within(dialog).queryByRole('button', { name: /Close|关闭/i })).toBeNull()
+
+    fireEvent.click(cancel)
+    const form = dialog.querySelector('form')
+    if (!form) throw new Error('salary band form did not render')
+    fireEvent.submit(form)
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    expect(gradeApi.createSalaryBand).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('dialog', { name: '新增薪档' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '新增薪档' })).toBeNull()
+
+    if (!resolveCreate) throw new Error('salary band mutation did not start')
+    resolveCreate({})
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '新增薪档' })).toBeNull())
+  })
+
   it('deactivates and restores grades with optimistic concurrency', async () => {
     renderPage()
 
@@ -263,6 +456,50 @@ describe('GradesPage', () => {
         expected_version: 4,
       }),
     )
+  })
+
+  it('does not close the lifecycle modal with Escape while its mutation is pending', async () => {
+    let resolveDeactivate: ((value: Record<string, never>) => void) | undefined
+    let form: HTMLFormElement | null = null
+    let replayedSubmit = false
+    gradeApi.deactivateGrade.mockImplementation(() => {
+      if (!replayedSubmit) {
+        replayedSubmit = true
+        if (!form) throw new Error('grade lifecycle form was not captured')
+        fireEvent.submit(form)
+      }
+      return new Promise<Record<string, never>>((resolve) => {
+        resolveDeactivate = resolve
+      })
+    })
+    renderPage()
+
+    const row = (await screen.findByText('门店主管')).closest('tr') as HTMLTableRowElement
+    fireEvent.click(within(row).getByRole('button', { name: '停用' }))
+    const dialog = await screen.findByRole('dialog', { name: '停用职级' })
+    fireEvent.change(within(dialog).getByLabelText('停用原因'), {
+      target: { value: '等待服务端确认' },
+    })
+    form = dialog.querySelector('form')
+    if (!form) throw new Error('grade lifecycle form did not render')
+    const submit = within(dialog).getByRole('button', { name: /OK|确\s*定|确认/i })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(gradeApi.deactivateGrade).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole('button', { name: /Cancel|取\s*消/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
+    )
+    pressEscape(dialog)
+    expect(screen.getByRole('dialog', { name: '停用职级' })).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: '编辑职级' })).toBeNull()
+
+    if (!resolveDeactivate) throw new Error('grade lifecycle mutation did not start')
+    resolveDeactivate({})
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '停用职级' })).toBeNull())
   })
 
   it('keeps maintenance actions away from read-only users while retaining band visibility', async () => {

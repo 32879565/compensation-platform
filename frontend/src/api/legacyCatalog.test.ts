@@ -24,6 +24,7 @@ describe('legacy catalog review API', () => {
     const payload = {
       source_field: '综合薪资',
       expected_record_count: 68245,
+      expected_source_snapshot_id: 'a'.repeat(32),
       confirmed_by_hr: true as const,
       reason: '经薪酬负责人核对旧系统字段',
       component: {
@@ -47,6 +48,7 @@ describe('legacy catalog review API', () => {
     const payload = {
       source_position: '服务员',
       expected_record_count: 19486,
+      expected_source_snapshot_id: 'b'.repeat(32),
       policy_confirmation: 'HR_CONFIRMED' as const,
       reason: '人事确认职位映射及现行薪档政策',
       grade: { code: 'STORE-P1', name: '门店一职级', rank: 10 },

@@ -148,7 +148,7 @@ def test_component_update_rejects_explicit_null_for_nonnullable_fields(client, d
     response = client.patch(
         f"/api/salary-components/{component['id']}",
         headers=headers,
-        json={field: None},
+        json={"expected_updated_at": component["updated_at"], field: None},
     )
 
     assert response.status_code == 422
@@ -181,7 +181,7 @@ def test_component_calculation_flags_are_immutable_after_payroll_use(client, db_
     changed_basis = client.patch(
         f"/api/salary-components/{component['id']}",
         headers=headers,
-        json={"taxable": False},
+        json={"expected_updated_at": component["updated_at"], "taxable": False},
     )
 
     assert changed_basis.status_code == 409
@@ -192,11 +192,41 @@ def test_component_calculation_flags_are_immutable_after_payroll_use(client, db_
     renamed = client.patch(
         f"/api/salary-components/{component['id']}",
         headers=headers,
-        json={"name": "Historical base label", "sort_order": 10},
+        json={
+            "expected_updated_at": component["updated_at"],
+            "name": "Historical base label",
+            "sort_order": 10,
+        },
     )
     assert renamed.status_code == 200, renamed.text
     assert renamed.json()["name"] == "Historical base label"
     assert renamed.json()["taxable"] is True
+
+
+def test_legacy_payroll_snapshot_does_not_lock_a_component_added_later(client, db_session):
+    employee = _employee(db_session)
+    _user(db_session, "hr-component-after-result", ["GROUP_HR"])
+    headers = _token(client, "hr-component-after-result")
+    _reopened_batch_with_prior_result(db_session, employee)
+
+    component = client.post(
+        "/api/salary-components",
+        headers=headers,
+        json={"code": "FUTURE_BASE", "name": "Future base", "component_type": "BASE"},
+    ).json()
+    initialized = client.put(
+        f"/api/employees/{employee.id}/initial-structure",
+        headers=headers,
+        json={
+            "effective_from": "2026-06-01",
+            "items": [{"component_id": component["id"], "amount": "5200"}],
+        },
+    )
+    assert initialized.status_code == 201, initialized.text
+
+    fetched = client.get("/api/salary-components", headers=headers).json()
+    future_component = next(item for item in fetched if item["id"] == component["id"])
+    assert future_component["calculation_locked"] is False
 
 
 def test_adjustment_creator_can_read_component_catalog_without_salary_structure_access(
@@ -249,7 +279,10 @@ def test_allowance_component_requires_a_kind_and_manual_evidence(client, db_sess
     reclassified = client.patch(
         f"/api/salary-components/{allowance['id']}",
         headers=headers,
-        json={"allowance_kind": "FLOATING"},
+        json={
+            "expected_updated_at": allowance["updated_at"],
+            "allowance_kind": "FLOATING",
+        },
     )
     assert reclassified.status_code == 200
     assert reclassified.json()["allowance_kind"] == "FLOATING"
@@ -257,7 +290,10 @@ def test_allowance_component_requires_a_kind_and_manual_evidence(client, db_sess
     prorated = client.patch(
         f"/api/salary-components/{allowance['id']}",
         headers=headers,
-        json={"prorate_by_attendance": False},
+        json={
+            "expected_updated_at": reclassified.json()["updated_at"],
+            "prorate_by_attendance": False,
+        },
     )
     assert prorated.status_code == 200
     assert prorated.json()["prorate_by_attendance"] is False
@@ -270,7 +306,10 @@ def test_allowance_component_requires_a_kind_and_manual_evidence(client, db_sess
     invalid_non_allowance = client.patch(
         f"/api/salary-components/{base['id']}",
         headers=headers,
-        json={"prorate_by_attendance": True},
+        json={
+            "expected_updated_at": base["updated_at"],
+            "prorate_by_attendance": True,
+        },
     )
     assert invalid_non_allowance.status_code == 422
 

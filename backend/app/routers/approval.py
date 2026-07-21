@@ -317,6 +317,25 @@ def _visible_adjustment_or_404(
     return adjustment
 
 
+def _active_component_for_new_reference(session: Session, component_id: int) -> SalaryComponentDef:
+    """Lock and validate the catalog row before creating or applying a reference."""
+
+    component = session.scalars(
+        select(SalaryComponentDef)
+        .where(SalaryComponentDef.id == component_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    ).first()
+    if component is None:
+        raise HTTPException(status_code=404, detail="Salary component not found")
+    if component.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Salary component is inactive",
+        )
+    return component
+
+
 def _require_adjustment_reader_or_creator(principal: Principal) -> None:
     if not (
         principal.has_permission(Perm.ADJUSTMENT_READ)
@@ -458,9 +477,7 @@ def create_salary_adjustment(
         employee_id=body.employee_id,
         permission=Perm.ADJUSTMENT_CREATE,
     )
-    component = session.get(SalaryComponentDef, body.component_id)
-    if component is None or component.is_deleted:
-        raise HTTPException(status_code=404, detail="Salary component not found")
+    component = _active_component_for_new_reference(session, body.component_id)
     before_snapshot = _structure_snapshot(
         session,
         employee_id=employee.id,
@@ -558,6 +575,7 @@ def submit_salary_adjustment(
         raise HTTPException(
             status_code=409, detail="Only draft salary adjustments may be submitted"
         )
+    _active_component_for_new_reference(session, adjustment.component_id)
     try:
         flow, steps = approvals.select_flow(
             session,
@@ -754,6 +772,7 @@ def decide_approval_instance(
                         "cancel and resubmit the adjustment"
                     ),
                 )
+            _active_component_for_new_reference(session, adjustment.component_id)
             # Snapshot comparison and the later structure append share the same
             # locked employee parent row.  Otherwise two final approvals can both
             # accept an old snapshot while one waits to write behind the other.

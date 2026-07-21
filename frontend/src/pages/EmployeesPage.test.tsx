@@ -49,11 +49,22 @@ import EmployeesPage, { isKnownSpecialPosition } from './EmployeesPage'
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <EmployeesPage />
-    </QueryClientProvider>,
-  )
+  return {
+    ...render(
+      <QueryClientProvider client={queryClient}>
+        <EmployeesPage />
+      </QueryClientProvider>,
+    ),
+    queryClient,
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((accept) => {
+    resolve = accept
+  })
+  return { promise, resolve }
 }
 
 describe('EmployeesPage safe edits', () => {
@@ -75,6 +86,7 @@ describe('EmployeesPage safe edits', () => {
       items: [
         {
           id: 17,
+          version: 4,
           emp_no: 'E0017',
           name: '陈星',
           org_unit_id: 3,
@@ -131,6 +143,19 @@ describe('EmployeesPage safe edits', () => {
 
   afterEach(cleanup)
 
+  it('lets keyboard users horizontally scroll the employee directory', async () => {
+    renderPage()
+
+    const region = await screen.findByRole('region', { name: '员工岗位目录' })
+    expect(region.tabIndex).toBe(0)
+    region.scrollLeft = 0
+    fireEvent.keyDown(region, { key: 'ArrowRight', code: 'ArrowRight' })
+    expect(region.scrollLeft).toBeGreaterThan(0)
+    const afterRight = region.scrollLeft
+    fireEvent.keyDown(region, { key: 'ArrowLeft', code: 'ArrowLeft' })
+    expect(region.scrollLeft).toBeLessThan(afterRight)
+  })
+
   it('never prefills masked PII and sends only fields actually changed by the editor', async () => {
     renderPage()
 
@@ -147,8 +172,189 @@ describe('EmployeesPage safe edits', () => {
       expect(masterdataApi.updateEmployee).toHaveBeenCalledWith(17, {
         position_title: '储备店长',
         is_special_position: true,
+        expected_version: 4,
       }),
     )
+  })
+
+  it('uses a synchronous latch to collapse rapid save clicks into one request', async () => {
+    const save = deferred<Record<string, never>>()
+    masterdataApi.updateEmployee.mockReturnValueOnce(save.promise)
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    fireEvent.change(screen.getByLabelText('姓名'), { target: { value: '陈星（单次提交）' } })
+    const confirm = screen.getByRole('button', { name: /OK|确\s*定/i })
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+
+    await waitFor(() => expect(masterdataApi.updateEmployee).toHaveBeenCalledTimes(1))
+    expect(masterdataApi.updateEmployee).toHaveBeenCalledWith(17, {
+      name: '陈星（单次提交）',
+      expected_version: 4,
+    })
+
+    save.resolve({})
+    await waitFor(() => expect(screen.queryByLabelText('姓名')).toBeNull())
+  })
+
+  it('recovers from a version conflict before allowing the employee to be edited again', async () => {
+    masterdataApi.updateEmployee
+      .mockRejectedValueOnce({
+        response: { status: 409, data: { detail: '员工已被其他操作更新' } },
+      })
+      .mockResolvedValueOnce({})
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    const stalePage = await masterdataApi.fetchEmployees.mock.results[0].value
+    const refreshedPage = {
+      ...stalePage,
+      items: stalePage.items.map((employee: { id: number }) =>
+        employee.id === 17 ? { ...employee, version: 5, name: '陈星（已刷新）' } : employee,
+      ),
+    }
+    const refresh = deferred<typeof refreshedPage>()
+    masterdataApi.fetchEmployees.mockImplementationOnce(() => refresh.promise)
+    masterdataApi.fetchEmployees.mockResolvedValue(refreshedPage)
+    fireEvent.change(screen.getByLabelText('姓名'), { target: { value: '陈星（冲突编辑）' } })
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() =>
+      expect(masterdataApi.updateEmployee).toHaveBeenNthCalledWith(1, 17, {
+        name: '陈星（冲突编辑）',
+        expected_version: 4,
+      }),
+    )
+    await waitFor(() => expect(screen.queryByLabelText('姓名')).toBeNull())
+    await waitFor(() => expect(masterdataApi.fetchEmployees).toHaveBeenCalledTimes(2))
+    expect((screen.getByRole('button', { name: /编\s*辑/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect((screen.getByRole('button', { name: /删\s*除/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect((screen.getByRole('button', { name: '新增员工' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    fireEvent.click(screen.getByRole('button', { name: /编\s*辑/ }))
+    expect(screen.queryByLabelText('姓名')).toBeNull()
+
+    refresh.resolve(refreshedPage)
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: /编\s*辑/ }) as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    )
+    expect(await screen.findByText('陈星（已刷新）')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /编\s*辑/ }))
+    expect(((await screen.findByLabelText('姓名')) as HTMLInputElement).value).toBe(
+      '陈星（已刷新）',
+    )
+    fireEvent.change(screen.getByLabelText('姓名'), { target: { value: '陈星（最终编辑）' } })
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() =>
+      expect(masterdataApi.updateEmployee).toHaveBeenNthCalledWith(2, 17, {
+        name: '陈星（最终编辑）',
+        expected_version: 5,
+      }),
+    )
+  })
+
+  it('keeps employee writes disabled until a successful save refetch completes', async () => {
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    const currentPage = await masterdataApi.fetchEmployees.mock.results[0].value
+    const refreshedPage = {
+      ...currentPage,
+      items: currentPage.items.map((employee: { id: number }) =>
+        employee.id === 17 ? { ...employee, version: 5, name: '陈星（保存后）' } : employee,
+      ),
+    }
+    const refresh = deferred<typeof refreshedPage>()
+    masterdataApi.fetchEmployees.mockImplementationOnce(() => refresh.promise)
+    masterdataApi.fetchEmployees.mockResolvedValue(refreshedPage)
+    fireEvent.change(screen.getByLabelText('姓名'), { target: { value: '陈星（保存后）' } })
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() => expect(masterdataApi.fetchEmployees).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByLabelText('姓名')).toBeNull())
+    expect((screen.getByRole('button', { name: /编\s*辑/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect((screen.getByRole('button', { name: /删\s*除/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect((screen.getByRole('button', { name: '新增员工' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+
+    refresh.resolve(refreshedPage)
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: /编\s*辑/ }) as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    )
+    expect(await screen.findByText('陈星（保存后）')).toBeTruthy()
+  })
+
+  it('retains the employee form after a non-conflict save failure', async () => {
+    masterdataApi.updateEmployee.mockRejectedValueOnce({
+      response: { status: 422, data: { detail: '员工数据无效' } },
+    })
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    fireEvent.change(screen.getByLabelText('姓名'), { target: { value: '陈星（待修正）' } })
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() => expect(masterdataApi.updateEmployee).toHaveBeenCalledTimes(1))
+    expect((screen.getByLabelText('姓名') as HTMLInputElement).value).toBe('陈星（待修正）')
+    expect(masterdataApi.fetchEmployees).toHaveBeenCalledTimes(1)
+  })
+
+  it('retains a new employee form when create returns a 409 business conflict', async () => {
+    masterdataApi.createEmployee.mockRejectedValueOnce({
+      response: { status: 409, data: { detail: '工号已存在' } },
+    })
+    renderPage()
+
+    const createButton = await screen.findByRole('button', { name: '新增员工' })
+    await waitFor(() => expect((createButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(createButton)
+    fireEvent.change(await screen.findByLabelText('工号'), { target: { value: 'E0099' } })
+    fireEvent.change(screen.getByLabelText('姓名'), { target: { value: '林月' } })
+    fireEvent.mouseDown(screen.getByLabelText('所属组织'))
+    fireEvent.click(await screen.findByRole('option', { name: '三店' }))
+    fireEvent.change(screen.getByLabelText('入职日期'), { target: { value: '2026-07-01' } })
+    expect((screen.getByLabelText('工号') as HTMLInputElement).value).toBe('E0099')
+    expect((screen.getByLabelText('姓名') as HTMLInputElement).value).toBe('林月')
+    expect((screen.getByLabelText('入职日期') as HTMLInputElement).value).toBe('2026-07-01')
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() => expect(masterdataApi.createEmployee).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText('工号已存在')).toBeTruthy()
+    expect((screen.getByLabelText('工号') as HTMLInputElement).value).toBe('E0099')
+    expect((screen.getByLabelText('姓名') as HTMLInputElement).value).toBe('林月')
+    expect((screen.getByLabelText('入职日期') as HTMLInputElement).value).toBe('2026-07-01')
+    expect(masterdataApi.fetchEmployees).toHaveBeenCalledTimes(1)
+  })
+
+  it('handles a null save rejection without replacing the original form', async () => {
+    masterdataApi.updateEmployee.mockRejectedValueOnce(null)
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    fireEvent.change(screen.getByLabelText('姓名'), { target: { value: '陈星（继续修正）' } })
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() => expect(masterdataApi.updateEmployee).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText('保存失败')).toBeTruthy()
+    expect((screen.getByLabelText('姓名') as HTMLInputElement).value).toBe('陈星（继续修正）')
+    expect(masterdataApi.fetchEmployees).toHaveBeenCalledTimes(1)
   })
 
   it('blocks confirmation when the DingTalk directory preview is truncated', async () => {
@@ -205,6 +411,43 @@ describe('EmployeesPage safe edits', () => {
     await waitFor(() =>
       expect(masterdataApi.updateEmployee).toHaveBeenCalledWith(17, {
         job_grade_id: 101,
+        expected_version: 4,
+      }),
+    )
+  })
+
+  it('fails closed when the grade catalog changes after a new grade was selected', async () => {
+    auth.permissions = ['employee:write', 'grade:read']
+    const { queryClient } = renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    const gradeSelect = await screen.findByLabelText('员工职级')
+    fireEvent.mouseDown(gradeSelect)
+    fireEvent.click(await screen.findByRole('option', { name: /G01.*初级职级/ }))
+    masterdataApi.fetchGrades.mockRejectedValueOnce(new Error('grade catalog unavailable'))
+    await queryClient.invalidateQueries({ queryKey: ['grades'] })
+    expect(await screen.findByText('职级目录加载失败，已禁止修改职级')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() => expect(masterdataApi.updateEmployee).not.toHaveBeenCalled())
+    expect(await screen.findByText('职级目录尚未完整读取，已禁止修改员工职级')).toBeTruthy()
+  })
+
+  it('can explicitly remove an incorrect employee grade assignment', async () => {
+    auth.permissions = ['employee:write', 'grade:read']
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /编\s*辑/ }))
+    const gradeSelect = await screen.findByLabelText('员工职级')
+    fireEvent.mouseDown(gradeSelect)
+    fireEvent.click(await screen.findByRole('option', { name: '未分配职级' }))
+    fireEvent.click(screen.getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() =>
+      expect(masterdataApi.updateEmployee).toHaveBeenCalledWith(17, {
+        job_grade_id: null,
+        expected_version: 4,
       }),
     )
   })

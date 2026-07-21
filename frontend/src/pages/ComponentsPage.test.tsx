@@ -27,15 +27,7 @@ vi.mock('../auth/AuthContext', () => ({
   }),
 }))
 vi.mock('../components/LegacyCatalogReviewDrawer', () => ({
-  default: ({
-    open,
-    mode,
-    onApplied,
-  }: {
-    open: boolean
-    mode: string
-    onApplied: () => void
-  }) => {
+  default: ({ open, mode, onApplied }: { open: boolean; mode: string; onApplied: () => void }) => {
     legacyReview.onApplied = onApplied
     return open ? (
       <div role="dialog" aria-label={`旧系统真实数据-${mode}`}>
@@ -62,6 +54,14 @@ async function submitLifecycleAction(row: HTMLElement, name: '停用' | '恢复'
   const dialog = await screen.findByRole('dialog', { name: `${name}薪资组件` })
   fireEvent.change(within(dialog).getByLabelText(`${name}原因`), { target: { value: reason } })
   fireEvent.click(within(dialog).getByRole('button', { name: /OK|确\s*定|确认/i }))
+}
+
+function pressEscape(dialog: HTMLElement) {
+  const wrapper = dialog.closest<HTMLElement>('.ant-modal-wrap')
+  if (!wrapper) throw new Error('modal wrapper did not render')
+  const event = new KeyboardEvent('keydown', { bubbles: true, key: 'Escape', code: 'Escape' })
+  Object.defineProperty(event, 'keyCode', { value: 27 })
+  fireEvent(wrapper, event)
 }
 
 describe('ComponentsPage', () => {
@@ -114,9 +114,7 @@ describe('ComponentsPage', () => {
 
     expect(screen.getByRole('dialog', { name: '旧系统真实数据-components' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '模拟应用真实数据' }))
-    await waitFor(() =>
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['components', 'hr'] }),
-    )
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['components', 'hr'] }))
     expect(screen.queryByRole('dialog', { name: '旧系统真实数据-components' })).toBeNull()
   })
 
@@ -267,6 +265,132 @@ describe('ComponentsPage', () => {
     )
   })
 
+  it('prevents duplicate component creation in the same render frame', async () => {
+    let resolveCreate: ((value: Record<string, never>) => void) | undefined
+    let form: HTMLFormElement | null = null
+    let replayedSubmit = false
+    compApi.createComponent.mockImplementation(() => {
+      if (!replayedSubmit) {
+        replayedSubmit = true
+        if (!form) throw new Error('component create form was not captured')
+        fireEvent.submit(form)
+      }
+      return new Promise<Record<string, never>>((resolve) => {
+        resolveCreate = resolve
+      })
+    })
+    renderPage()
+
+    const open = await screen.findByRole('button', { name: '新增组件' })
+    await waitFor(() => expect((open as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(open)
+    const dialog = await screen.findByRole('dialog', { name: '新增薪资组件' })
+    fireEvent.change(within(dialog).getByLabelText('编码'), { target: { value: 'BASE' } })
+    fireEvent.change(within(dialog).getByLabelText('名称'), { target: { value: '基本工资' } })
+    fireEvent.mouseDown(within(dialog).getByLabelText('类型'))
+    fireEvent.click(await screen.findByText('基本'))
+    form = dialog.querySelector('form')
+    if (!form) throw new Error('component create form did not render')
+    const submit = within(dialog).getByRole('button', { name: /OK|确\s*定/i })
+
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(compApi.createComponent).toHaveBeenCalled())
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(compApi.createComponent).toHaveBeenCalledTimes(1)
+
+    if (!resolveCreate) throw new Error('component creation did not start')
+    resolveCreate({})
+  })
+
+  it('keeps the edit modal isolated while its mutation is pending', async () => {
+    let resolveUpdate: ((value: Record<string, never>) => void) | undefined
+    let form: HTMLFormElement | null = null
+    let replayedSubmit = false
+    compApi.updateComponent.mockImplementation(() => {
+      if (!replayedSubmit) {
+        replayedSubmit = true
+        if (!form) throw new Error('component edit form was not captured')
+        fireEvent.submit(form)
+      }
+      return new Promise<Record<string, never>>((resolve) => {
+        resolveUpdate = resolve
+      })
+    })
+    renderPage()
+
+    const row = (await screen.findByText('餐补')).closest('tr') as HTMLTableRowElement
+    fireEvent.click(within(row).getByRole('button', { name: '编辑' }))
+    const dialog = await screen.findByRole('dialog', { name: '编辑薪资组件' })
+    form = dialog.querySelector('form')
+    if (!form) throw new Error('component edit form did not render')
+    const submit = within(dialog).getByRole('button', { name: /OK|确\s*定/i })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(compApi.updateComponent).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole('button', { name: /Cancel|取\s*消/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
+    )
+    pressEscape(dialog)
+
+    expect(screen.getByRole('dialog', { name: '编辑薪资组件' })).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: '停用薪资组件' })).toBeNull()
+
+    if (!resolveUpdate) throw new Error('component update did not start')
+    resolveUpdate({})
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '编辑薪资组件' })).toBeNull())
+  })
+
+  it('keeps the lifecycle modal isolated while its mutation is pending', async () => {
+    let resolveDeactivate: ((value: Record<string, never>) => void) | undefined
+    let form: HTMLFormElement | null = null
+    let replayedSubmit = false
+    compApi.deactivateComponent.mockImplementation(() => {
+      if (!replayedSubmit) {
+        replayedSubmit = true
+        if (!form) throw new Error('component lifecycle form was not captured')
+        fireEvent.submit(form)
+      }
+      return new Promise<Record<string, never>>((resolve) => {
+        resolveDeactivate = resolve
+      })
+    })
+    renderPage()
+
+    const row = (await screen.findByText('餐补')).closest('tr') as HTMLTableRowElement
+    fireEvent.click(within(row).getByRole('button', { name: '停用' }))
+    const dialog = await screen.findByRole('dialog', { name: '停用薪资组件' })
+    fireEvent.change(within(dialog).getByLabelText('停用原因'), {
+      target: { value: '待服务端确认停用' },
+    })
+    form = dialog.querySelector('form')
+    if (!form) throw new Error('component lifecycle form did not render')
+    const submit = within(dialog).getByRole('button', { name: /OK|确\s*定|确认/i })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(compApi.deactivateComponent).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole('button', { name: /Cancel|取\s*消/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
+    )
+    pressEscape(dialog)
+
+    expect(screen.getByRole('dialog', { name: '停用薪资组件' })).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: '编辑薪资组件' })).toBeNull()
+
+    if (!resolveDeactivate) throw new Error('component lifecycle mutation did not start')
+    resolveDeactivate({})
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '停用薪资组件' })).toBeNull())
+  })
+
   it('explains and disables historical calculation fields while keeping descriptive fields editable', async () => {
     compApi.fetchComponents.mockResolvedValue([
       {
@@ -332,7 +456,7 @@ describe('ComponentsPage', () => {
     renderPage()
 
     const row = (await screen.findByText('历史补贴')).closest('tr')
-    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '编辑' }))
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '补齐分类' }))
     const dialog = await screen.findByRole('dialog', { name: '编辑薪资组件' })
 
     expect((within(dialog).getByLabelText('补贴方式') as HTMLInputElement).disabled).toBe(false)
@@ -351,6 +475,56 @@ describe('ComponentsPage', () => {
         expected_updated_at: '2026-07-21T06:30:00Z',
         allowance_kind: 'FIXED',
         reason: '依据原补贴审批单补录分类',
+      }),
+    )
+  })
+
+  it('requires reasoned classification before lifecycle even when legacy allowance is unlocked', async () => {
+    compApi.fetchComponents.mockResolvedValue([
+      {
+        id: 7,
+        code: 'LEGACY_UNLOCKED',
+        name: '未分类历史补贴',
+        component_type: 'ALLOWANCE',
+        allowance_kind: null,
+        taxable: true,
+        in_social_base: false,
+        in_housing_base: false,
+        prorate_by_attendance: false,
+        sort_order: 5,
+        is_active: true,
+        deactivated_at: null,
+        updated_at: '2026-07-21T06:40:00Z',
+        calculation_locked: false,
+        calculation_lock_reason: null,
+      },
+    ])
+    renderPage()
+
+    const row = (await screen.findByText('未分类历史补贴')).closest('tr') as HTMLTableRowElement
+    expect((within(row).getByRole('button', { name: '停用' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    fireEvent.click(within(row).getByRole('button', { name: '补齐分类' }))
+    const dialog = await screen.findByRole('dialog', { name: '编辑薪资组件' })
+    fireEvent.mouseDown(within(dialog).getByLabelText('补贴方式'))
+    fireEvent.click(await screen.findByText('浮动补贴（变量）'))
+    fireEvent.change(within(dialog).getByLabelText('历史补贴分类原因'), {
+      target: { value: '依据旧审批台账确认' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: /OK|确\s*定/i }))
+
+    await waitFor(() =>
+      expect(compApi.updateComponent).toHaveBeenCalledWith(7, {
+        name: '未分类历史补贴',
+        allowance_kind: 'FLOATING',
+        prorate_by_attendance: false,
+        taxable: true,
+        in_social_base: false,
+        in_housing_base: false,
+        sort_order: 5,
+        expected_updated_at: '2026-07-21T06:40:00Z',
+        reason: '依据旧审批台账确认',
       }),
     )
   })

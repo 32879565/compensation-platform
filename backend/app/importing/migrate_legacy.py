@@ -15,16 +15,23 @@ import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from app.importing.parser import clean_text, normalize_store_name, parse_money, standard_store_name
+from app.importing.parser import (
+    clean_text,
+    normalize_store_name,
+    parse_money,
+    standard_store_name,
+)
+from app.importing.source_lock import lock_legacy_salary_dataset
 from app.importing.store_aliases import STORE_ALIASES
 from app.models.org import OrgType, OrgUnit
 from app.models.salary import SalaryRecord, SalarySource
 
 _META_KEYS = {"月份", "姓名", "门店", "标准门店", "工作表", "来源文件"}
 _PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_LOAD_REVISION = "089dead90284"
 
 
 @dataclass
@@ -44,6 +51,14 @@ class LegacyMigrationError(ValueError):
         super().__init__(f"历史薪资迁移校验失败：{'；'.join(issues)}")
 
 
+class LegacyAlreadyMigrated(LegacyMigrationError):
+    """Raised under the dataset lock when historical rows already exist."""
+
+    def __init__(self, record_count: int):
+        self.record_count = record_count
+        super().__init__([f"已存在 {record_count} 条历史记录"])
+
+
 @dataclass(frozen=True)
 class _LegacyRow:
     period: str
@@ -51,6 +66,19 @@ class _LegacyRow:
     store_name: str
     fields: dict
     total_cost: Decimal
+
+
+def assert_legacy_load_revision(session: Session) -> None:
+    """Fail closed unless the CLI is run at the pre-backfill S6 revision."""
+
+    revision = session.scalar(text("SELECT version_num FROM alembic_version"))
+    if revision != _LOAD_REVISION:
+        raise LegacyMigrationError(
+            [
+                "目标库必须先执行 alembic upgrade 089dead90284，导入完成后再执行 "
+                f"alembic upgrade head；当前版本为 {revision or 'unknown'}"
+            ]
+        )
 
 
 def _canonical_store_name(row: dict) -> str:
@@ -138,6 +166,14 @@ def load_legacy_rows(sqlite_path: str) -> list[dict]:
 
 
 def migrate_rows(session: Session, legacy_rows: list[dict]) -> MigrationReport:
+    lock_legacy_salary_dataset(session)
+    existing = session.scalar(
+        select(func.count())
+        .select_from(SalaryRecord)
+        .where(SalaryRecord.source == SalarySource.HISTORICAL)
+    )
+    if existing:
+        raise LegacyAlreadyMigrated(int(existing))
     normalized_rows = _validate_legacy_rows(legacy_rows)
     org_by_name = {
         name: oid
@@ -192,16 +228,13 @@ def main() -> None:  # pragma: no cover - CLI 入口
 
     legacy_rows = load_legacy_rows(args.sqlite)
     with SessionLocal() as session:
-        # 幂等保护：若已迁移过历史数据则拒绝重复
-        existing = session.scalar(
-            select(func.count())
-            .select_from(SalaryRecord)
-            .where(SalaryRecord.source == SalarySource.HISTORICAL)
-        )
-        if existing:
-            print(f"已存在 {existing} 条历史记录，跳过迁移（如需重迁请先清理）。")
+        assert_legacy_load_revision(session)
+        try:
+            report = migrate_rows(session, legacy_rows)
+        except LegacyAlreadyMigrated as exc:
+            session.rollback()
+            print(f"已存在 {exc.record_count} 条历史记录，跳过迁移（如需重迁请先清理）。")
             return
-        report = migrate_rows(session, legacy_rows)
         session.commit()
     print(
         f"历史迁移完成：源 {report.total_rows} 行 → 写入 {report.written} 条，"

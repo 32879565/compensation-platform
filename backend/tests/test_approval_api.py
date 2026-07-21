@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -12,7 +12,7 @@ from app.auth.permissions import Perm
 from app.core.security import hash_password
 from app.models.approval import ApprovalBusinessType, ApprovalFlow
 from app.models.auth import Permission, Role, RolePermission, User, UserOrgScope, UserRole
-from app.models.comp import EmployeeSalaryStructure
+from app.models.comp import EmployeeSalaryStructure, SalaryComponentDef
 from app.models.employee import Employee
 from app.models.org import OrgType, OrgUnit
 
@@ -195,6 +195,58 @@ def test_salary_adjustment_requires_separate_approvers_and_writes_only_after_fin
         regional_approver.id,
         _group_hr.id,
     ]
+
+
+def test_final_salary_adjustment_approval_rechecks_component_activity(client, db_session):
+    region, _store, employee = _employee_in_region(db_session)
+    _user(db_session, "inactive-requester", ["REGION_MANAGER"], org_scope_id=region.id)
+    _user(
+        db_session,
+        "inactive-regional-approver",
+        ["REGION_MANAGER"],
+        org_scope_id=region.id,
+    )
+    _user(db_session, "inactive-group-hr", ["GROUP_HR"])
+    group_headers = _token(client, "inactive-group-hr")
+    component = _component(client, group_headers)
+    _flow(client, group_headers, region.id)
+    adjustment = _create_adjustment(
+        client,
+        _token(client, "inactive-requester"),
+        employee.id,
+        component["id"],
+    )
+    submitted = client.post(
+        f"/api/salary-adjustments/{adjustment['id']}/submit",
+        headers=_token(client, "inactive-requester"),
+    )
+    assert submitted.status_code == 200, submitted.text
+    instance_id = submitted.json()["approval_instance_id"]
+    first_approval = client.post(
+        f"/api/approval-instances/{instance_id}/decisions",
+        headers=_token(client, "inactive-regional-approver"),
+        json={"decision": "APPROVE", "comment": "Regional review complete"},
+    )
+    assert first_approval.status_code == 200, first_approval.text
+
+    # Simulate an inactive catalog row inherited from a legacy deployment.
+    # The lifecycle endpoint itself rejects deactivation while this request is
+    # pending, but final approval must still defend against pre-existing data.
+    stored_component = db_session.get(SalaryComponentDef, component["id"])
+    assert stored_component is not None
+    stored_component.is_deleted = True
+    stored_component.deleted_at = datetime.now(UTC)
+    db_session.commit()
+
+    final_approval = client.post(
+        f"/api/approval-instances/{instance_id}/decisions",
+        headers=group_headers,
+        json={"decision": "APPROVE", "comment": "Group approval complete"},
+    )
+
+    assert final_approval.status_code == 409
+    assert "inactive" in str(final_approval.json()["detail"]).lower()
+    assert db_session.scalars(select(EmployeeSalaryStructure)).all() == []
 
 
 def test_final_approval_persists_a_2000_character_adjustment_reason(client, db_session):

@@ -9,7 +9,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.audit.context import set_actor
-from app.auth.service import Principal, build_principal
+from app.auth.service import Principal, build_principal, resolve_permission_org_scope
 from app.core.security import decode_access_token
 from app.db.session import get_session
 from app.models.auth import User
@@ -54,6 +54,29 @@ def require_permission(permission: str) -> Callable[[Principal], Principal]:
 
     def _dep(principal: Principal = Depends(get_current_principal)) -> Principal:
         if not principal.has_permission(permission):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
+        return principal
+
+    return _dep
+
+
+def require_global_permission(permission: str) -> Callable[[Principal, Session], Principal]:
+    """Require one permission to come from a role that is itself globally scoped.
+
+    A principal's aggregate ``org_scope`` can be unrestricted because of an
+    unrelated global role.  Global catalog mutations must instead resolve the
+    scope of the exact permission being exercised, otherwise a local write
+    grant and an unrelated global grant could be combined into group authority.
+    """
+
+    def _dep(
+        principal: Principal = Depends(get_current_principal),
+        session: Session = Depends(get_session),
+    ) -> Principal:
+        if (
+            not principal.has_permission(permission)
+            or resolve_permission_org_scope(session, principal, permission) is not None
+        ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限")
         return principal
 

@@ -11,8 +11,10 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.orm import Session
 
 from alembic import command
+from app.importing.migrate_legacy import assert_legacy_load_revision, migrate_rows
 
 
 def _config_with_connection(connection) -> Config:
@@ -21,6 +23,96 @@ def _config_with_connection(connection) -> Config:
     config.set_main_option("script_location", str(backend_dir / "alembic"))
     config.attributes["connection"] = connection
     return config
+
+
+def test_fresh_legacy_runbook_loads_before_store_and_employee_backfills(pg_engine) -> None:
+    """The documented S6 load order must produce linked real historical rows."""
+
+    schema = f"legacy_runbook_{uuid4().hex}"
+    with pg_engine.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.commit()
+        try:
+            connection.execute(text(f'SET search_path TO "{schema}", public'))
+            config = _config_with_connection(connection)
+            command.upgrade(config, "089dead90284")
+            connection.execute(text("""
+                    INSERT INTO org_unit
+                        (parent_id, type, name, code, city, status,
+                         created_at, updated_at, created_by, is_deleted, deleted_at)
+                    SELECT
+                        NULL, 'GROUP', 'Runbook Group', 'RUNBOOK-GROUP', NULL, 'ACTIVE',
+                        now(), now(), NULL, false, NULL
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM org_unit
+                        WHERE type = 'GROUP' AND is_deleted = false
+                    )
+                    """))
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM org_unit "
+                        "WHERE type = 'GROUP' AND is_deleted = false"
+                    )
+                )
+                == 1
+            )
+            connection.commit()
+
+            with Session(bind=connection) as session:
+                assert_legacy_load_revision(session)
+                report = migrate_rows(
+                    session,
+                    [
+                        {
+                            "月份": "2026-06",
+                            "姓名": "Runbook Person One",
+                            "门店": "历史门店甲",
+                            "标准门店": "历史门店甲",
+                            "职位": "服务员",
+                            "综合薪资": "4200.00",
+                            "合计工资": "4200.00",
+                        },
+                        {
+                            "月份": "2026-06",
+                            "姓名": "Runbook Person Two",
+                            "门店": "历史门店乙",
+                            "标准门店": "历史门店乙",
+                            "职位": "厨工",
+                            "综合薪资": "5000.00",
+                            "合计工资": "5000.00",
+                        },
+                    ],
+                )
+                assert report.written == 2
+                session.commit()
+
+            command.upgrade(config, "head")
+
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM salary_record WHERE org_unit_id IS NOT NULL")
+                )
+                == 2
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM salary_record WHERE employee_id IS NOT NULL")
+                )
+                == 2
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT count(*) FROM employee WHERE emp_no LIKE 'LEGACY-NAME-%'")
+                )
+                == 2
+            )
+        finally:
+            connection.rollback()
+            connection.execute(text("SET search_path TO public"))
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            connection.commit()
 
 
 def test_upgrade_head_from_empty_postgresql_schema(pg_engine) -> None:

@@ -1,7 +1,7 @@
 import enum
 from datetime import date
 
-from sqlalchemy import Boolean, Date, Enum, ForeignKey, String
+from sqlalchemy import Boolean, CheckConstraint, Date, Enum, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.crypto import EncryptedString
@@ -55,6 +55,7 @@ class Employee(Base, TimestampMixin, SoftDeleteMixin):
     """
 
     __tablename__ = "employee"
+    __table_args__ = (CheckConstraint("version > 0", name="ck_employee_version_positive"),)
 
     emp_no: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
     name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -62,6 +63,7 @@ class Employee(Base, TimestampMixin, SoftDeleteMixin):
     job_grade_id: Mapped[int | None] = mapped_column(
         ForeignKey("job_grade.id"), nullable=True, index=True
     )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     employment_type: Mapped[EmploymentType] = mapped_column(
         Enum(EmploymentType, name="employment_type"),
         nullable=False,

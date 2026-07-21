@@ -1475,7 +1475,6 @@ def _structure_source_rows(
             EmployeeSalaryStructure.employee_id == result.employee_id,
             SalaryComponentDef.code.in_(codes),
             SalaryComponentDef.component_type.in_(component_types),
-            SalaryComponentDef.is_deleted.is_(False),
             EmployeeSalaryStructure.effective_from <= selection_date,
             (EmployeeSalaryStructure.effective_to.is_(None))
             | (EmployeeSalaryStructure.effective_to > selection_date),

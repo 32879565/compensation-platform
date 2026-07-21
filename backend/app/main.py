@@ -26,6 +26,7 @@ from app.routers.grade import router as grade_router
 from app.routers.holiday import router as holiday_router
 from app.routers.imports import router as imports_router
 from app.routers.imports import salary_router
+from app.routers.legacy_catalog import router as legacy_catalog_router
 from app.routers.org import router as org_router
 from app.routers.payroll import router as payroll_router
 from app.routers.payroll_adjustment import router as payroll_adjustment_router
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(grade_router)
     app.include_router(imports_router)
     app.include_router(salary_router)
+    app.include_router(legacy_catalog_router)
     app.include_router(comp_router)
     app.include_router(structure_router)
     app.include_router(approval_router)

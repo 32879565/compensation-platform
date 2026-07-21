@@ -3,6 +3,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { Employee } from '../api/masterdata'
+
 const compApi = vi.hoisted(() => ({
   fetchComponents: vi.fn(),
   fetchSalaryStructure: vi.fn(),
@@ -27,8 +29,9 @@ vi.mock('../auth/AuthContext', () => ({
 
 import SalaryStructureDrawer from './SalaryStructureDrawer'
 
-const employee = {
+const employee: Employee = {
   id: 17,
+  version: 1,
   emp_no: 'E0017',
   name: '陈星',
   org_unit_id: 3,
@@ -198,6 +201,24 @@ function renderDrawer(props: Partial<React.ComponentProps<typeof SalaryStructure
   return { ...rendered, queryClient }
 }
 
+async function findInitialStructureDialog() {
+  const title = await screen.findByText('初始化薪资结构', { selector: '.ant-modal-title' })
+  const dialog = title.closest<HTMLElement>('[role="dialog"]')
+  if (!dialog) throw new Error('初始化薪资结构弹窗未渲染')
+  return dialog
+}
+
+function expectArrowKeyScrolling(region: HTMLElement) {
+  region.focus()
+  expect(document.activeElement).toBe(region)
+  region.scrollLeft = 0
+  fireEvent.keyDown(region, { key: 'ArrowRight', code: 'ArrowRight' })
+  expect(region.scrollLeft).toBeGreaterThan(0)
+  const afterRight = region.scrollLeft
+  fireEvent.keyDown(region, { key: 'ArrowLeft', code: 'ArrowLeft' })
+  expect(region.scrollLeft).toBeLessThan(afterRight)
+}
+
 describe('SalaryStructureDrawer', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -230,10 +251,15 @@ describe('SalaryStructureDrawer', () => {
     expect(screen.getByText('v2')).toBeTruthy()
     expect(screen.getByText('2026-01-01 至 2026-06-30')).toBeTruthy()
     expect(screen.getByText('年度调薪审批')).toBeTruthy()
+    expect(screen.getByText('#22')).toBeTruthy()
     expect(screen.getByText('组件已停用')).toBeTruthy()
     expect(screen.getByRole('link', { name: '查看附件' }).getAttribute('href')).toBe(
       'https://files.example.test/adjustments/22.pdf',
     )
+    const historyRegion = screen.getByRole('region', { name: '薪资结构变更历史' })
+    expect(historyRegion.tabIndex).toBe(0)
+    expect(within(historyRegion).getByText('历史岗位补贴')).toBeTruthy()
+    expectArrowKeyScrolling(historyRegion)
 
     fireEvent.change(screen.getByLabelText('查看日期'), {
       target: { value: '2026-06-30' },
@@ -246,8 +272,12 @@ describe('SalaryStructureDrawer', () => {
     compApi.fetchSalaryStructureHistory.mockResolvedValue([])
     renderDrawer()
 
-    fireEvent.click(await screen.findByRole('button', { name: '初始化薪资结构' }))
-    const dialog = await screen.findByRole('dialog', { name: '初始化薪资结构' })
+    const firstOpen = await screen.findByRole('button', { name: '初始化薪资结构' })
+    await waitFor(() => expect((firstOpen as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(firstOpen)
+    const title = await screen.findByText('初始化薪资结构', { selector: '.ant-modal-title' })
+    const dialog = title.closest<HTMLElement>('[role="dialog"]')
+    if (!dialog) throw new Error('初始化薪资结构弹窗未渲染')
     fireEvent.change(within(dialog).getByLabelText('生效日期'), {
       target: { value: '2026-07-01' },
     })
@@ -260,14 +290,14 @@ describe('SalaryStructureDrawer', () => {
     fireEvent.change(within(dialog).getByLabelText('餐补金额'), { target: { value: '300' } })
     fireEvent.change(within(dialog).getByLabelText('房补金额'), { target: { value: '600' } })
     fireEvent.change(within(dialog).getByLabelText('餐补附件'), {
-      target: { value: 'ftp://files.example.test/meal.pdf' },
+      target: { value: 'https://user:secret@files.example.test/meal.pdf' },
     })
     fireEvent.click(within(dialog).getByRole('button', { name: '确认初始化' }))
 
     expect(await within(dialog).findByText('餐补必须填写原因')).toBeTruthy()
-    expect(within(dialog).getByText('餐补附件必须为 http(s) 地址')).toBeTruthy()
+    expect(within(dialog).getByText('餐补附件必须为无凭据 HTTPS 地址')).toBeTruthy()
     expect(within(dialog).getByText('房补必须填写原因')).toBeTruthy()
-    expect(within(dialog).getByText('房补附件必须为 http(s) 地址')).toBeTruthy()
+    expect(within(dialog).getByText('房补附件必须为无凭据 HTTPS 地址')).toBeTruthy()
     expect(compApi.setInitialSalaryStructure).not.toHaveBeenCalled()
 
     fireEvent.change(within(dialog).getByLabelText('餐补原因'), {
@@ -280,7 +310,7 @@ describe('SalaryStructureDrawer', () => {
       target: { value: '经薪酬负责人确认的住房补贴政策' },
     })
     fireEvent.change(within(dialog).getByLabelText('房补附件'), {
-      target: { value: 'http://intranet.example.test/policies/housing.pdf' },
+      target: { value: 'https://intranet.example.test/policies/housing.pdf' },
     })
     fireEvent.click(within(dialog).getByRole('button', { name: '确认初始化' }))
 
@@ -299,13 +329,227 @@ describe('SalaryStructureDrawer', () => {
             component_id: 4,
             amount: 600,
             reason: '经薪酬负责人确认的住房补贴政策',
-            attachment_url: 'http://intranet.example.test/policies/housing.pdf',
+            attachment_url: 'https://intranet.example.test/policies/housing.pdf',
           },
         ],
       }),
     )
     await waitFor(() => expect(compApi.fetchSalaryStructure.mock.calls.length).toBeGreaterThan(1))
     expect(compApi.fetchSalaryStructureHistory.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('prevents duplicate initial structure submissions in the same render frame', async () => {
+    let resolveInitial: ((value: never[]) => void) | undefined
+    let form: HTMLFormElement | null = null
+    let replayedSubmit = false
+    compApi.fetchSalaryStructure.mockResolvedValue(emptyStructure)
+    compApi.fetchSalaryStructureHistory.mockResolvedValue([])
+    compApi.setInitialSalaryStructure.mockImplementation(() => {
+      if (!replayedSubmit) {
+        replayedSubmit = true
+        if (!form) throw new Error('initial structure form was not captured')
+        fireEvent.submit(form)
+      }
+      return new Promise<never[]>((resolve) => {
+        resolveInitial = resolve
+      })
+    })
+    renderDrawer()
+
+    const openButton = await screen.findByRole('button', { name: '初始化薪资结构' })
+    await waitFor(() => expect((openButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(openButton)
+    const dialog = await findInitialStructureDialog()
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: '选择基本工资' }))
+    fireEvent.change(within(dialog).getByLabelText('基本工资金额'), {
+      target: { value: '5200' },
+    })
+    form = dialog.querySelector('form')
+    if (!form) throw new Error('initial structure form did not render')
+    const submit = within(dialog).getByRole('button', { name: '确认初始化' })
+
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(compApi.setInitialSalaryStructure).toHaveBeenCalled())
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(compApi.setInitialSalaryStructure).toHaveBeenCalledTimes(1)
+
+    if (!resolveInitial) throw new Error('initial structure mutation did not start')
+    resolveInitial([])
+    await waitFor(() =>
+      expect(screen.queryByText('初始化薪资结构', { selector: '.ant-modal-title' })).toBeNull(),
+    )
+  })
+
+  it.each([409, 404])(
+    'closes and resets stale initial structure evidence after a %s conflict',
+    async (status) => {
+      let resolveComponentsRefresh: ((value: typeof components) => void) | undefined
+      let resolveStructureRefresh: ((value: typeof emptyStructure) => void) | undefined
+      let resolveHistoryRefresh: ((value: typeof history) => void) | undefined
+      compApi.fetchComponents.mockResolvedValueOnce(components).mockImplementation(
+        () =>
+          new Promise<typeof components>((resolve) => {
+            resolveComponentsRefresh = resolve
+          }),
+      )
+      compApi.fetchSalaryStructure.mockResolvedValueOnce(emptyStructure).mockImplementation(
+        () =>
+          new Promise<typeof emptyStructure>((resolve) => {
+            resolveStructureRefresh = resolve
+          }),
+      )
+      compApi.fetchSalaryStructureHistory.mockResolvedValueOnce([]).mockImplementation(
+        () =>
+          new Promise<typeof history>((resolve) => {
+            resolveHistoryRefresh = resolve
+          }),
+      )
+      compApi.setInitialSalaryStructure.mockRejectedValue({
+        response: { status, data: { detail: '薪资结构证据已变化' } },
+      })
+      renderDrawer()
+
+      const openButton = await screen.findByRole('button', { name: '初始化薪资结构' })
+      await waitFor(() => expect((openButton as HTMLButtonElement).disabled).toBe(false))
+      fireEvent.click(openButton)
+      const dialog = await findInitialStructureDialog()
+      fireEvent.click(within(dialog).getByRole('checkbox', { name: '选择基本工资' }))
+      fireEvent.change(within(dialog).getByLabelText('基本工资金额'), {
+        target: { value: '5300' },
+      })
+      fireEvent.click(within(dialog).getByRole('button', { name: '确认初始化' }))
+
+      await waitFor(() => expect(compApi.setInitialSalaryStructure).toHaveBeenCalledTimes(1))
+      await waitFor(() =>
+        expect(screen.queryByText('初始化薪资结构', { selector: '.ant-modal-title' })).toBeNull(),
+      )
+      await waitFor(() => expect(compApi.fetchComponents.mock.calls.length).toBeGreaterThan(1))
+      expect(compApi.fetchSalaryStructure.mock.calls.length).toBeGreaterThan(1)
+      expect(compApi.fetchSalaryStructureHistory.mock.calls.length).toBeGreaterThan(1)
+      expect(screen.queryByRole('button', { name: '初始化薪资结构' })).toBeNull()
+
+      if (!resolveComponentsRefresh || !resolveStructureRefresh || !resolveHistoryRefresh) {
+        throw new Error('conflict refresh did not start')
+      }
+      resolveComponentsRefresh(components)
+      resolveStructureRefresh(emptyStructure)
+      resolveHistoryRefresh([])
+
+      const reopen = await screen.findByRole('button', { name: '初始化薪资结构' })
+      await waitFor(() => expect((reopen as HTMLButtonElement).disabled).toBe(false))
+      fireEvent.click(reopen)
+      const refreshedDialog = await findInitialStructureDialog()
+      expect(
+        (
+          within(refreshedDialog).getByRole('checkbox', {
+            name: '选择基本工资',
+          }) as HTMLInputElement
+        ).checked,
+      ).toBe(false)
+      expect(within(refreshedDialog).queryByLabelText('基本工资金额')).toBeNull()
+    },
+  )
+
+  it('does not offer initialization again when a conflict refresh finds an existing structure', async () => {
+    compApi.fetchSalaryStructure
+      .mockResolvedValueOnce(emptyStructure)
+      .mockResolvedValue(currentStructure)
+    compApi.fetchSalaryStructureHistory.mockResolvedValueOnce([]).mockResolvedValue(history)
+    compApi.setInitialSalaryStructure.mockRejectedValue({
+      response: { status: 409, data: { detail: '薪资结构已由其他操作建立' } },
+    })
+    renderDrawer()
+
+    const openButton = await screen.findByRole('button', { name: '初始化薪资结构' })
+    await waitFor(() => expect((openButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(openButton)
+    const dialog = await findInitialStructureDialog()
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: '选择基本工资' }))
+    fireEvent.change(within(dialog).getByLabelText('基本工资金额'), {
+      target: { value: '5400' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认初始化' }))
+
+    expect(await screen.findByText('已有薪资结构不能直接修改，请通过调薪审批变更。')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '初始化薪资结构' })).toBeNull()
+    expect(compApi.fetchComponents.mock.calls.length).toBeGreaterThan(1)
+    expect(compApi.fetchSalaryStructure.mock.calls.length).toBeGreaterThan(1)
+    expect(compApi.fetchSalaryStructureHistory.mock.calls.length).toBeGreaterThan(1)
+    expect(compApi.setInitialSalaryStructure).toHaveBeenCalledTimes(1)
+  })
+
+  it('retains initial structure values after a non-conflict failure and allows retry', async () => {
+    compApi.fetchSalaryStructure.mockResolvedValue(emptyStructure)
+    compApi.fetchSalaryStructureHistory.mockResolvedValue([])
+    compApi.setInitialSalaryStructure
+      .mockRejectedValueOnce({
+        response: { status: 422, data: { detail: '初始金额不符合规则' } },
+      })
+      .mockResolvedValue([])
+    renderDrawer()
+
+    const openButton = await screen.findByRole('button', { name: '初始化薪资结构' })
+    await waitFor(() => expect((openButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(openButton)
+    const dialog = await findInitialStructureDialog()
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: '选择基本工资' }))
+    fireEvent.change(within(dialog).getByLabelText('基本工资金额'), {
+      target: { value: '5500' },
+    })
+    const submit = within(dialog).getByRole('button', { name: '确认初始化' })
+    fireEvent.click(submit)
+
+    expect(await within(dialog).findByText('初始金额不符合规则')).toBeTruthy()
+    expect(screen.getByText('初始化薪资结构', { selector: '.ant-modal-title' })).toBeTruthy()
+    expect(
+      (within(dialog).getByRole('checkbox', { name: '选择基本工资' }) as HTMLInputElement).checked,
+    ).toBe(true)
+    expect((within(dialog).getByLabelText('基本工资金额') as HTMLInputElement).value).toBe(
+      '5500.00',
+    )
+    await waitFor(() => expect((submit as HTMLButtonElement).disabled).toBe(false))
+
+    fireEvent.click(submit)
+    await waitFor(() => expect(compApi.setInitialSalaryStructure).toHaveBeenCalledTimes(2))
+  })
+
+  it('clears a cancelled initial structure before reopening on another view date', async () => {
+    compApi.fetchSalaryStructure.mockResolvedValue(emptyStructure)
+    compApi.fetchSalaryStructureHistory.mockResolvedValue([])
+    renderDrawer()
+
+    const secondOpen = await screen.findByRole('button', { name: '初始化薪资结构' })
+    await waitFor(() => expect((secondOpen as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(secondOpen)
+    let dialog = await findInitialStructureDialog()
+    fireEvent.change(within(dialog).getByLabelText('生效日期'), {
+      target: { value: '2026-07-01' },
+    })
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: '选择基本工资' }))
+    fireEvent.change(within(dialog).getByLabelText('基本工资金额'), {
+      target: { value: '5100' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: /Cancel|取\s*消/i }))
+    await waitFor(() =>
+      expect(screen.queryByText('初始化薪资结构', { selector: '.ant-modal-title' })).toBeNull(),
+    )
+
+    fireEvent.change(screen.getByLabelText('查看日期'), {
+      target: { value: '2026-08-01' },
+    })
+    await waitFor(() => expect(compApi.fetchSalaryStructure).toHaveBeenCalledWith(17, '2026-08-01'))
+    const reopen = await screen.findByRole('button', { name: '初始化薪资结构' })
+    await waitFor(() => expect((reopen as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(reopen)
+    dialog = await findInitialStructureDialog()
+
+    expect((within(dialog).getByLabelText('生效日期') as HTMLInputElement).value).toBe('2026-08-01')
+    expect(
+      (within(dialog).getByRole('checkbox', { name: '选择基本工资' }) as HTMLInputElement).checked,
+    ).toBe(false)
+    expect(within(dialog).queryByLabelText('基本工资金额')).toBeNull()
   })
 
   it('routes every existing structure change through salary-adjustment approval', async () => {
@@ -316,6 +560,16 @@ describe('SalaryStructureDrawer', () => {
     expect(screen.getByRole('link', { name: '发起调薪审批' }).getAttribute('href')).toBe(
       '/adjustment',
     )
+  })
+
+  it('does not reopen initial setup when history exists but no row is active on the view date', async () => {
+    compApi.fetchSalaryStructure.mockResolvedValue(emptyStructure)
+    compApi.fetchSalaryStructureHistory.mockResolvedValue(history)
+    renderDrawer()
+
+    expect(await screen.findByText('已有薪资结构不能直接修改，请通过调薪审批变更。')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '初始化薪资结构' })).toBeNull()
+    expect(screen.getByRole('link', { name: '发起调薪审批' })).toBeTruthy()
   })
 
   it('fails closed when any required structure evidence cannot be loaded', async () => {

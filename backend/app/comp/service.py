@@ -178,7 +178,7 @@ def band_for(session: Session, job_grade_id: int, on_date: date) -> SalaryBand |
             SalaryBand.is_deleted.is_(False),
             SalaryBand.effective_from <= on_date,
         )
-        .order_by(SalaryBand.effective_from.desc())
+        .order_by(SalaryBand.effective_from.desc(), SalaryBand.id.desc())
         .limit(1)
     ).first()
 

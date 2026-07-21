@@ -4,7 +4,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.auth.bootstrap import seed_rbac
 from app.auth.permissions import Perm
@@ -154,11 +154,13 @@ def _initial_structure(
     headers: dict[str, str],
     employee_id: int,
     items: list[dict[str, object]],
+    *,
+    effective_from: str = "2026-01-01",
 ):
     return client.put(
         f"/api/employees/{employee_id}/initial-structure",
         headers=headers,
-        json={"effective_from": "2026-01-01", "items": items},
+        json={"effective_from": effective_from, "items": items},
     )
 
 
@@ -520,7 +522,11 @@ def test_catalog_marks_calculation_metadata_locked_after_payroll_use(client, db_
         [{"component_id": used["id"], "amount": "5000"}],
     )
     assert initialized.status_code == 201, initialized.text
-    _persist_payroll_result(db_session, employee)
+    _persist_payroll_result(
+        db_session,
+        employee,
+        input_snapshot={"structure": [{"code": used["code"]}]},
+    )
 
     listed = client.get("/api/salary-components", headers=headers)
 
@@ -528,6 +534,34 @@ def test_catalog_marks_calculation_metadata_locked_after_payroll_use(client, db_
     by_id = {item["id"]: item for item in listed.json()}
     assert by_id[fresh["id"]]["calculation_locked"] is False
     assert by_id[used["id"]]["calculation_locked"] is True
+
+
+def test_component_added_after_an_older_result_is_not_falsely_calculation_locked(
+    client, db_session
+):
+    _user(db_session, "component-future-lock-hr", ["GROUP_HR"])
+    headers = _token(client, "component-future-lock-hr")
+    employee = _employee(db_session, suffix="FUTURE_LOCK")
+    _persist_payroll_result(
+        db_session,
+        employee,
+        input_snapshot={"structure": [{"code": "HISTORICAL_ONLY"}]},
+    )
+    future = _component(client, headers, code="FUTURE_BASE")
+    initialized = _initial_structure(
+        client,
+        headers,
+        employee.id,
+        [{"component_id": future["id"], "amount": "5200"}],
+        effective_from="2027-01-01",
+    )
+    assert initialized.status_code == 201, initialized.text
+
+    listed = client.get("/api/salary-components", headers=headers)
+
+    assert listed.status_code == 200, listed.text
+    by_id = {item["id"]: item for item in listed.json()}
+    assert by_id[future["id"]]["calculation_locked"] is False
 
 
 def test_pending_salary_adjustment_blocks_component_deactivation(client, db_session):
@@ -560,6 +594,117 @@ def test_pending_salary_adjustment_blocks_component_deactivation(client, db_sess
     assert component["id"] in active_ids
     stored_component = db_session.get(SalaryComponentDef, component["id"])
     assert stored_component is not None and stored_component.is_deleted is False
+
+
+def test_pending_salary_adjustment_blocks_component_calculation_metadata_changes(
+    client, db_session
+):
+    hr = _user(db_session, "component-pending-policy-hr", ["GROUP_HR"])
+    headers = _token(client, hr.username)
+    employee = _employee(db_session, suffix="PENDING_POLICY")
+    component = _component(client, headers, code="PENDING_POLICY_BASE")
+    db_session.add(
+        SalaryAdjustment(
+            employee_id=employee.id,
+            org_unit_id=employee.org_unit_id,
+            component_id=component["id"],
+            amount=Decimal("5500"),
+            effective_from=date(2026, 8, 1),
+            reason="Pending approval must retain its component semantics",
+            attachment_url="https://files.example.test/adjustments/pending-policy.pdf",
+            requester_id=hr.id,
+            status=SalaryAdjustmentStatus.PENDING,
+            before_snapshot={"record_exists": False},
+        )
+    )
+    db_session.flush()
+
+    response = client.patch(
+        f"/api/salary-components/{component['id']}",
+        headers=headers,
+        json={
+            "expected_updated_at": component["updated_at"],
+            "taxable": False,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "pending" in response.json()["detail"].lower()
+    stored = db_session.get(SalaryComponentDef, component["id"])
+    assert stored is not None and stored.taxable is True
+
+
+def test_legacy_allowance_must_be_classified_before_lifecycle_and_can_be_fixed_inactive(
+    client, db_session
+):
+    _user(db_session, "component-legacy-classification-hr", ["GROUP_HR"])
+    headers = _token(client, "component-legacy-classification-hr")
+    db_session.execute(
+        text(
+            "ALTER TABLE salary_component_def " "DROP CONSTRAINT ck_salary_component_allowance_kind"
+        )
+    )
+    active_id, inactive_id = db_session.execute(text("""
+            INSERT INTO salary_component_def
+                (code, name, component_type, taxable, in_social_base, in_housing_base,
+                 prorate_by_attendance, allowance_kind, sort_order, is_deleted, deleted_at)
+            VALUES
+                ('LEGACY_UNCLASSIFIED_ACTIVE', 'Legacy active', 'ALLOWANCE', true, false,
+                 false, false, NULL, 1, false, NULL),
+                ('LEGACY_UNCLASSIFIED_INACTIVE', 'Legacy inactive', 'ALLOWANCE', true, false,
+                 false, false, NULL, 2, true, now())
+            RETURNING id
+            """)).scalars().all()
+    db_session.execute(text("""
+            ALTER TABLE salary_component_def
+            ADD CONSTRAINT ck_salary_component_allowance_kind CHECK (
+                (component_type = 'ALLOWANCE' AND allowance_kind IS NOT NULL)
+                OR (component_type <> 'ALLOWANCE' AND allowance_kind IS NULL)
+            ) NOT VALID
+            """))
+    db_session.flush()
+    catalog = client.get("/api/salary-components", headers=headers, params={"status": "all"}).json()
+    by_id = {item["id"]: item for item in catalog}
+
+    blocked = _deactivate(client, headers, active_id, reason="Cannot retire ambiguous policy")
+    blocked_restore = client.post(
+        f"/api/salary-components/{inactive_id}/restore",
+        headers=headers,
+        json={"reason": "Cannot restore ambiguous policy"},
+    )
+    classified_active = client.patch(
+        f"/api/salary-components/{active_id}",
+        headers=headers,
+        json={
+            "expected_updated_at": by_id[active_id]["updated_at"],
+            "allowance_kind": "FIXED",
+            "reason": "HR confirmed historical allowance policy",
+        },
+    )
+    classified_inactive = client.patch(
+        f"/api/salary-components/{inactive_id}",
+        headers=headers,
+        json={
+            "expected_updated_at": by_id[inactive_id]["updated_at"],
+            "allowance_kind": "FLOATING",
+            "reason": "HR confirmed inactive historical allowance policy",
+        },
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked_restore.status_code == 409, blocked_restore.text
+    assert classified_active.status_code == 200, classified_active.text
+    assert classified_active.json()["allowance_kind"] == "FIXED"
+    retired = _deactivate(client, headers, active_id, reason="Classification is now complete")
+    assert retired.status_code == 200, retired.text
+    assert classified_inactive.status_code == 200, classified_inactive.text
+    assert classified_inactive.json()["is_active"] is False
+    restored = client.post(
+        f"/api/salary-components/{inactive_id}/restore",
+        headers=headers,
+        json={"reason": "Approved after classification"},
+    )
+    assert restored.status_code == 200, restored.text
 
 
 def test_draft_adjustment_cannot_be_submitted_after_its_component_is_deactivated(

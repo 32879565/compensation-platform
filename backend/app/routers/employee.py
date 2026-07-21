@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -12,6 +13,7 @@ from app.auth.permissions import Perm
 from app.auth.service import Principal, resolve_permission_org_scope
 from app.db.session import get_session
 from app.models.employee import Employee, requires_approved_attendance_days
+from app.models.grade import JobGrade
 from app.models.org import OrgType
 from app.payroll.guards import (
     PayrollSourceLockedError,
@@ -19,7 +21,6 @@ from app.payroll.guards import (
     assert_new_employee_cohort_mutable,
 )
 from app.repositories.employee import EmployeeRepository
-from app.repositories.grade import JobGradeRepository
 from app.repositories.org import OrgUnitRepository
 from app.schemas.employee import (
     EmployeeCreate,
@@ -95,10 +96,20 @@ def _visible_store_or_error(
 
 
 def _visible_grade_or_error(session: Session, job_grade_id: int | None) -> None:
-    """Reject missing or soft-deleted global grade master data explicitly."""
+    """Lock and validate a grade that is about to receive a new assignment."""
 
-    if job_grade_id is not None and JobGradeRepository(session).get(job_grade_id) is None:
-        raise HTTPException(status_code=404, detail="Job grade does not exist or is unavailable.")
+    if job_grade_id is None:
+        return
+    grade = session.scalars(
+        select(JobGrade)
+        .where(JobGrade.id == job_grade_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
+    if grade is None:
+        raise HTTPException(status_code=404, detail="Job grade does not exist.")
+    if grade.is_deleted:
+        raise HTTPException(status_code=409, detail="Inactive job grades cannot be assigned.")
 
 
 def _validate_merged_lifecycle(
@@ -241,7 +252,11 @@ def create_employee(
         actor=(principal.user_id, principal.username),
         target_type="employee",
         target_id=emp.id,
-        detail={"emp_no": emp.emp_no, "org_unit_id": emp.org_unit_id},
+        detail={
+            "emp_no": emp.emp_no,
+            "org_unit_id": emp.org_unit_id,
+            "job_grade_id": emp.job_grade_id,
+        },
     )
     session.commit()
     return EmployeeOut.from_employee(
@@ -257,16 +272,35 @@ def update_employee(
     principal: Principal = Depends(require_permission(Perm.EMPLOYEE_WRITE)),
     session: Session = Depends(get_session),
 ) -> EmployeeOut:
-    repo = _repo(session, principal, Perm.EMPLOYEE_WRITE)
-    emp = repo.get(employee_id)
+    write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
+    statement = select(Employee).where(
+        Employee.id == employee_id,
+        Employee.is_deleted.is_(False),
+    )
+    if write_scope is not None:
+        statement = statement.where(Employee.org_unit_id.in_(write_scope))
+    emp = session.scalars(
+        statement.with_for_update().execution_options(populate_existing=True)
+    ).first()
     if emp is None:
         raise HTTPException(status_code=404, detail="员工不存在或不可见")
-    data = body.model_dump(exclude_unset=True)
+    data = body.model_dump(exclude_unset=True, exclude={"expected_version"})
     target_position_title = data.get("position_title", emp.position_title)
     if requires_approved_attendance_days(target_position_title):
         data["is_special_position"] = True
     target_org_unit_id = data.get("org_unit_id") or emp.org_unit_id
-    _visible_grade_or_error(session, data.get("job_grade_id", emp.job_grade_id))
+    previous_job_grade_id = emp.job_grade_id
+    grade_assignment_changed = "job_grade_id" in data and data["job_grade_id"] != emp.job_grade_id
+    if grade_assignment_changed and body.expected_version is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Job grade assignment requires expected_version.",
+        )
+    if body.expected_version is not None and emp.version != body.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Employee changed by another user; refresh and retry.",
+        )
     _validate_merged_lifecycle(
         hire_date=data.get("hire_date", emp.hire_date),
         probation_end=data.get("probation_end", emp.probation_end),
@@ -282,6 +316,11 @@ def update_employee(
             hire_date=data.get("hire_date", emp.hire_date),
             leave_date=data.get("leave_date", emp.leave_date),
         )
+    # Grade is a current master-data assignment used by compa analysis, not a
+    # payroll calculation input.  Validate only actual reassignment and do not
+    # make promotions impossible merely because the employee has prior payroll.
+    if grade_assignment_changed:
+        _visible_grade_or_error(session, data["job_grade_id"])
     # 转移组织时，目标组织也必须在可见范围内（防越权把员工移出/移入不可见组织）
     if "org_unit_id" in data and data["org_unit_id"] is not None:
         _visible_store_or_error(
@@ -291,14 +330,26 @@ def update_employee(
         )
     for field, value in data.items():
         setattr(emp, field, value)
+    previous_version = emp.version
+    emp.version += 1
     session.flush()
+    audit_detail: dict[str, object] = {
+        "changed": sorted(data.keys()),
+        "from_version": previous_version,
+        "to_version": emp.version,
+    }
+    if grade_assignment_changed:
+        audit_detail["job_grade_assignment"] = {
+            "before_grade_id": previous_job_grade_id,
+            "after_grade_id": emp.job_grade_id,
+        }
     audit.record(
         session,
         action="employee.update",
         actor=(principal.user_id, principal.username),
         target_type="employee",
         target_id=emp.id,
-        detail={"changed": sorted(data.keys())},
+        detail=audit_detail,
     )
     session.commit()
     return EmployeeOut.from_employee(

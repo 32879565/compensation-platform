@@ -349,17 +349,17 @@ def test_employee_update_with_unknown_job_grade_returns_404(client, db_session):
     orgs = _org_tree(db_session)
     _user(db_session, "hr", ["GROUP_HR"])
     headers = _token(client, "hr")
-    employee_id = _create_emp(
+    employee = _create_emp(
         client,
         headers,
         orgs["gz_store"].id,
         emp_no="UNKNOWN-GRADE-UPDATE",
-    ).json()["id"]
+    ).json()
 
     response = client.patch(
-        f"/api/employees/{employee_id}",
+        f"/api/employees/{employee['id']}",
         headers=headers,
-        json={"job_grade_id": 999_999},
+        json={"job_grade_id": 999_999, "expected_version": employee["version"]},
     )
 
     assert response.status_code == 404
@@ -694,18 +694,31 @@ def test_update_employee_changes_field(client, db_session):
     r = client.patch(f"/api/employees/{eid}", headers=hr, json={"name": "李四"})
     assert r.status_code == 200
     assert r.json()["name"] == "李四"
+    assert r.json()["version"] == 2
 
 
 def test_update_employee_transfer_to_unseen_org_blocked(client, db_session):
     orgs = _org_tree(db_session)
     _make_scoped_writer_role(db_session)
     _user(db_session, "gzw", ["SCOPED_WRITER"], scope_ids=[orgs["gz"].id])
-    hr_global = _user(db_session, "hr", ["GROUP_HR"])  # noqa: F841
+    _user(db_session, "hr", ["GROUP_HR"])
     h = _token(client, "gzw")
     eid = _create_emp(client, h, orgs["gz_store"].id, emp_no="GZ5").json()["id"]
     # 试图把员工转到不可见的深圳店 → 404
     r = client.patch(f"/api/employees/{eid}", headers=h, json={"org_unit_id": orgs["sz_store"].id})
     assert r.status_code == 404
+
+    global_headers = _token(client, "hr")
+    transferred = client.patch(
+        f"/api/employees/{eid}",
+        headers=global_headers,
+        json={"org_unit_id": orgs["sz_store"].id},
+    )
+    assert transferred.status_code == 200
+    stale_scoped_edit = client.patch(
+        f"/api/employees/{eid}", headers=h, json={"name": "No longer visible"}
+    )
+    assert stale_scoped_edit.status_code == 404
 
 
 def test_delete_employee_soft(client, db_session):

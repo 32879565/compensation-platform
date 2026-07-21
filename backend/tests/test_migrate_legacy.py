@@ -2,7 +2,11 @@ from decimal import Decimal
 
 import pytest
 
-from app.importing.migrate_legacy import LegacyMigrationError, migrate_rows
+from app.importing.migrate_legacy import (
+    LegacyAlreadyMigrated,
+    LegacyMigrationError,
+    migrate_rows,
+)
 from app.models.org import OrgType, OrgUnit
 from app.models.salary import SalaryRecord, SalarySource
 
@@ -54,4 +58,12 @@ def test_migrate_rejects_unparseable_legacy_total(db_session):
     legacy = [{"月份": "2026-05", "姓名": "张三", "门店": "广州店", "合计工资": "五千"}]
 
     with pytest.raises(LegacyMigrationError, match=r"第 1 行.*合计工资"):
+        migrate_rows(db_session, legacy)
+
+
+def test_migrate_rechecks_idempotency_inside_dataset_lock(db_session):
+    legacy = [{"月份": "2026-05", "姓名": "张三", "门店": "广州店", "合计工资": "5000"}]
+    migrate_rows(db_session, legacy)
+
+    with pytest.raises(LegacyAlreadyMigrated, match="已存在 1 条历史记录"):
         migrate_rows(db_session, legacy)

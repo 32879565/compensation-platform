@@ -54,6 +54,7 @@ class EmployeeCreate(BaseModel):
 
 
 class EmployeeUpdate(BaseModel):
+    expected_version: int | None = Field(default=None, ge=1)
     name: str | None = Field(default=None, min_length=1, max_length=64)
     org_unit_id: int | None = None
     job_grade_id: int | None = None
@@ -87,6 +88,7 @@ class EmployeeUpdate(BaseModel):
 
 class EmployeeOut(BaseModel):
     id: int
+    version: int
     emp_no: str
     name: str
     org_unit_id: int
@@ -109,6 +111,7 @@ class EmployeeOut(BaseModel):
         """构造响应；无 employee:pii 权限时证件信息脱敏（不变量7）。"""
         return cls(
             id=emp.id,
+            version=emp.version,
             emp_no=emp.emp_no,
             name=emp.name,
             org_unit_id=emp.org_unit_id,

@@ -3,6 +3,7 @@
 连锁餐饮企业薪酬系统：核算 + 管理 + 查询。数据库为权威来源，Excel 仅作历史迁移与批量导入辅助。
 
 - 建设蓝图：[plans/compensation-platform.md](plans/compensation-platform.md)（17 步 / 6 里程碑 / 11 条全局不变量）
+- 旧系统真实数据迁移与目录复核：[docs/legacy-catalog-import.md](docs/legacy-catalog-import.md)
 - 技术栈：FastAPI (Python 3.12) + PostgreSQL 16 + React (TypeScript / Vite / Ant Design)
 
 ## 目录结构

@@ -13,6 +13,7 @@ export type ComponentType =
 // The API calls the variable allowance mode FLOATING.  Keep its wire value
 // here even though the UI presents it as a variable allowance.
 export type AllowanceKind = 'FIXED' | 'FLOATING'
+export type ComponentCatalogStatus = 'active' | 'inactive' | 'all'
 
 export interface SalaryComponent {
   id: number
@@ -25,6 +26,11 @@ export interface SalaryComponent {
   prorate_by_attendance: boolean
   allowance_kind: AllowanceKind | null
   sort_order: number
+  is_active: boolean
+  deactivated_at: string | null
+  updated_at: string
+  calculation_locked: boolean
+  calculation_lock_reason: string | null
 }
 
 export interface ComponentCreateFormInput {
@@ -80,6 +86,18 @@ export interface SalaryStructureItem {
   amount: string
   effective_from: string
   effective_to: string | null
+  source_adjustment_id: number | null
+  source_reason: string | null
+  source_attachment_url: string | null
+}
+
+export interface SalaryStructureHistoryItem extends SalaryStructureItem {
+  id: number
+  revision: number
+  component_code: string
+  component_name: string
+  component_type: ComponentType
+  component_is_active: boolean
 }
 
 export interface CompaSummary {
@@ -103,15 +121,33 @@ export interface SetComponentAmountInput {
   attachment_url?: string
 }
 
-export async function fetchComponents(): Promise<SalaryComponent[]> {
-  return (await api.get<SalaryComponent[]>('/api/salary-components')).data
+export interface InitialSalaryStructureItemInput {
+  component_id: number
+  amount: number
+  reason?: string
+  attachment_url?: string
+}
+
+export interface InitialSalaryStructureInput {
+  effective_from: string
+  items: InitialSalaryStructureItemInput[]
+}
+
+export interface ComponentCatalogQuery {
+  status?: ComponentCatalogStatus
+}
+
+export async function fetchComponents(
+  query: ComponentCatalogQuery = { status: 'active' },
+): Promise<SalaryComponent[]> {
+  return (await api.get<SalaryComponent[]>('/api/salary-components', { params: query })).data
 }
 
 export async function createComponent(payload: CreateComponentInput): Promise<SalaryComponent> {
   return (await api.post<SalaryComponent>('/api/salary-components', payload)).data
 }
 
-export type UpdateComponentInput = Partial<
+type MutableComponentFields = Partial<
   Pick<
     SalaryComponent,
     | 'name'
@@ -124,11 +160,38 @@ export type UpdateComponentInput = Partial<
   >
 >
 
+export type UpdateComponentInput = MutableComponentFields & {
+  expected_updated_at: string
+  reason?: string
+}
+
+export interface ComponentLifecycleInput {
+  reason: string
+  expected_updated_at: string
+}
+
 export async function updateComponent(
   componentId: number,
   payload: UpdateComponentInput,
 ): Promise<SalaryComponent> {
   return (await api.patch<SalaryComponent>(`/api/salary-components/${componentId}`, payload)).data
+}
+
+export async function deactivateComponent(
+  componentId: number,
+  payload: ComponentLifecycleInput,
+): Promise<SalaryComponent> {
+  return (
+    await api.post<SalaryComponent>(`/api/salary-components/${componentId}/deactivate`, payload)
+  ).data
+}
+
+export async function restoreComponent(
+  componentId: number,
+  payload: ComponentLifecycleInput,
+): Promise<SalaryComponent> {
+  return (await api.post<SalaryComponent>(`/api/salary-components/${componentId}/restore`, payload))
+    .data
 }
 
 export async function fetchSalaryStructure(
@@ -139,6 +202,23 @@ export async function fetchSalaryStructure(
     await api.get<SalaryStructure>(`/api/employees/${employeeId}/structure`, {
       params: { on_date: onDate },
     })
+  ).data
+}
+
+export async function fetchSalaryStructureHistory(
+  employeeId: number,
+): Promise<SalaryStructureHistoryItem[]> {
+  return (
+    await api.get<SalaryStructureHistoryItem[]>(`/api/employees/${employeeId}/structure/history`)
+  ).data
+}
+
+export async function setInitialSalaryStructure(
+  employeeId: number,
+  payload: InitialSalaryStructureInput,
+): Promise<SalaryStructureItem[]> {
+  return (
+    await api.put<SalaryStructureItem[]>(`/api/employees/${employeeId}/initial-structure`, payload)
   ).data
 }
 

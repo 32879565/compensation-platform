@@ -3,10 +3,12 @@ from decimal import Decimal
 
 import pytest
 from openpyxl import Workbook
+from sqlalchemy import text
 
 from app.importing.excel import read_salary_workbook
 from app.importing.parser import SalaryRow
 from app.importing.service import ImportError_, confirm_import, stage_import
+from app.importing.source_lock import LEGACY_SALARY_DATASET_LOCK_KEY
 from app.models.employee import Employee
 from app.models.org import OrgType, OrgUnit
 from app.models.salary import ImportStagingRow, ImportStatus, RowStatus, SalaryRecord, SalarySource
@@ -113,6 +115,37 @@ def test_confirm_writes_records_and_resolves_org(db_session):
     assert zhang.fields["合计工资"] == "5000"  # 金额以字符串保精度
     assert zhang.source == SalarySource.IMPORT
     assert zhang.employee_id == zhang_employee.id
+
+
+def test_confirm_holds_catalog_dataset_lock_until_transaction_finishes(db_session, pg_engine):
+    store = OrgUnit(code="LOCK-S1", name="Lock Store", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    _employee(db_session, store, "LOCK-E1", "Lock Employee")
+    batch = stage_import(
+        db_session,
+        filename="lock.xlsx",
+        period="2026-05",
+        rows=[
+            _row(
+                "Lock Employee",
+                "Lock Store",
+                emp_no="LOCK-E1",
+                fields={"合计工资": "5000"},
+                money={"合计工资": Decimal("5000")},
+            )
+        ],
+    )
+
+    assert confirm_import(db_session, batch) == 1
+    with pg_engine.connect() as competing_connection:
+        acquired = competing_connection.scalar(
+            text("SELECT pg_try_advisory_xact_lock(:key)"),
+            {"key": LEGACY_SALARY_DATASET_LOCK_KEY},
+        )
+        competing_connection.rollback()
+
+    assert acquired is False
 
 
 def test_current_import_rejects_employee_master_store_mismatch(db_session):

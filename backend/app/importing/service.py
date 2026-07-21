@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.importing.header_rules import MONEY_FIELDS
 from app.importing.parser import SalaryRow, dedupe_rows
+from app.importing.source_lock import lock_legacy_salary_dataset
 from app.models.employee import Employee
 from app.models.org import OrgType, OrgUnit
 from app.models.salary import (
@@ -208,6 +209,9 @@ def stage_import(
 def confirm_import(session: Session, batch: ImportBatch) -> int:
     """把批次的 OK 行写入 salary_record；有 ERROR 行则拒绝。返回写入条数。"""
     # 行锁防并发/双击重复确认（重复确认将只在第一个成功，其余见 CONFIRMED 报错）
+    # Catalog evidence is reviewed as one append-only dataset. Take the same
+    # transaction lock used by preview/apply before inserting any source row.
+    lock_legacy_salary_dataset(session)
     session.refresh(batch, with_for_update=True)
     if batch.status == ImportStatus.CONFIRMED:
         raise ImportError_("批次已确认")
