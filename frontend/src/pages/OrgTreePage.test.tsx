@@ -71,7 +71,7 @@ const preview: DingTalkOrganizationPreview = {
       remote_department_name: '广州区域',
       remote_department_path: '集团 / 广州区域',
       action: 'CREATE',
-      change_fields: ['name'],
+      change_fields: ['name', 'dingtalk_dept_id'],
       match_method: 'REMOTE_ONLY',
       proposed_org_unit_id: null,
       proposed_org_unit_name: '广州区域',
@@ -301,6 +301,7 @@ describe('OrgTreePage DingTalk organization sync', () => {
     const regionChanges = within(dialog).getByRole('region', { name: '区域变更（1）' })
     expect(within(regionChanges).getByText('创建新区域')).toBeTruthy()
     expect(within(regionChanges).getByText('集团 / 广州区域')).toBeTruthy()
+    expect(within(regionChanges).getByText('名称、钉钉部门 ID')).toBeTruthy()
 
     const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
     expect(within(dialog).getByText('区域变更暂不可确认')).toBeTruthy()
@@ -332,6 +333,32 @@ describe('OrgTreePage DingTalk organization sync', () => {
       ],
     }
     dingtalkApi.previewDingTalkOrganization.mockResolvedValue(regionConflictPreview)
+
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(applyButton)
+    expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a pending region count', { ready_regions: 1, region_conflicts: 0, region_items: [] }],
+    ['a region conflict count', { ready_regions: 0, region_conflicts: 1, region_items: [] }],
+    ['region preview items', { ready_regions: 0, region_conflicts: 0, region_items: preview.region_items }],
+  ])('fails closed for %s even when no other conflict is present', async (_reason, regionState) => {
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue({
+      ...preview,
+      ...regionState,
+      ready_stores: 1,
+      store_conflicts: 0,
+      store_items: [preview.store_items[0]],
+      ready_reviewers: 0,
+      reviewer_conflicts: 0,
+      reviewer_items: [],
+    })
 
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))

@@ -240,7 +240,7 @@ describe('DingTalk and compensation appeal API client', () => {
           remote_department_name: '广州区域',
           remote_department_path: '集团 / 广州区域',
           action: 'CREATE',
-          change_fields: ['name'],
+          change_fields: ['name', 'dingtalk_dept_id'],
           match_method: 'REMOTE_ONLY',
           proposed_org_unit_id: null,
           proposed_org_unit_name: '广州区域',
@@ -323,7 +323,7 @@ describe('DingTalk and compensation appeal API client', () => {
       remote_department_name: '广州区域',
       remote_department_path: '集团 / 广州区域',
       action: 'CREATE',
-      change_fields: ['name'],
+      change_fields: ['name', 'dingtalk_dept_id'],
       match_method: 'REMOTE_ONLY',
       proposed_org_unit_id: null,
       proposed_org_unit_name: '广州区域',
@@ -364,5 +364,53 @@ describe('DingTalk and compensation appeal API client', () => {
       conflict_code: null,
     })
     expect(result).toEqual(applied)
+  })
+
+  it('normalizes legacy organization previews into the current safe shape', async () => {
+    client.post.mockResolvedValueOnce({
+      data: {
+        batch_id: 'legacy-organization-preview',
+        expires_at: '2026-07-22T04:00:00Z',
+        remote_stores: 1,
+        local_stores: 1,
+        ready_stores: 1,
+        store_conflicts: 0,
+        ready_reviewers: 0,
+        reviewer_conflicts: 0,
+        store_items: [
+          {
+            id: 101,
+            kind: 'STORE',
+            remote_department_id: null,
+            remote_department_name: 'Closed store',
+            remote_department_path: 'Local / Closed store',
+            action: 'MISSING_IN_DINGTALK',
+            change_fields: ['dingtalk_dept_id'],
+            match_method: 'LOCAL_STORE_NOT_VISIBLE',
+            proposed_org_unit_id: 11,
+            proposed_org_unit_name: 'Closed store',
+            proposed_parent_org_unit_id: 1,
+            proposed_parent_org_unit_name: 'Region',
+            status: 'READY',
+            conflict_code: null,
+          },
+        ],
+        reviewer_items: [],
+      },
+    })
+
+    const staged = await previewDingTalkOrganization()
+
+    expect(staged).toMatchObject({
+      remote_regions: 0,
+      local_regions: 0,
+      ready_regions: 0,
+      region_conflicts: 0,
+      region_items: [],
+    })
+    expect(staged.store_items[0]).toMatchObject({
+      action: 'DEACTIVATE',
+      change_fields: ['dingtalk_dept_id'],
+    })
   })
 })

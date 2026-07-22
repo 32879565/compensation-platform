@@ -20,6 +20,7 @@ import {
   applyDingTalkOrganization,
   previewDingTalkOrganization,
   type DingTalkOrganizationNodeAction,
+  type DingTalkOrganizationChangeField,
   type DingTalkOrganizationNodeItem,
   type DingTalkOrganizationNodeKind,
   type DingTalkOrganizationPreview,
@@ -70,6 +71,12 @@ const ORGANIZATION_ACTION_COLOR: Record<DingTalkOrganizationNodeAction, string> 
   DEACTIVATE: 'orange',
 }
 
+const ORGANIZATION_CHANGE_FIELD_LABEL: Record<DingTalkOrganizationChangeField, string> = {
+  name: '名称',
+  parent_id: '上级组织',
+  dingtalk_dept_id: '钉钉部门 ID',
+}
+
 const REVIEWER_ACTION_LABEL: Record<DingTalkOrganizationReviewerAction, string> = {
   ASSIGN: '分配',
   REMOVE: '撤销',
@@ -105,6 +112,12 @@ function localTargetLabel(name: string | null, id: number | null): string {
   return id === null ? name : `${name}（ID ${id}）`
 }
 
+function changeFieldsLabel(changeFields: DingTalkOrganizationChangeField[]): string {
+  return changeFields.length === 0
+    ? '—'
+    : changeFields.map((field) => ORGANIZATION_CHANGE_FIELD_LABEL[field]).join('、')
+}
+
 function organizationColumns(
   kind: DingTalkOrganizationNodeKind,
 ): ColumnsType<DingTalkOrganizationNodeItem> {
@@ -125,6 +138,7 @@ function organizationColumns(
     },
     { title: '钉钉完整路径', dataIndex: 'remote_department_path' },
     { title: '匹配方式', dataIndex: 'match_method' },
+    { title: '变更字段', render: (_value, item) => changeFieldsLabel(item.change_fields) },
     {
       title: `本地${organizationLabel}`,
       render: (_value, item) =>
@@ -227,6 +241,14 @@ function totalConflicts(preview: DingTalkOrganizationPreview): number {
   return preview.region_conflicts + preview.store_conflicts + preview.reviewer_conflicts
 }
 
+function hasBlockedRegionChanges(preview: DingTalkOrganizationPreview): boolean {
+  return (
+    preview.ready_regions > 0 ||
+    preview.region_conflicts > 0 ||
+    preview.region_items.length > 0
+  )
+}
+
 interface ReviewerChangesSectionProps {
   action: DingTalkOrganizationReviewerAction
   items: DingTalkOrganizationReviewerItem[]
@@ -319,7 +341,7 @@ export default function OrgTreePage() {
   function applyPreview(): void {
     if (
       !syncPreview ||
-      syncPreview.region_items.length > 0 ||
+      hasBlockedRegionChanges(syncPreview) ||
       totalConflicts(syncPreview) > 0 ||
       totalReadyItems(syncPreview) === 0
     ) {
@@ -334,7 +356,7 @@ export default function OrgTreePage() {
   const canApplyPreview =
     syncPreview !== null &&
     hasApplicableItems &&
-    syncPreview.region_items.length === 0 &&
+    !hasBlockedRegionChanges(syncPreview) &&
     totalConflicts(syncPreview) === 0
   const reviewerAssignments =
     syncPreview?.reviewer_items.filter((item) => item.action === 'ASSIGN') ?? []
@@ -382,7 +404,7 @@ export default function OrgTreePage() {
               message={`待应用：${syncPreview.ready_regions} 项区域变更、${syncPreview.ready_stores} 项门店变更、${syncPreview.ready_reviewers} 项负责人变更`}
               description="当前可确认门店变更、负责人分配和负责人撤销。"
             />
-            {syncPreview.region_items.length > 0 ? (
+            {hasBlockedRegionChanges(syncPreview) ? (
               <Alert
                 type="warning"
                 showIcon
