@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -134,3 +139,71 @@ def test_loopback_service_ports_can_be_overridden_for_an_isolated_e2e_stack() ->
     assert "${COMP_POSTGRES_PORT:-5432}:5432" in compose
     assert "${COMP_BACKEND_PORT:-8000}:8000" in compose
     assert "${COMP_FRONTEND_PORT:-8080}:80" in compose
+
+
+def test_org_sync_job_reuses_the_backend_runtime_without_exposing_the_api() -> None:
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("Docker Compose is not installed")
+
+    project_dir = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env.update(
+        {
+            "POSTGRES_PASSWORD": "compose-test-postgres-password",
+            "COMP_SECRET_KEY": "compose-test-secret-key-not-for-production",
+            "COMP_ENCRYPTION_KEY": "compose-test-encryption-key-not-for-production",
+        }
+    )
+    compose_version = subprocess.run(
+        [docker, "compose", "version"],
+        cwd=project_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if compose_version.returncode != 0:
+        version_error = f"{compose_version.stdout}\n{compose_version.stderr}".lower()
+        if "compose is not a docker command" in version_error or (
+            "unknown command" in version_error and "compose" in version_error
+        ):
+            pytest.skip("Docker Compose is not installed")
+        pytest.fail(version_error)
+
+    result = subprocess.run(
+        [
+            docker,
+            "compose",
+            "-f",
+            str(project_dir / "deploy" / "docker-compose.yml"),
+            "--profile",
+            "org-sync-job",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=project_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    services = json.loads(result.stdout)["services"]
+    backend = services["backend"]
+    job = services["dingtalk-org-sync-job"]
+    for runtime_key in ("image", "build", "environment", "networks"):
+        assert job[runtime_key] == backend[runtime_key]
+    assert job["command"] == ["python", "-m", "app.dingtalk.org_sync_job"]
+    assert job["restart"] == "no"
+    assert job["profiles"] == ["org-sync-job"]
+    assert "ports" not in job
+    assert "healthcheck" not in job
+    assert backend["restart"] == "unless-stopped"
+    assert "ports" in backend
+    assert "healthcheck" in backend
+    assert job["depends_on"] == {"postgres": {"condition": "service_healthy", "required": True}}

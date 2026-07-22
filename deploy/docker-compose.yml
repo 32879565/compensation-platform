@@ -3,6 +3,45 @@ name: compensation-platform
 # fail-closed：POSTGRES_PASSWORD 必填（先 cp .env.example .env）。
 # 所有端口只绑 127.0.0.1，薪资数据默认不暴露局域网；生产经 S17 反代对外。
 
+x-backend-runtime: &backend-runtime
+  build: ../backend
+  image: compensation-platform-backend
+  environment:
+    COMP_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-comp}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-compensation}
+    COMP_SECRET_KEY: ${COMP_SECRET_KEY:?COMP_SECRET_KEY 未设置：请在 deploy/.env 配置强随机密钥}
+    COMP_ENCRYPTION_KEY: ${COMP_ENCRYPTION_KEY:?COMP_ENCRYPTION_KEY 未设置：请在 deploy/.env 配置强随机密钥}
+    COMP_COOKIE_SECURE: ${COMP_COOKIE_SECURE:-true}
+    COMP_DEBUG: ${COMP_DEBUG:-false}
+    # sandbox is fail-safe: credentials may be verified/configured without
+    # allowing any salary notification to leave the application.
+    COMP_DINGTALK_MODE: ${COMP_DINGTALK_MODE:-sandbox}
+    COMP_DINGTALK_APP_ID: ${COMP_DINGTALK_APP_ID:-}
+    COMP_DINGTALK_CORP_ID: ${COMP_DINGTALK_CORP_ID:-}
+    COMP_DINGTALK_CLIENT_ID: ${COMP_DINGTALK_CLIENT_ID:-}
+    COMP_DINGTALK_CLIENT_SECRET: ${COMP_DINGTALK_CLIENT_SECRET:-}
+    COMP_DINGTALK_AGENT_ID: ${COMP_DINGTALK_AGENT_ID:-}
+    COMP_DINGTALK_REVIEW_SESSION_TTL_MINUTES: ${COMP_DINGTALK_REVIEW_SESSION_TTL_MINUTES:-15}
+    COMP_DINGTALK_REVIEW_SESSION_MAX_ATTEMPTS: ${COMP_DINGTALK_REVIEW_SESSION_MAX_ATTEMPTS:-10}
+    COMP_DINGTALK_REVIEW_SESSION_IP_MAX_ATTEMPTS: ${COMP_DINGTALK_REVIEW_SESSION_IP_MAX_ATTEMPTS:-300}
+    COMP_DINGTALK_REVIEW_SESSION_ATTEMPT_WINDOW_MINUTES: ${COMP_DINGTALK_REVIEW_SESSION_ATTEMPT_WINDOW_MINUTES:-15}
+    COMP_DINGTALK_REVIEW_LINK_TTL_HOURS: ${COMP_DINGTALK_REVIEW_LINK_TTL_HOURS:-168}
+    COMP_DINGTALK_READ_SYNC_ENABLED: ${COMP_DINGTALK_READ_SYNC_ENABLED:-false}
+    COMP_DINGTALK_STORE_ROOT_NAMES: ${COMP_DINGTALK_STORE_ROOT_NAMES:-潮发运营中心,九亩地,中山}
+    COMP_DINGTALK_DINING_MANAGER_TITLES: ${COMP_DINGTALK_DINING_MANAGER_TITLES:-店长}
+    COMP_DINGTALK_KITCHEN_MANAGER_TITLES: ${COMP_DINGTALK_KITCHEN_MANAGER_TITLES:-厨房经理}
+    COMP_DINGTALK_ORG_ROOT_MAPPINGS: ${COMP_DINGTALK_ORG_ROOT_MAPPINGS:-}
+    COMP_DINGTALK_ORG_SYNC_TIMEZONE: ${COMP_DINGTALK_ORG_SYNC_TIMEZONE:-Asia/Shanghai}
+    COMP_DINGTALK_ORG_SYNC_FRESHNESS_MINUTES: ${COMP_DINGTALK_ORG_SYNC_FRESHNESS_MINUTES:-5}
+    COMP_DINGTALK_PUBLIC_BASE_URL: ${COMP_DINGTALK_PUBLIC_BASE_URL:-}
+    # Empty by default. Only an intentionally disposable browser-E2E stack
+    # sets this non-secret identifier for /api/health verification.
+    COMP_E2E_TARGET_MARKER: ${COMP_E2E_TARGET_MARKER:-}
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - app_network
+
 services:
   postgres:
     image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
@@ -24,42 +63,9 @@ services:
     restart: unless-stopped
 
   backend:
-    build: ../backend
-    environment:
-      COMP_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-comp}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-compensation}
-      COMP_SECRET_KEY: ${COMP_SECRET_KEY:?COMP_SECRET_KEY 未设置：请在 deploy/.env 配置强随机密钥}
-      COMP_ENCRYPTION_KEY: ${COMP_ENCRYPTION_KEY:?COMP_ENCRYPTION_KEY 未设置：请在 deploy/.env 配置强随机密钥}
-      COMP_COOKIE_SECURE: ${COMP_COOKIE_SECURE:-true}
-      COMP_DEBUG: ${COMP_DEBUG:-false}
-      # sandbox is fail-safe: credentials may be verified/configured without
-      # allowing any salary notification to leave the application.
-      COMP_DINGTALK_MODE: ${COMP_DINGTALK_MODE:-sandbox}
-      COMP_DINGTALK_APP_ID: ${COMP_DINGTALK_APP_ID:-}
-      COMP_DINGTALK_CORP_ID: ${COMP_DINGTALK_CORP_ID:-}
-      COMP_DINGTALK_CLIENT_ID: ${COMP_DINGTALK_CLIENT_ID:-}
-      COMP_DINGTALK_CLIENT_SECRET: ${COMP_DINGTALK_CLIENT_SECRET:-}
-      COMP_DINGTALK_AGENT_ID: ${COMP_DINGTALK_AGENT_ID:-}
-      COMP_DINGTALK_REVIEW_SESSION_TTL_MINUTES: ${COMP_DINGTALK_REVIEW_SESSION_TTL_MINUTES:-15}
-      COMP_DINGTALK_REVIEW_SESSION_MAX_ATTEMPTS: ${COMP_DINGTALK_REVIEW_SESSION_MAX_ATTEMPTS:-10}
-      COMP_DINGTALK_REVIEW_SESSION_IP_MAX_ATTEMPTS: ${COMP_DINGTALK_REVIEW_SESSION_IP_MAX_ATTEMPTS:-300}
-      COMP_DINGTALK_REVIEW_SESSION_ATTEMPT_WINDOW_MINUTES: ${COMP_DINGTALK_REVIEW_SESSION_ATTEMPT_WINDOW_MINUTES:-15}
-      COMP_DINGTALK_REVIEW_LINK_TTL_HOURS: ${COMP_DINGTALK_REVIEW_LINK_TTL_HOURS:-168}
-      COMP_DINGTALK_READ_SYNC_ENABLED: ${COMP_DINGTALK_READ_SYNC_ENABLED:-false}
-      COMP_DINGTALK_STORE_ROOT_NAMES: ${COMP_DINGTALK_STORE_ROOT_NAMES:-潮发运营中心,九亩地,中山}
-      COMP_DINGTALK_DINING_MANAGER_TITLES: ${COMP_DINGTALK_DINING_MANAGER_TITLES:-店长}
-      COMP_DINGTALK_KITCHEN_MANAGER_TITLES: ${COMP_DINGTALK_KITCHEN_MANAGER_TITLES:-厨房经理}
-      COMP_DINGTALK_ORG_ROOT_MAPPINGS: ${COMP_DINGTALK_ORG_ROOT_MAPPINGS:-}
-      COMP_DINGTALK_ORG_SYNC_TIMEZONE: ${COMP_DINGTALK_ORG_SYNC_TIMEZONE:-Asia/Shanghai}
-      COMP_DINGTALK_ORG_SYNC_FRESHNESS_MINUTES: ${COMP_DINGTALK_ORG_SYNC_FRESHNESS_MINUTES:-5}
-      COMP_DINGTALK_PUBLIC_BASE_URL: ${COMP_DINGTALK_PUBLIC_BASE_URL:-}
-      # Empty by default. Only an intentionally disposable browser-E2E stack
-      # sets this non-secret identifier for /api/health verification.
-      COMP_E2E_TARGET_MARKER: ${COMP_E2E_TARGET_MARKER:-}
+    <<: *backend-runtime
     ports:
       - "127.0.0.1:${COMP_BACKEND_PORT:-8000}:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
       interval: 5s
@@ -68,9 +74,13 @@ services:
       # The entrypoint applies migrations before Uvicorn starts. Do not mark a
       # healthy-but-upgrading instance unhealthy during that bounded startup.
       start_period: 90s
-    networks:
-      - app_network
     restart: unless-stopped
+
+  dingtalk-org-sync-job:
+    <<: *backend-runtime
+    command: ["python", "-m", "app.dingtalk.org_sync_job"]
+    restart: "no"
+    profiles: ["org-sync-job"]
 
   frontend:
     build: ../frontend

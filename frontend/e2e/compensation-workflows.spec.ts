@@ -84,4 +84,301 @@ test.describe('compensation workflows', () => {
     // globalSetup has verified this is a disposable E2E stack. The CI stack is
     // destroyed after the run, so this test deliberately has no product API cleanup.
   })
+
+  test('reviews a scheduled organization preview and applies one conflict-free refresh', async ({
+    page,
+    e2eTargetGuard,
+  }) => {
+    test.setTimeout(60_000)
+
+    const scheduledBatch = '11111111111111111111111111111111'
+    const manualBatch = '22222222222222222222222222222222'
+    const farFuture = {
+      created_at: '2099-07-22T00:00:00Z',
+      last_checked_at: '2099-07-22T00:01:00Z',
+      expires_at: '2099-07-22T00:16:00Z',
+    }
+    const regionItem = {
+      id: 90001,
+      kind: 'REGION',
+      remote_department_id: 91001,
+      remote_department_name: 'E2E Mock 新区域',
+      remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域',
+      action: 'CREATE',
+      change_fields: ['name', 'dingtalk_dept_id'],
+      match_method: 'E2E_MOCK_REMOTE_ONLY',
+      proposed_org_unit_id: null,
+      proposed_org_unit_name: 'E2E Mock 新区域',
+      proposed_parent_org_unit_id: 92001,
+      proposed_parent_org_unit_name: 'E2E Mock 集团',
+      status: 'READY',
+      conflict_code: null,
+    }
+    const storeItem = {
+      id: 90002,
+      kind: 'STORE',
+      remote_department_id: 91002,
+      remote_department_name: 'E2E Mock 新门店',
+      remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      action: 'CREATE',
+      change_fields: ['name', 'parent_id', 'dingtalk_dept_id'],
+      match_method: 'E2E_MOCK_REMOTE_ONLY',
+      proposed_org_unit_id: null,
+      proposed_org_unit_name: 'E2E Mock 新门店',
+      proposed_parent_org_unit_id: null,
+      proposed_parent_org_unit_name: 'E2E Mock 新区域',
+      status: 'READY',
+      conflict_code: null,
+    }
+    const assignedReviewer = {
+      id: 90003,
+      remote_department_id: 91002,
+      remote_department_name: 'E2E Mock 新门店',
+      remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      department: 'DINING',
+      action: 'ASSIGN',
+      dingtalk_name: 'E2E Mock 厅面负责人',
+      proposed_employee_id: 93001,
+      proposed_employee_name: 'E2E Mock 厅面员工',
+      match_method: 'E2E_MOCK_JOB_NUMBER',
+      current_reviewer_name: null,
+      status: 'READY',
+      conflict_code: null,
+    }
+    const removedReviewer = {
+      id: 90004,
+      remote_department_id: 91002,
+      remote_department_name: 'E2E Mock 新门店',
+      remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      department: 'KITCHEN',
+      action: 'REMOVE',
+      dingtalk_name: null,
+      proposed_employee_id: null,
+      proposed_employee_name: null,
+      match_method: 'E2E_MOCK_MISSING_MANAGER',
+      current_reviewer_name: 'E2E Mock 旧厨房负责人',
+      status: 'READY',
+      conflict_code: null,
+    }
+    const conflictingReviewer = {
+      id: 90005,
+      remote_department_id: 91003,
+      remote_department_name: 'E2E Mock 冲突门店',
+      remote_department_path: 'E2E Mock 集团 / E2E Mock 冲突门店',
+      department: 'DINING',
+      action: 'CONFLICT',
+      dingtalk_name: 'E2E Mock 冲突负责人',
+      proposed_employee_id: null,
+      proposed_employee_name: null,
+      match_method: 'E2E_MOCK_AMBIGUOUS',
+      current_reviewer_name: null,
+      status: 'CONFLICT',
+      conflict_code: 'ORG_MANAGER_AMBIGUOUS',
+    }
+    const manualPreview = {
+      batch_id: manualBatch,
+      trigger: 'MANUAL',
+      ...farFuture,
+      remote_regions: 1,
+      local_regions: 0,
+      ready_regions: 1,
+      region_conflicts: 0,
+      remote_stores: 1,
+      local_stores: 0,
+      ready_stores: 1,
+      store_conflicts: 0,
+      ready_reviewers: 2,
+      reviewer_conflicts: 0,
+      warnings: 1,
+      region_items: [regionItem],
+      store_items: [storeItem],
+      reviewer_items: [assignedReviewer, removedReviewer],
+    }
+    const scheduledPreview = {
+      ...manualPreview,
+      batch_id: scheduledBatch,
+      trigger: 'SCHEDULED',
+      reviewer_conflicts: 1,
+      reviewer_items: [assignedReviewer, removedReviewer, conflictingReviewer],
+    }
+    const oldTree = [
+      {
+        id: 92001,
+        code: 'E2E-MOCK-GROUP',
+        name: 'E2E Mock 集团',
+        type: 'GROUP',
+        parent_id: null,
+        city: null,
+        status: 'ACTIVE',
+        children: [
+          {
+            id: 92003,
+            code: 'E2E-MOCK-EXISTING-REGION',
+            name: 'E2E Mock 既有区域',
+            type: 'REGION',
+            parent_id: 92001,
+            city: null,
+            status: 'ACTIVE',
+            children: [],
+          },
+        ],
+      },
+    ]
+    const newTree = [
+      {
+        ...oldTree[0],
+        children: [
+          ...oldTree[0].children,
+          {
+            id: 92002,
+            code: 'E2E-MOCK-REGION',
+            name: 'E2E Mock 新区域',
+            type: 'REGION',
+            parent_id: 92001,
+            city: null,
+            status: 'ACTIVE',
+            children: [],
+          },
+        ],
+      },
+    ]
+
+    const counters = { latestReads: 0, treeReads: 0, previewPosts: 0, applyPosts: 0 }
+    const unexpectedOrgSyncRequests: string[] = []
+    let applied = false
+    let previewResponseArmed = false
+    let applyResponseArmed = false
+    let latestPreview = scheduledPreview
+
+    await page.route('**/api/dingtalk/sync/organization/**', async (route) => {
+      const request = route.request()
+      const url = new URL(request.url())
+      const requestKey = `${request.method()} ${url.pathname}`
+      if (url.origin !== e2eTargetGuard.verifiedOrigin) {
+        unexpectedOrgSyncRequests.push(requestKey)
+        await route.abort('blockedbyclient')
+        return
+      }
+      if (
+        request.method() === 'GET' &&
+        url.pathname === '/api/dingtalk/sync/organization/latest'
+      ) {
+        counters.latestReads += 1
+        await route.fulfill({ status: 200, contentType: 'application/json', json: latestPreview })
+        return
+      }
+      if (
+        request.method() === 'POST' &&
+        url.pathname === '/api/dingtalk/sync/organization/preview' &&
+        previewResponseArmed
+      ) {
+        previewResponseArmed = false
+        counters.previewPosts += 1
+        latestPreview = manualPreview
+        await route.fulfill({ status: 200, contentType: 'application/json', json: manualPreview })
+        return
+      }
+      if (
+        request.method() === 'POST' &&
+        url.pathname === `/api/dingtalk/sync/organization/${manualBatch}/apply` &&
+        applyResponseArmed
+      ) {
+        applyResponseArmed = false
+        counters.applyPosts += 1
+        applied = true
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          json: {
+            applied_regions: 1,
+            applied_stores: 1,
+            applied_reviewers: 2,
+            unresolved: 0,
+            already_applied: false,
+          },
+        })
+        return
+      }
+      unexpectedOrgSyncRequests.push(requestKey)
+      await route.fulfill({ status: 500, contentType: 'application/json', json: { detail: 'blocked' } })
+    })
+    await page.route('**/api/org/tree', async (route) => {
+      const request = route.request()
+      const url = new URL(request.url())
+      if (
+        url.origin !== e2eTargetGuard.verifiedOrigin ||
+        request.method() !== 'GET' ||
+        url.pathname !== '/api/org/tree'
+      ) {
+        await route.abort('blockedbyclient')
+        return
+      }
+      counters.treeReads += 1
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        json: applied ? newTree : oldTree,
+      })
+    })
+
+    e2eTargetGuard.assertPageOrigin(page)
+    await page.getByTestId('nav-org').click()
+    await expect(page).toHaveURL(`${e2eTargetGuard.verifiedOrigin}/org`)
+    e2eTargetGuard.assertPageOrigin(page)
+
+    const status = page.getByRole('region', { name: '钉钉组织同步状态' })
+    await expect(status.getByText('定时检查', { exact: true })).toBeVisible()
+    await expect(page.getByRole('dialog', { name: '钉钉组织同步预览' })).toHaveCount(0)
+    await status.getByRole('button', { name: '查看预览', exact: true }).click()
+
+    const scheduledDialog = page.getByRole('dialog', { name: '钉钉组织同步预览' })
+    await expect(scheduledDialog).toBeVisible()
+    await expect(scheduledDialog.getByRole('region', { name: '区域变更（1）' })).toBeVisible()
+    await expect(scheduledDialog.getByRole('region', { name: '门店变更（1）' })).toBeVisible()
+    await expect(scheduledDialog.getByRole('region', { name: '负责人分配（1）' })).toBeVisible()
+    await expect(scheduledDialog.getByRole('region', { name: '负责人撤销（1）' })).toBeVisible()
+    await expect(scheduledDialog.getByRole('region', { name: '负责人冲突（1）' })).toContainText(
+      'ORG_MANAGER_AMBIGUOUS',
+    )
+    await expect(
+      scheduledDialog.getByRole('button', { name: '确认应用变更', exact: true }),
+    ).toBeDisabled()
+    expect(counters.applyPosts).toBe(0)
+    await scheduledDialog.getByRole('button', { name: /取\s*消/ }).click()
+
+    previewResponseArmed = true
+    const previewResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === '/api/dingtalk/sync/organization/preview' &&
+        response.request().method() === 'POST',
+    )
+    await status.getByRole('button', { name: '刷新预览', exact: true }).click()
+    expect((await previewResponse).status()).toBe(200)
+
+    const manualDialog = page.getByRole('dialog', { name: '钉钉组织同步预览' })
+    await expect(manualDialog.getByText('手动检查', { exact: false })).toBeVisible()
+    const applyButton = manualDialog.getByRole('button', {
+      name: '确认应用变更',
+      exact: true,
+    })
+    await expect(applyButton).toBeEnabled()
+
+    applyResponseArmed = true
+    const applyResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname ===
+          `/api/dingtalk/sync/organization/${manualBatch}/apply` &&
+        response.request().method() === 'POST',
+    )
+    await applyButton.click()
+    expect((await applyResponse).status()).toBe(200)
+
+    await expect(manualDialog).toHaveCount(0)
+    await expect.poll(() => counters.latestReads).toBeGreaterThanOrEqual(2)
+    await expect.poll(() => counters.treeReads).toBeGreaterThanOrEqual(2)
+    await expect(page.getByText('E2E Mock 新区域（区域）', { exact: true })).toBeVisible()
+    expect(counters.previewPosts).toBe(1)
+    expect(counters.applyPosts).toBe(1)
+    expect(unexpectedOrgSyncRequests).toEqual([])
+  })
 })

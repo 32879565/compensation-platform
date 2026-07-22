@@ -47,6 +47,34 @@ def test_dingtalk_root_mappings_are_canonical(monkeypatch):
     assert settings.dingtalk_org_root_mapping_pairs == ((100, "GROUP-GZ"), (200, "GROUP-SZ"))
 
 
+def test_dingtalk_org_sync_timezone_defaults_to_asia_shanghai(monkeypatch):
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.delenv("COMP_DINGTALK_ORG_SYNC_TIMEZONE", raising=False)
+
+    assert Settings(_env_file=None).dingtalk_org_sync_timezone == "Asia/Shanghai"
+
+
+def test_dingtalk_org_sync_timezone_accepts_asia_shanghai(monkeypatch):
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.setenv("COMP_DINGTALK_ORG_SYNC_TIMEZONE", " Asia/Shanghai ")
+
+    assert Settings(_env_file=None).dingtalk_org_sync_timezone == "Asia/Shanghai"
+
+
+def test_dingtalk_org_sync_timezone_rejects_an_invalid_iana_name(monkeypatch):
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.setenv("COMP_DINGTALK_ORG_SYNC_TIMEZONE", "Asia/Not-A-Timezone")
+
+    with pytest.raises(ValidationError, match="valid IANA timezone"):
+        Settings(_env_file=None)
+
+
 def test_missing_secret_key_fails_closed(monkeypatch):
     # 清空环境中的必填项，构造时不读 .env，应因缺 secret_key/database_url 而失败
     for key in ("COMP_SECRET_KEY", "COMP_DATABASE_URL"):
