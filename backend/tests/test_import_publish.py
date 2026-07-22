@@ -401,9 +401,7 @@ def test_import_publish_targets_restore_the_persisted_locked_store_range(db_sess
     publish_import_for_review(db_session, imported, store_ids={first_store.id})
 
     targets = publish_module.list_import_publish_targets(db_session, imported)
-    assert [(target.store_id, target.locked) for target in targets] == [
-        (first_store.id, True)
-    ]
+    assert [(target.store_id, target.locked) for target in targets] == [(first_store.id, True)]
 
 
 def test_publish_rejects_workbook_department_that_conflicts_with_employee_master(db_session):
@@ -587,6 +585,11 @@ def test_publish_retry_rejects_a_different_store_selection(db_session):
         publish_import_for_review(db_session, imported, store_ids={second_store.id})
 
     assert same.already_published is True
+    assert same.payroll_batch_id == first.payroll_batch_id
+    results = list(db_session.scalars(select(PayrollResult)).all())
+    assert {(row.employee_id, row.org_unit_id) for row in results} == {
+        (first_employee.id, first_store.id)
+    }
 
 
 def test_publish_retry_rejects_a_missing_department_confirmation(db_session):
@@ -640,11 +643,6 @@ def test_publish_retry_rejects_a_missing_department_confirmation(db_session):
 
     with pytest.raises(ImportPublishError, match="复核范围不完整"):
         publish_import_for_review(db_session, imported, store_ids={store.id})
-    assert same.payroll_batch_id == first.payroll_batch_id
-    results = list(db_session.scalars(select(PayrollResult)).all())
-    assert {(row.employee_id, row.org_unit_id) for row in results} == {
-        (first_employee.id, first_store.id)
-    }
 
 
 def test_excel_delivery_retry_requeues_the_failed_row_after_routing_is_fixed(db_session):

@@ -54,6 +54,7 @@ class ImportPublishTarget:
     store_name: str
     employee_count: int
     departments: tuple[Department, ...]
+    locked: bool = False
 
 
 @dataclass(frozen=True)
@@ -355,6 +356,62 @@ def _target_department(record: SalaryRecord, employee: Employee | None) -> Depar
     return None
 
 
+def _load_published_scopes(
+    session: Session,
+    imported: ImportBatch,
+) -> tuple[PayrollBatch, frozenset[tuple[int, Department]]]:
+    """Load and verify the immutable store/department range of a published import."""
+
+    if imported.published_batch_id is None or imported.published_batch_version is None:
+        raise ImportPublishError("导入批次的发布关联不完整，请联系系统管理员")
+    payroll_batch = session.get(PayrollBatch, imported.published_batch_id)
+    if payroll_batch is None:
+        raise ImportPublishError("已发布的薪资批次不存在，请联系系统管理员")
+    if payroll_batch.version != imported.published_batch_version:
+        raise ImportPublishError("该导入已发布到历史版本；请上传修正后的新文件")
+
+    result_rows: list[tuple[int | None, Department]] = list(
+        session.execute(
+            select(PayrollResult.org_unit_id, PayrollResult.department).where(
+                PayrollResult.source_import_batch_id == imported.id,
+                PayrollResult.batch_id == payroll_batch.id,
+                PayrollResult.batch_version == imported.published_batch_version,
+            )
+        )
+        .tuples()
+        .all()
+    )
+    confirmation_rows: list[tuple[int | None, Department]] = list(
+        session.execute(
+            select(BatchConfirmation.org_unit_id, BatchConfirmation.department).where(
+                BatchConfirmation.batch_id == payroll_batch.id,
+                BatchConfirmation.batch_version == imported.published_batch_version,
+            )
+        )
+        .tuples()
+        .all()
+    )
+    valid_departments = {Department.DINING, Department.KITCHEN}
+    if any(
+        org_unit_id is None or department not in valid_departments
+        for org_unit_id, department in result_rows + confirmation_rows
+    ):
+        raise ImportPublishError("已发布的薪资复核范围不完整，请联系系统管理员")
+    result_scopes = frozenset(
+        (org_unit_id, department)
+        for org_unit_id, department in result_rows
+        if org_unit_id is not None
+    )
+    confirmation_scopes = frozenset(
+        (org_unit_id, department)
+        for org_unit_id, department in confirmation_rows
+        if org_unit_id is not None
+    )
+    if not result_scopes or result_scopes != confirmation_scopes:
+        raise ImportPublishError("已发布的薪资复核范围不完整，请联系系统管理员")
+    return payroll_batch, result_scopes
+
+
 def list_import_publish_targets(
     session: Session,
     imported: ImportBatch,
@@ -365,6 +422,11 @@ def list_import_publish_targets(
         raise ImportPublishError("仅人事 Excel 导入可以推送复核")
     if imported.status != ImportStatus.CONFIRMED:
         raise ImportPublishError("请先确认导入数据，再选择推送门店")
+    locked_store_ids: frozenset[int] | None = None
+    if imported.published_batch_id is not None or imported.published_batch_version is not None:
+        _payroll_batch, published_scopes = _load_published_scopes(session, imported)
+        locked_store_ids = frozenset(store_id for store_id, _department in published_scopes)
+
     records = list(
         session.scalars(
             select(SalaryRecord)
@@ -375,6 +437,8 @@ def list_import_publish_targets(
             .order_by(SalaryRecord.id)
         ).all()
     )
+    if locked_store_ids is not None:
+        records = [record for record in records if record.org_unit_id in locked_store_ids]
     if not records:
         raise ImportPublishError("导入批次没有可推送的工资数据")
 
@@ -400,6 +464,9 @@ def list_import_publish_targets(
         if department is not None:
             departments.setdefault(record.org_unit_id, set()).add(department)
 
+    if locked_store_ids is not None and set(employee_keys) != set(locked_store_ids):
+        raise ImportPublishError("已发布的薪资复核范围不完整，请联系系统管理员")
+
     department_order = {
         Department.DINING: 0,
         Department.KITCHEN: 1,
@@ -412,6 +479,7 @@ def list_import_publish_targets(
             departments=tuple(
                 sorted(departments.get(store_id, set()), key=department_order.__getitem__)
             ),
+            locked=locked_store_ids is not None,
         )
         for store_id in sorted(employee_keys)
     ]
@@ -423,32 +491,8 @@ def _published_summary(
     *,
     selected_store_ids: frozenset[int],
 ) -> ImportPublishSummary:
-    if imported.published_batch_id is None or imported.published_batch_version is None:
-        raise ImportPublishError("导入批次的发布关联不完整，请联系系统管理员")
-    payroll_batch = session.get(PayrollBatch, imported.published_batch_id)
-    if payroll_batch is None:
-        raise ImportPublishError("已发布的薪资批次不存在，请联系系统管理员")
-    if payroll_batch.version != imported.published_batch_version:
-        raise ImportPublishError("该导入已发布到历史版本；请上传修正后的新文件")
-    result_store_ids = set(
-        session.scalars(
-            select(PayrollResult.org_unit_id).where(
-                PayrollResult.source_import_batch_id == imported.id,
-                PayrollResult.batch_id == payroll_batch.id,
-                PayrollResult.batch_version == imported.published_batch_version,
-            )
-        ).all()
-    )
-    confirmation_store_ids = set(
-        session.scalars(
-            select(BatchConfirmation.org_unit_id).where(
-                BatchConfirmation.batch_id == payroll_batch.id,
-                BatchConfirmation.batch_version == imported.published_batch_version,
-            )
-        ).all()
-    )
-    if None in result_store_ids or result_store_ids != confirmation_store_ids:
-        raise ImportPublishError("已发布的薪资复核范围不完整，请联系系统管理员")
+    payroll_batch, published_scopes = _load_published_scopes(session, imported)
+    result_store_ids = {store_id for store_id, _department in published_scopes}
     if result_store_ids != selected_store_ids:
         raise ImportPublishError("该导入批次已经按其他门店范围发布")
     employees = (
@@ -463,17 +507,7 @@ def _published_summary(
         )
         or 0
     )
-    scopes = (
-        session.scalar(
-            select(func.count())
-            .select_from(BatchConfirmation)
-            .where(
-                BatchConfirmation.batch_id == payroll_batch.id,
-                BatchConfirmation.batch_version == imported.published_batch_version,
-            )
-        )
-        or 0
-    )
+    scopes = len(published_scopes)
     if employees <= 0 or scopes <= 0:
         raise ImportPublishError("已发布的薪资复核数据不完整，请联系系统管理员")
     return ImportPublishSummary(

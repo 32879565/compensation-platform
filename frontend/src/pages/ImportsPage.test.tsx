@@ -32,18 +32,21 @@ const publishTargets = [
     store_name: '一店',
     employee_count: 1,
     departments: ['DINING'],
+    locked: false,
   },
   {
     store_id: 202,
     store_name: '二店',
     employee_count: 1,
     departments: ['KITCHEN'],
+    locked: false,
   },
   {
     store_id: 303,
     store_name: '三店',
     employee_count: 1,
     departments: ['DINING', 'KITCHEN'],
+    locked: false,
   },
 ]
 
@@ -256,6 +259,10 @@ describe('ImportsPage salary workbook workflow', () => {
     expect(importsApi.publishSalaryImport).not.toHaveBeenCalled()
     expect(await screen.findByText('确认推送薪资复核？')).toBeTruthy()
     expect(screen.getByText(/一店、二店/)).toBeTruthy()
+    expect(screen.getByText('首次推送后门店范围将立即锁定')).toBeTruthy()
+    expect(
+      screen.getByText(/本次已选择 2 家，未选择 1 家.*未选择的门店将不能再使用该导入批次追加推送/),
+    ).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '确认推送' }))
 
     await waitFor(() =>
@@ -270,6 +277,65 @@ describe('ImportsPage salary workbook workflow', () => {
     expect(screen.queryByRole('checkbox', { name: /二店/ })).toBeNull()
     expect(screen.queryByRole('checkbox', { name: /三店/ })).toBeNull()
     expect(screen.queryByRole('button', { name: '推送给店长和厨房经理' })).toBeNull()
+  })
+
+  it('restores and locks the persisted store range for an idempotent publish retry', async () => {
+    importsApi.uploadSalaryImport.mockResolvedValue({
+      id: 8,
+      filename: '七月薪资.xlsx',
+      period: '2026-07',
+      status: 'PARSED',
+      total_rows: 1,
+      error_rows: 0,
+    })
+    importsApi.fetchSalaryImportRows.mockResolvedValue([
+      {
+        row_index: 0,
+        period: '2026-07',
+        emp_no: 'E001',
+        name: '林月',
+        store_name: '一店',
+        parsed_fields: { 应发工资: '5200.00' },
+        errors: [],
+        status: 'OK',
+      },
+    ])
+    importsApi.fetchSalaryImportPublishTargets.mockResolvedValue([
+      { ...publishTargets[0], locked: true },
+    ])
+    importsApi.publishSalaryImport.mockResolvedValueOnce({
+      import_batch_id: 8,
+      payroll_batch_id: 19,
+      batch_version: 3,
+      employees: 1,
+      scopes: 1,
+      routed: 1,
+      configuration_failures: 0,
+      existing: 1,
+      already_published: true,
+      sandbox: true,
+    })
+    renderPage()
+
+    await uploadWorkbook()
+    fireEvent.click(await screen.findByRole('button', { name: '确认写入薪资记录' }))
+
+    expect(await screen.findByText('该导入批次的推送门店范围已锁定')).toBeTruthy()
+    const store = screen.getByRole('checkbox', { name: /一店/ }) as HTMLInputElement
+    expect(store.checked).toBe(true)
+    expect(store.disabled).toBe(true)
+    expect((screen.getByRole('button', { name: /全\s*选/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect((screen.getByRole('button', { name: /清\s*空/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '按原范围重试推送' }))
+    expect(await screen.findByText('已锁定范围幂等重试')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '确认推送' }))
+
+    await waitFor(() => expect(importsApi.publishSalaryImport).toHaveBeenCalledWith(8, [101]))
   })
 
   it('keeps an idempotent retry action when reviewer notification configuration fails', async () => {

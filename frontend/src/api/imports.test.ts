@@ -9,6 +9,7 @@ import {
   fetchSalaryImportPublishTargets,
   fetchSalaryImportRows,
   publishSalaryImport,
+  type SalaryImportPublishTarget,
   uploadSalaryImport,
 } from './imports'
 
@@ -41,21 +42,24 @@ describe('salary import API', () => {
   })
 
   it('reads staging rows and publish targets, then publishes only the selected stores', async () => {
+    const targets: SalaryImportPublishTarget[] = [
+      {
+        store_id: 11,
+        store_name: '一店',
+        employee_count: 1,
+        departments: ['DINING'],
+        locked: false,
+      },
+      {
+        store_id: 22,
+        store_name: '二店',
+        employee_count: 1,
+        departments: ['KITCHEN'],
+        locked: false,
+      },
+    ]
     client.get.mockResolvedValueOnce({ data: [] }).mockResolvedValueOnce({
-      data: [
-        {
-          store_id: 11,
-          store_name: '一店',
-          employee_count: 1,
-          departments: ['DINING'],
-        },
-        {
-          store_id: 22,
-          store_name: '二店',
-          employee_count: 1,
-          departments: ['KITCHEN'],
-        },
-      ],
+      data: targets,
     })
     client.post.mockResolvedValueOnce({ data: { written: 2 } }).mockResolvedValueOnce({
       data: {
@@ -73,7 +77,7 @@ describe('salary import API', () => {
 
     await fetchSalaryImportRows(8)
     await confirmSalaryImport(8)
-    await fetchSalaryImportPublishTargets(8)
+    await expect(fetchSalaryImportPublishTargets(8)).resolves.toEqual(targets)
     await publishSalaryImport(8, [11, 22])
 
     expect(client.get).toHaveBeenNthCalledWith(1, '/api/imports/8')
