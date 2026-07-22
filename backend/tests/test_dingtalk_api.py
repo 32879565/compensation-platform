@@ -506,6 +506,7 @@ def _live_settings() -> Settings:
         dingtalk_agent_id=123,
         dingtalk_public_base_url="https://payroll.example.test",
         dingtalk_read_sync_enabled=True,
+        dingtalk_org_root_mappings="10:GROUP",
     )
 
 
