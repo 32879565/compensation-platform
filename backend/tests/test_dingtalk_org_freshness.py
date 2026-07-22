@@ -153,7 +153,7 @@ def _add_applied_sync(
                 proposed_employee_id=employee.id,
                 proposed_org_type=None,
                 department=Department.DINING,
-                match_method="ASSIGN|JOB_NUMBER",
+                match_method="JOB_NUMBER",
                 change_fields=["reviewer_scope"],
                 applied_identity_proof=dingtalk_organization_identity_proof(
                     employee.dingtalk_user_id_hash or "",

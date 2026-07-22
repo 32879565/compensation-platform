@@ -31,6 +31,12 @@ from app.dingtalk.client import (
     DingTalkOrganizationUser,
 )
 from app.dingtalk.org_rules import manager_department_for_title
+from app.dingtalk.org_structure import (
+    ClassifiedNode,
+    OrganizationStructureError,
+    classify_organization,
+    normalize_org_name,
+)
 from app.dingtalk.read_sync import (
     LocalEmployeeIdentity,
     blind_index_dingtalk_user_id,
@@ -45,17 +51,15 @@ from app.models.dingtalk import (
     DingTalkOrgSyncItem,
     DingTalkOrgSyncItemKind,
     DingTalkOrgSyncItemStatus,
+    DingTalkOrgSyncTrigger,
 )
 from app.models.employee import Department, Employee, EmployeeStatus
 from app.models.org import OrgType, OrgUnit
 
 _PREVIEW_TTL = timedelta(minutes=15)
-_DEFAULT_STORE_ROOT_NAMES = frozenset({"潮发运营中心", "九亩地", "中山"})
 _MAX_PATH_LENGTH = 1024
 _ORG_SYNC_LOCK_NAME = "compensation-platform:dingtalk-organization-sync:v2"
 _ALLOWED_REVIEWER_ROLES = frozenset({"STORE_MANAGER", "EMPLOYEE"})
-_STORE_ACTIONS = frozenset({"LINK", "CREATE", "ACTIVATE", "UPDATE", "MISSING_IN_DINGTALK"})
-_REVIEWER_ACTIONS = frozenset({"ASSIGN", "REMOVE", "CONFLICT"})
 
 
 class DingTalkOrganizationSyncError(RuntimeError):
@@ -71,9 +75,11 @@ class _ConcurrentChange(RuntimeError):
 
 
 @dataclass(frozen=True)
-class StorePreviewItem:
+class OrganizationNodePreviewItem:
     id: int
-    action: str
+    kind: OrgType
+    action: DingTalkOrgSyncAction
+    change_fields: tuple[str, ...]
     match_method: str
     remote_department_id: int | None
     remote_department_name: str
@@ -106,14 +112,23 @@ class ReviewerPreviewItem:
 @dataclass(frozen=True)
 class OrganizationPreview:
     batch_id: str
+    trigger: DingTalkOrgSyncTrigger
+    created_at: datetime
+    last_checked_at: datetime
     expires_at: datetime
+    remote_regions: int
+    local_regions: int
+    ready_regions: int
+    region_conflicts: int
     remote_stores: int
     local_stores: int
     ready_stores: int
     store_conflicts: int
     ready_reviewers: int
     reviewer_conflicts: int
-    store_items: tuple[StorePreviewItem, ...]
+    warnings: int
+    region_items: tuple[OrganizationNodePreviewItem, ...]
+    store_items: tuple[OrganizationNodePreviewItem, ...]
     reviewer_items: tuple[ReviewerPreviewItem, ...]
 
 
@@ -205,26 +220,6 @@ def _fingerprint(*parts: object) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _encode_method(action: str, method: str) -> str:
-    encoded = f"{action}|{method}"
-    if len(encoded) > 64:
-        raise RuntimeError("organization sync method encoding exceeds storage limit")
-    return encoded
-
-
-def _decode_method(item: DingTalkOrgSyncItem) -> tuple[str, str]:
-    try:
-        action, method = item.match_method.split("|", 1)
-    except ValueError as exc:
-        raise RuntimeError("invalid staged organization sync method") from exc
-    valid_actions = (
-        _STORE_ACTIONS if item.kind == DingTalkOrgSyncItemKind.STORE else _REVIEWER_ACTIONS
-    )
-    if action not in valid_actions or not method:
-        raise RuntimeError("invalid staged organization sync method")
-    return action, method
-
-
 def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
@@ -256,35 +251,15 @@ def _snapshot_hash(snapshot: DingTalkOrganizationSnapshot, *, encryption_key: st
     return hmac.new(derived_key, payload, hashlib.sha256).hexdigest()
 
 
-def _root_config_hash(root_mapping_pairs: tuple[tuple[int, str], ...]) -> str:
+def _root_config_hash(root_mappings: tuple[tuple[int, OrgUnit], ...]) -> str:
     """Fingerprint configured remote-root to immutable-local-anchor bindings only."""
 
     payload = json.dumps(
-        sorted(
-            (int(remote_root_id), str(local_anchor_code))
-            for remote_root_id, local_anchor_code in root_mapping_pairs
-        ),
+        sorted((int(remote_root_id), anchor.code) for remote_root_id, anchor in root_mappings),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
-
-
-def _persisted_store_action(action: str) -> tuple[DingTalkOrgSyncAction, list[str]]:
-    mapping = {
-        "LINK": (DingTalkOrgSyncAction.LINK, ["dingtalk_dept_id"]),
-        "CREATE": (
-            DingTalkOrgSyncAction.CREATE,
-            ["code", "name", "parent_id", "type", "dingtalk_dept_id"],
-        ),
-        "UPDATE": (DingTalkOrgSyncAction.UPDATE, ["name"]),
-        "ACTIVATE": (DingTalkOrgSyncAction.ACTIVATE, ["status"]),
-        "MISSING_IN_DINGTALK": (DingTalkOrgSyncAction.DEACTIVATE, ["status"]),
-    }
-    try:
-        return mapping[action]
-    except KeyError as exc:
-        raise RuntimeError("invalid store persistence action") from exc
 
 
 def _persisted_reviewer_action(action: str) -> tuple[DingTalkOrgSyncAction, list[str]]:
@@ -299,57 +274,61 @@ def _persisted_reviewer_action(action: str) -> tuple[DingTalkOrgSyncAction, list
         raise RuntimeError("invalid reviewer persistence action") from exc
 
 
-def _path_for_department(
-    department: DingTalkDepartment,
+def _relative_remote_path(
+    node: ClassifiedNode,
     departments_by_id: dict[int, DingTalkDepartment],
 ) -> str:
     parts: list[str] = []
-    current: DingTalkDepartment | None = department
+    current = node.department
     visited: set[int] = set()
-    while current is not None:
+    while current.department_id != node.root_id:
         if current.department_id in visited:
-            raise DingTalkOrganizationSyncError(
-                "INVALID_DEPARTMENT_TREE",
-                "DingTalk organization contains a department cycle",
-            )
+            raise RuntimeError("classified organization path contains a cycle")
         visited.add(current.department_id)
         parts.append(current.name)
-        current = departments_by_id.get(current.parent_id) if current.parent_id else None
-    path = " / ".join(reversed(parts))
-    if len(path) > _MAX_PATH_LENGTH:
-        raise DingTalkOrganizationSyncError(
-            "INVALID_DEPARTMENT_TREE",
-            "DingTalk organization path exceeds the safety limit",
-        )
-    return path
-
-
-def _local_path(store: OrgUnit, org_units_by_id: dict[int, OrgUnit]) -> str:
-    parts: list[str] = []
-    current: OrgUnit | None = store
-    visited: set[int] = set()
-    while current is not None and current.id not in visited:
-        visited.add(current.id)
-        parts.append(current.name)
-        current = org_units_by_id.get(current.parent_id) if current.parent_id else None
+        parent = departments_by_id.get(current.parent_id) if current.parent_id else None
+        if parent is None:
+            if current.parent_id == node.root_id:
+                break
+            raise RuntimeError("classified organization path left its configured root")
+        current = parent
     return " / ".join(reversed(parts))[:_MAX_PATH_LENGTH]
 
 
-def _is_descendant_of(
-    department: DingTalkDepartment,
-    root_ids: set[int],
-    departments_by_id: dict[int, DingTalkDepartment],
-) -> bool:
-    current: DingTalkDepartment | None = department
+def _local_relative_path(
+    organization: OrgUnit,
+    anchor: OrgUnit,
+    org_units_by_id: dict[int, OrgUnit],
+) -> tuple[str, ...] | None:
+    """Return a normalized path only when the node remains below the anchor."""
+
+    parts: list[str] = []
+    current: OrgUnit | None = organization
     visited: set[int] = set()
-    while current is not None:
-        if current.department_id in root_ids:
-            return True
-        if current.department_id in visited:
-            return False
-        visited.add(current.department_id)
-        current = departments_by_id.get(current.parent_id) if current.parent_id else None
-    return False
+    while current is not None and current.id not in visited:
+        if current.id == anchor.id:
+            return tuple(reversed(parts))
+        visited.add(current.id)
+        parts.append(normalize_org_name(current.name))
+        current = org_units_by_id.get(current.parent_id) if current.parent_id else None
+    return None
+
+
+def _display_local_relative_path(
+    organization: OrgUnit,
+    anchor: OrgUnit,
+    org_units_by_id: dict[int, OrgUnit],
+) -> str:
+    parts: list[str] = []
+    current: OrgUnit | None = organization
+    visited: set[int] = set()
+    while current is not None and current.id not in visited:
+        if current.id == anchor.id:
+            return " / ".join(reversed(parts))[:_MAX_PATH_LENGTH]
+        visited.add(current.id)
+        parts.append(current.name)
+        current = org_units_by_id.get(current.parent_id) if current.parent_id else None
+    raise RuntimeError("organization left its validated authority anchor")
 
 
 def _load_local_state(session: Session, *, for_update: bool = False) -> _LocalState:
@@ -379,6 +358,44 @@ def _load_local_state(session: Session, *, for_update: bool = False) -> _LocalSt
         user_roles=tuple(session.scalars(user_role_statement).all()),
         review_scopes=tuple(session.scalars(scope_statement).all()),
     )
+
+
+def _resolve_root_mappings(
+    state: _LocalState,
+    root_mappings: tuple[tuple[int, str], ...],
+) -> tuple[tuple[int, OrgUnit], ...]:
+    if not root_mappings:
+        raise DingTalkOrganizationSyncError(
+            "ORG_ROOT_CONFIG_INVALID", "DingTalk organization roots are not configured"
+        )
+    remote_ids: set[int] = set()
+    resolved: list[tuple[int, OrgUnit]] = []
+    for remote_id, anchor_code in root_mappings:
+        if (
+            not isinstance(remote_id, int)
+            or isinstance(remote_id, bool)
+            or remote_id <= 0
+            or remote_id in remote_ids
+            or not anchor_code.strip()
+        ):
+            raise DingTalkOrganizationSyncError(
+                "ORG_ROOT_CONFIG_INVALID", "DingTalk organization root mapping is invalid"
+            )
+        remote_ids.add(remote_id)
+        candidates = [
+            organization for organization in state.org_units if organization.code == anchor_code
+        ]
+        if len(candidates) != 1:
+            raise DingTalkOrganizationSyncError(
+                "ORG_ROOT_CONFIG_INVALID", "Configured local organization anchor is not unique"
+            )
+        anchor = candidates[0]
+        if anchor.is_deleted or anchor.status != "ACTIVE" or anchor.type == OrgType.STORE:
+            raise DingTalkOrganizationSyncError(
+                "ORG_ROOT_CONFIG_INVALID", "Configured local organization anchor is invalid"
+            )
+        resolved.append((remote_id, anchor))
+    return tuple(sorted(resolved, key=lambda pair: pair[0]))
 
 
 def _optional_get[T](mapping: dict[int, T], key: int | None) -> T | None:
@@ -416,6 +433,74 @@ def _state_indexes(state: _LocalState) -> tuple[
         users_by_id,
         {user_id: tuple(sorted(codes)) for user_id, codes in role_codes_by_user.items()},
         {key: tuple(sorted(user_ids)) for key, user_ids in scopes.items()},
+    )
+
+
+def _complete_local_baseline(state: _LocalState) -> str:
+    """Fingerprint every local row that can alter organization or reviewer planning."""
+
+    return _fingerprint(
+        "COMPLETE_LOCAL_BASELINE",
+        tuple(
+            (
+                org.id,
+                org.parent_id,
+                org.type.value,
+                org.name,
+                org.code,
+                org.dingtalk_dept_id,
+                org.city,
+                org.status,
+                org.is_deleted,
+                org.updated_at,
+            )
+            for org in state.org_units
+        ),
+        tuple(
+            (
+                employee.id,
+                employee.emp_no,
+                employee.name,
+                employee.version,
+                employee.status.value,
+                employee.org_unit_id,
+                employee.department.value,
+                employee.dingtalk_user_id_hash,
+                employee.is_deleted,
+                employee.updated_at,
+            )
+            for employee in state.employees
+        ),
+        tuple(
+            (
+                user.id,
+                user.employee_id,
+                user.status,
+                user.login_enabled,
+                user.dingtalk_user_id_hash,
+                user.is_deleted,
+                user.updated_at,
+            )
+            for user in state.users
+        ),
+        tuple((role.id, role.code, role.updated_at) for role in state.roles),
+        tuple((assignment.user_id, assignment.role_id) for assignment in state.user_roles),
+        tuple(
+            (scope.user_id, scope.org_unit_id, scope.department.value)
+            for scope in state.review_scopes
+        ),
+    )
+
+
+def _wrap_baselines(items: list[DingTalkOrgSyncItem], complete_local_baseline: str) -> None:
+    for item in items:
+        item.baseline_fingerprint = _fingerprint(item.baseline_fingerprint, complete_local_baseline)
+
+
+def _planned_baseline_hash(items: list[DingTalkOrgSyncItem]) -> str:
+    return _fingerprint(
+        "PLANNED_LOCAL_BASELINES",
+        tuple(sorted((item.row_key, item.baseline_fingerprint) for item in items)),
     )
 
 
@@ -578,26 +663,6 @@ def _manager_department(
     )
 
 
-def _nearest_parent(
-    department: DingTalkDepartment,
-    *,
-    departments_by_id: dict[int, DingTalkDepartment],
-    nonstores_by_name: dict[str, list[OrgUnit]],
-    fallback_groups: list[OrgUnit],
-) -> tuple[OrgUnit | None, str | None]:
-    current = departments_by_id.get(department.parent_id) if department.parent_id else None
-    visited: set[int] = set()
-    while current is not None and current.department_id not in visited:
-        visited.add(current.department_id)
-        candidates = nonstores_by_name.get(_normalize_name(current.name), [])
-        if len(candidates) == 1:
-            return candidates[0], None
-        current = departments_by_id.get(current.parent_id) if current.parent_id else None
-    if len(fallback_groups) == 1:
-        return fallback_groups[0], None
-    return None, "STORE_PARENT_UNRESOLVED"
-
-
 def _current_reviewer_name(
     scope_user_ids: tuple[int, ...], users_by_id: dict[int, User]
 ) -> str | None:
@@ -613,15 +678,107 @@ def _required_reviewer_department(item: DingTalkOrgSyncItem) -> Department:
     return item.department
 
 
+def _reviewer_preview_action(item: DingTalkOrgSyncItem) -> str:
+    if item.action == DingTalkOrgSyncAction.ASSIGN_SCOPE:
+        return "ASSIGN"
+    if item.action == DingTalkOrgSyncAction.REMOVE_SCOPE:
+        return "REMOVE"
+    return "CONFLICT"
+
+
+def _organization_preview_result(
+    batch: DingTalkOrgSyncBatch,
+    items: list[DingTalkOrgSyncItem],
+    *,
+    state: _LocalState,
+    reviewer_metadata: dict[str, _ReviewerDraft],
+) -> OrganizationPreview:
+    proposed_names = {org.id: org.name for org in state.org_units if not org.is_deleted}
+
+    def node_view(row: DingTalkOrgSyncItem) -> OrganizationNodePreviewItem:
+        if row.proposed_org_type not in (OrgType.REGION, OrgType.STORE):
+            raise RuntimeError("organization node preview is missing its proposed type")
+        proposed_name = _optional_get(proposed_names, row.proposed_org_unit_id)
+        if proposed_name is None and row.action == DingTalkOrgSyncAction.CREATE:
+            proposed_name = row.remote_department_name
+        return OrganizationNodePreviewItem(
+            id=row.id,
+            kind=row.proposed_org_type,
+            action=row.action,
+            change_fields=tuple(row.change_fields),
+            match_method=row.match_method,
+            remote_department_id=row.remote_department_id,
+            remote_department_name=row.remote_department_name,
+            remote_department_path=row.remote_department_path,
+            proposed_org_unit_id=row.proposed_org_unit_id,
+            proposed_org_unit_name=proposed_name,
+            proposed_parent_org_unit_id=row.proposed_parent_org_unit_id,
+            proposed_parent_org_unit_name=_optional_get(
+                proposed_names, row.proposed_parent_org_unit_id
+            ),
+            status=row.status,
+            conflict_code=row.conflict_code,
+        )
+
+    reviewer_views: list[ReviewerPreviewItem] = []
+    for row in items:
+        if row.kind != DingTalkOrgSyncItemKind.REVIEWER:
+            continue
+        metadata = reviewer_metadata.get(row.row_key)
+        reviewer_views.append(
+            ReviewerPreviewItem(
+                id=row.id,
+                action=_reviewer_preview_action(row),
+                match_method=row.match_method,
+                remote_department_id=row.remote_department_id,
+                remote_department_name=row.remote_department_name,
+                remote_department_path=row.remote_department_path,
+                department=_required_reviewer_department(row),
+                dingtalk_name=metadata.dingtalk_name if metadata else None,
+                current_reviewer_name=(metadata.current_reviewer_name if metadata else None),
+                proposed_employee_id=row.proposed_employee_id,
+                proposed_employee_name=(metadata.proposed_employee_name if metadata else None),
+                status=row.status,
+                conflict_code=row.conflict_code,
+            )
+        )
+
+    region_items = [item for item in items if item.kind == DingTalkOrgSyncItemKind.REGION]
+    store_items = [item for item in items if item.kind == DingTalkOrgSyncItemKind.STORE]
+    if batch.last_checked_at is None:
+        raise RuntimeError("organization preview is missing its last check time")
+    return OrganizationPreview(
+        batch_id=batch.public_id,
+        trigger=batch.trigger,
+        created_at=batch.created_at,
+        last_checked_at=batch.last_checked_at,
+        expires_at=batch.expires_at,
+        remote_regions=batch.remote_region_count,
+        local_regions=batch.local_region_count,
+        ready_regions=batch.ready_region_count,
+        region_conflicts=batch.region_conflict_count,
+        remote_stores=batch.remote_store_count,
+        local_stores=batch.local_store_count,
+        ready_stores=batch.ready_store_count,
+        store_conflicts=batch.store_conflict_count,
+        ready_reviewers=batch.ready_reviewer_count,
+        reviewer_conflicts=batch.reviewer_conflict_count,
+        warnings=batch.warning_count,
+        region_items=tuple(node_view(row) for row in region_items),
+        store_items=tuple(node_view(row) for row in store_items),
+        reviewer_items=tuple(reviewer_views),
+    )
+
+
 def preview_organization_sync(
     session: Session,
     snapshot: DingTalkOrganizationSnapshot,
     *,
     encryption_key: str,
-    actor: tuple[int, str],
+    actor: tuple[int, str] | None,
+    root_mappings: tuple[tuple[int, str], ...],
+    trigger: DingTalkOrgSyncTrigger = DingTalkOrgSyncTrigger.MANUAL,
     now: datetime | None = None,
-    store_root_names: frozenset[str] = _DEFAULT_STORE_ROOT_NAMES,
-    root_mapping_pairs: tuple[tuple[int, str], ...] = (),
     dining_manager_titles: frozenset[str] = frozenset({"店长"}),
     kitchen_manager_titles: frozenset[str] = frozenset({"厨房经理"}),
 ) -> OrganizationPreview:
@@ -629,6 +786,10 @@ def preview_organization_sync(
 
     take_organization_sync_lock(session)
     current_time = now or datetime.now(UTC)
+    if actor is None and trigger != DingTalkOrgSyncTrigger.SCHEDULED:
+        raise DingTalkOrganizationSyncError(
+            "ORG_ROOT_CONFIG_INVALID", "A manual organization preview requires an actor"
+        )
     state = _load_local_state(session)
     (
         org_units_by_id,
@@ -638,186 +799,238 @@ def preview_organization_sync(
         role_codes_by_user,
         scope_users_by_pair,
     ) = _state_indexes(state)
-
-    local_stores = [
-        org for org in state.org_units if org.type == OrgType.STORE and not org.is_deleted
-    ]
-    local_stores_by_name: dict[str, list[OrgUnit]] = defaultdict(list)
-    local_stores_by_remote_id: dict[int, OrgUnit] = {}
-    for store in local_stores:
-        local_stores_by_name[_normalize_name(store.name)].append(store)
-        if store.dingtalk_dept_id is not None:
-            local_stores_by_remote_id[store.dingtalk_dept_id] = store
-
+    resolved_root_mappings = _resolve_root_mappings(state, root_mappings)
+    anchors_by_root = dict(resolved_root_mappings)
     departments_by_id: dict[int, DingTalkDepartment] = {}
     for department in snapshot.departments:
         if department.department_id in departments_by_id:
             raise DingTalkOrganizationSyncError(
-                "INVALID_DEPARTMENT_TREE", "DingTalk returned a duplicate department"
+                "ORG_SNAPSHOT_INVALID", "DingTalk returned a duplicate department"
             )
         departments_by_id[department.department_id] = department
-    for department in snapshot.departments:
-        _path_for_department(department, departments_by_id)
-    root_ids = {
-        department.department_id
-        for department in snapshot.departments
-        if department.name in store_root_names
+    path_candidates: dict[tuple[int, tuple[str, ...], OrgType], list[OrgUnit]] = defaultdict(list)
+    authority_membership: dict[int, tuple[int, OrgUnit]] = {}
+    exact_store_paths: set[tuple[int, tuple[str, ...]]] = set()
+    for root_id, anchor in resolved_root_mappings:
+        for organization in state.org_units:
+            if organization.is_deleted or organization.id == anchor.id:
+                continue
+            relative_path = _local_relative_path(organization, anchor, org_units_by_id)
+            if relative_path is None:
+                continue
+            if organization.type in (OrgType.REGION, OrgType.STORE):
+                path_candidates[(root_id, relative_path, organization.type)].append(organization)
+                authority_membership.setdefault(organization.id, (root_id, anchor))
+                if organization.type == OrgType.STORE:
+                    exact_store_paths.add((root_id, relative_path))
+
+    bound_types = {
+        organization.dingtalk_dept_id: organization.type
+        for organization in state.org_units
+        if not organization.is_deleted and organization.dingtalk_dept_id is not None
     }
-    if not root_ids and not local_stores_by_remote_id:
-        raise DingTalkOrganizationSyncError(
-            "STORE_ROOT_NOT_FOUND", "Configured DingTalk store roots were not found"
+    try:
+        classified = classify_organization(
+            snapshot,
+            root_ids=frozenset(anchors_by_root),
+            bound_types=bound_types,
+            exact_store_paths=frozenset(exact_store_paths),
         )
+    except OrganizationStructureError as exc:
+        raise DingTalkOrganizationSyncError(exc.code, str(exc)) from None
 
-    candidate_by_id: dict[int, DingTalkDepartment] = {}
-    for department in snapshot.departments:
-        if department.department_id in root_ids:
-            continue
-        stable = department.department_id in local_stores_by_remote_id
-        inside_root = _is_descendant_of(department, root_ids, departments_by_id)
-        name_is_store = department.name.strip().endswith("店")
-        name_matches_local = _normalize_name(department.name) in local_stores_by_name
-        if stable or (inside_root and (name_is_store or name_matches_local)):
-            candidate_by_id[department.department_id] = department
-    candidate_departments = sorted(
-        candidate_by_id.values(), key=lambda department: department.department_id
-    )
-    remote_stores_by_name: dict[str, list[DingTalkDepartment]] = defaultdict(list)
-    for department in candidate_departments:
-        remote_stores_by_name[_normalize_name(department.name)].append(department)
-
-    nonstores_by_name: dict[str, list[OrgUnit]] = defaultdict(list)
-    fallback_groups: list[OrgUnit] = []
-    for org in state.org_units:
-        if org.is_deleted or org.type == OrgType.STORE:
-            continue
-        nonstores_by_name[_normalize_name(org.name)].append(org)
-        if org.type == OrgType.GROUP:
-            fallback_groups.append(org)
-
+    local_by_remote_id: dict[int, list[OrgUnit]] = defaultdict(list)
+    for organization in state.org_units:
+        if organization.dingtalk_dept_id is not None:
+            local_by_remote_id[organization.dingtalk_dept_id].append(organization)
     org_units_by_code = {org.code: org for org in state.org_units}
-    store_rows: list[DingTalkOrgSyncItem] = []
-    matched_local_store_ids: set[int] = set()
-    store_matches: dict[int, OrgUnit | None] = {}
-    for remote_store in candidate_departments:
-        key = _normalize_name(remote_store.name)
-        stable_store = local_stores_by_remote_id.get(remote_store.department_id)
-        local_candidates = local_stores_by_name.get(key, [])
-        remote_candidates = remote_stores_by_name.get(key, [])
-        proposed_store: OrgUnit | None = None
-        proposed_parent: OrgUnit | None = None
-        action = "LINK"
-        method = "NONE"
-        conflict_code: str | None = None
-        if stable_store is not None:
-            proposed_store = stable_store
-            method = "STABLE_DEPARTMENT_ID"
-        elif len(local_candidates) == 1 and len(remote_candidates) == 1:
-            proposed_store = local_candidates[0]
-            method = "UNIQUE_NAME"
-        elif len(local_candidates) > 1 or len(remote_candidates) > 1:
-            conflict_code = "STORE_NAME_CONFLICT"
-        else:
-            action = "CREATE"
-            proposed_parent, conflict_code = _nearest_parent(
-                remote_store,
-                departments_by_id=departments_by_id,
-                nonstores_by_name=nonstores_by_name,
-                fallback_groups=fallback_groups,
-            )
-            method = "REMOTE_ONLY"
-            code = f"DINGTALK-{remote_store.department_id}"
-            if conflict_code is None and code in org_units_by_code:
-                conflict_code = "STORE_CODE_CONFLICT"
+    node_rows: list[DingTalkOrgSyncItem] = []
+    rows_by_remote_id: dict[int, DingTalkOrgSyncItem] = {}
+    node_matches: dict[int, OrgUnit | None] = {}
+    matched_local_ids: set[int] = set()
+    classified_nodes = sorted(
+        (*classified.regions, *classified.stores),
+        key=lambda node: (node.depth, node.department.department_id),
+    )
+    classified_ids = {node.department.department_id for node in classified_nodes}
+    remote_nodes_by_path: dict[tuple[int, tuple[str, ...], OrgType], list[int]] = defaultdict(list)
+    for node in classified_nodes:
+        remote_nodes_by_path[(node.root_id, node.relative_path, node.kind)].append(
+            node.department.department_id
+        )
+    ambiguous_remote_ids = {
+        remote_id
+        for remote_ids in remote_nodes_by_path.values()
+        if len(remote_ids) > 1
+        for remote_id in remote_ids
+    }
 
-        if proposed_store is not None:
-            matched_local_store_ids.add(proposed_store.id)
-            if proposed_store.name.strip() != remote_store.name.strip():
-                action = "UPDATE"
-            elif proposed_store.status == "HISTORICAL":
-                action = "ACTIVATE"
+    for node in classified_nodes:
+        remote = node.department
+        stable_candidates = local_by_remote_id.get(remote.department_id, [])
+        local_candidates = path_candidates.get((node.root_id, node.relative_path, node.kind), [])
+        proposed: OrgUnit | None = None
+        proposed_parent: OrgUnit | None = None
+        parent_is_staged_create = False
+        conflict_code: str | None = (
+            "ORG_PATH_AMBIGUOUS" if remote.department_id in ambiguous_remote_ids else None
+        )
+        match_method = "NO_LOCAL_PATH_MATCH"
+        if stable_candidates:
+            match_method = "STABLE_DEPARTMENT_ID"
+            if (
+                len(stable_candidates) != 1
+                or stable_candidates[0].type != node.kind
+                or stable_candidates[0].is_deleted
+                or _local_relative_path(
+                    stable_candidates[0], anchors_by_root[node.root_id], org_units_by_id
+                )
+                is None
+            ):
+                conflict_code = "ORG_NODE_CLASSIFICATION_CONFLICT"
             else:
-                action = "LINK"
+                proposed = stable_candidates[0]
+        elif len(local_candidates) == 1:
+            proposed = local_candidates[0]
+            match_method = "EXACT_RELATIVE_PATH"
+        elif len(local_candidates) > 1:
+            conflict_code = "ORG_PATH_AMBIGUOUS"
+            match_method = "EXACT_RELATIVE_PATH"
+
+        if node.depth == 1:
+            proposed_parent = anchors_by_root[node.root_id]
+        else:
+            parent_row = rows_by_remote_id.get(remote.parent_id or -1)
+            if parent_row is None or (remote.parent_id or -1) not in classified_ids:
+                conflict_code = conflict_code or "ORG_PATH_AMBIGUOUS"
+            elif parent_row.status == DingTalkOrgSyncItemStatus.CONFLICT:
+                conflict_code = conflict_code or "ORG_PATH_AMBIGUOUS"
+            elif parent_row.proposed_org_unit_id is not None:
+                proposed_parent = org_units_by_id[parent_row.proposed_org_unit_id]
+            elif parent_row.action == DingTalkOrgSyncAction.CREATE:
+                parent_is_staged_create = True
+            else:
+                conflict_code = conflict_code or "ORG_PATH_AMBIGUOUS"
+
+        change_fields: list[str] = []
+        if proposed is None:
+            action = DingTalkOrgSyncAction.CREATE
+            if f"DINGTALK-{remote.department_id}" in org_units_by_code:
+                conflict_code = conflict_code or "ORG_PATH_AMBIGUOUS"
+        else:
+            matched_local_ids.add(proposed.id)
+            if proposed.name.strip() != remote.name.strip():
+                change_fields.append("name")
+            if (
+                proposed_parent is not None and proposed.parent_id != proposed_parent.id
+            ) or parent_is_staged_create:
+                change_fields.append("parent_id")
+            if proposed.status == "HISTORICAL":
+                action = DingTalkOrgSyncAction.ACTIVATE
+            elif change_fields:
+                action = DingTalkOrgSyncAction.UPDATE
+            else:
+                action = DingTalkOrgSyncAction.LINK
+                if proposed.dingtalk_dept_id is None:
+                    change_fields = ["dingtalk_dept_id"]
+
         status = (
             DingTalkOrgSyncItemStatus.READY
-            if action in {"LINK", "CREATE", "ACTIVATE", "UPDATE"} and conflict_code is None
+            if conflict_code is None
             else DingTalkOrgSyncItemStatus.CONFLICT
         )
-        store_matches[remote_store.department_id] = proposed_store
         baseline = (
             _create_store_baseline(
                 parent=proposed_parent,
-                code=f"DINGTALK-{remote_store.department_id}",
-                name=remote_store.name,
+                code=f"DINGTALK-{remote.department_id}",
+                name=remote.name,
                 org_units=state.org_units,
             )
-            if action == "CREATE"
-            else _resolved_store_baseline(proposed_store, org_units=state.org_units)
+            if proposed is None
+            else _resolved_store_baseline(proposed, org_units=state.org_units)
         )
-        persisted_action, change_fields = _persisted_store_action(action)
-        store_rows.append(
-            DingTalkOrgSyncItem(
-                row_key=f"STORE:REMOTE:{remote_store.department_id}",
-                kind=DingTalkOrgSyncItemKind.STORE,
-                status=status,
-                action=persisted_action,
-                remote_department_id=remote_store.department_id,
-                remote_department_name=remote_store.name,
-                remote_department_path=_path_for_department(remote_store, departments_by_id),
-                remote_user_id_hash=None,
-                proposed_org_unit_id=(proposed_store.id if proposed_store else None),
-                proposed_parent_org_unit_id=(proposed_parent.id if proposed_parent else None),
-                proposed_employee_id=None,
-                proposed_org_type=OrgType.STORE,
-                department=None,
-                match_method=_encode_method(action, method),
-                conflict_code=conflict_code,
-                change_fields=change_fields,
-                baseline_fingerprint=baseline,
-            )
+        row = DingTalkOrgSyncItem(
+            row_key=f"{node.kind.value}:REMOTE:{remote.department_id}",
+            kind=DingTalkOrgSyncItemKind(node.kind.value),
+            action=action,
+            change_fields=change_fields,
+            status=status,
+            remote_department_id=remote.department_id,
+            remote_department_name=remote.name,
+            remote_department_path=_relative_remote_path(node, departments_by_id),
+            remote_user_id_hash=None,
+            proposed_org_unit_id=proposed.id if proposed else None,
+            proposed_parent_org_unit_id=proposed_parent.id if proposed_parent else None,
+            proposed_employee_id=None,
+            proposed_org_type=node.kind,
+            department=None,
+            match_method=match_method,
+            conflict_code=conflict_code,
+            baseline_fingerprint=baseline,
         )
+        node_rows.append(row)
+        rows_by_remote_id[remote.department_id] = row
+        node_matches[remote.department_id] = proposed
 
-    # A stable-id rename and a second department retaining the old name can
-    # otherwise both resolve READY to the same local store.  Never let apply
-    # order decide which remote department or reviewer wins.
-    ready_rows_by_local_store: dict[int, list[DingTalkOrgSyncItem]] = defaultdict(list)
-    for row in store_rows:
+    ready_rows_by_local_node: dict[int, list[DingTalkOrgSyncItem]] = defaultdict(list)
+    for row in node_rows:
         if row.status == DingTalkOrgSyncItemStatus.READY and row.proposed_org_unit_id is not None:
-            ready_rows_by_local_store[row.proposed_org_unit_id].append(row)
-    for duplicate_rows in ready_rows_by_local_store.values():
-        if len(duplicate_rows) <= 1:
-            continue
-        for row in duplicate_rows:
-            row.status = DingTalkOrgSyncItemStatus.CONFLICT
-            row.conflict_code = "STORE_TARGET_CONFLICT"
+            ready_rows_by_local_node[row.proposed_org_unit_id].append(row)
+    for duplicate_rows in ready_rows_by_local_node.values():
+        if len(duplicate_rows) > 1:
+            for row in duplicate_rows:
+                row.status = DingTalkOrgSyncItemStatus.CONFLICT
+                row.conflict_code = "ORG_PATH_AMBIGUOUS"
 
-    local_only_stores = [
-        store
-        for store in local_stores
-        if store.status == "ACTIVE" and store.id not in matched_local_store_ids
+    local_authority_nodes = [
+        organization
+        for organization in state.org_units
+        if organization.id in authority_membership
+        and organization.type in (OrgType.REGION, OrgType.STORE)
+        and not organization.is_deleted
     ]
-    for store in local_only_stores:
-        persisted_action, change_fields = _persisted_store_action("MISSING_IN_DINGTALK")
-        store_rows.append(
+    local_only_nodes = [
+        organization
+        for organization in local_authority_nodes
+        if organization.status == "ACTIVE" and organization.id not in matched_local_ids
+    ]
+    for organization in sorted(local_only_nodes, key=lambda value: (value.type.value, value.id)):
+        _root_id, anchor = authority_membership[organization.id]
+        node_rows.append(
             DingTalkOrgSyncItem(
-                row_key=f"STORE:LOCAL:{store.id}",
-                kind=DingTalkOrgSyncItemKind.STORE,
-                status=DingTalkOrgSyncItemStatus.CONFLICT,
-                action=persisted_action,
+                row_key=f"{organization.type.value}:LOCAL:{organization.id}",
+                kind=DingTalkOrgSyncItemKind(organization.type.value),
+                action=DingTalkOrgSyncAction.DEACTIVATE,
+                change_fields=[],
+                status=DingTalkOrgSyncItemStatus.READY,
                 remote_department_id=None,
-                remote_department_name=store.name,
-                remote_department_path=_local_path(store, org_units_by_id),
+                remote_department_name=organization.name,
+                remote_department_path=_display_local_relative_path(
+                    organization, anchor, org_units_by_id
+                ),
                 remote_user_id_hash=None,
-                proposed_org_unit_id=store.id,
-                proposed_parent_org_unit_id=store.parent_id,
+                proposed_org_unit_id=organization.id,
+                proposed_parent_org_unit_id=organization.parent_id,
                 proposed_employee_id=None,
-                proposed_org_type=OrgType.STORE,
+                proposed_org_type=organization.type,
                 department=None,
-                match_method=_encode_method("MISSING_IN_DINGTALK", "LOCAL_STORE_NOT_VISIBLE"),
-                conflict_code="LOCAL_STORE_NOT_VISIBLE",
-                change_fields=change_fields,
-                baseline_fingerprint=_resolved_store_baseline(store, org_units=state.org_units),
+                match_method="MISSING_IN_DINGTALK",
+                conflict_code=None,
+                baseline_fingerprint=_resolved_store_baseline(
+                    organization, org_units=state.org_units
+                ),
             )
         )
+
+    region_rows = [row for row in node_rows if row.kind == DingTalkOrgSyncItemKind.REGION]
+    store_rows = [row for row in node_rows if row.kind == DingTalkOrgSyncItemKind.STORE]
+    candidate_departments = [node.department for node in classified.stores]
+    candidate_by_id = {department.department_id: department for department in candidate_departments}
+    store_matches = {
+        department.department_id: node_matches[department.department_id]
+        for department in candidate_departments
+    }
+    local_only_stores = [node for node in local_only_nodes if node.type == OrgType.STORE]
 
     active_employees = [
         employee
@@ -919,7 +1132,7 @@ def preview_organization_sync(
             proposed_employee_id=(selected_employee.id if selected_employee is not None else None),
             proposed_org_type=None,
             department=department,
-            match_method=_encode_method(action, method),
+            match_method=method,
             conflict_code=conflict_code,
             change_fields=change_fields,
             baseline_fingerprint=_reviewer_baseline(
@@ -941,7 +1154,12 @@ def preview_organization_sync(
         )
 
     for local_store in local_only_stores:
-        local_path = _local_path(local_store, org_units_by_id)
+        local_path = next(
+            row.remote_department_path
+            for row in store_rows
+            if row.proposed_org_unit_id == local_store.id
+            and row.action == DingTalkOrgSyncAction.DEACTIVATE
+        )
         for review_department in (Department.DINING, Department.KITCHEN):
             add_reviewer_row(
                 row_key=(f"REVIEWER:LOCAL:{local_store.id}:{review_department.value}"),
@@ -985,7 +1203,7 @@ def preview_organization_sync(
             selected_employee: Employee | None = None
             method = "NONE"
             reviewer_conflict_code: str | None = None
-            action = "CONFLICT"
+            reviewer_action = "CONFLICT"
             status = DingTalkOrgSyncItemStatus.CONFLICT
             scope_user_ids = (
                 scope_users_by_pair.get((proposed_store_for_review.id, review_department), ())
@@ -996,7 +1214,7 @@ def preview_organization_sync(
                 reviewer_conflict_code = "STORE_UNRESOLVED"
             elif not candidates:
                 if scope_user_ids:
-                    action = "REMOVE"
+                    reviewer_action = "REMOVE"
                     method = "REMOVE_MISSING_MANAGER"
                     status = DingTalkOrgSyncItemStatus.READY
                 else:
@@ -1051,7 +1269,7 @@ def preview_organization_sync(
                             if account_owners or employee_owners:
                                 reviewer_conflict_code = "MANAGER_IDENTITY_CONFLICT"
                             else:
-                                action = "ASSIGN"
+                                reviewer_action = "ASSIGN"
                                 status = DingTalkOrgSyncItemStatus.READY
             add_reviewer_row(
                 row_key=(
@@ -1060,14 +1278,18 @@ def preview_organization_sync(
                 remote_store=remote_store,
                 store=proposed_store_for_review,
                 department=review_department,
-                action=action,
+                action=reviewer_action,
                 method=method,
                 status=status,
                 conflict_code=reviewer_conflict_code,
                 selected_remote=selected_remote,
                 selected_employee=selected_employee,
                 remote_name=remote_store.name,
-                remote_path=_path_for_department(remote_store, departments_by_id),
+                remote_path=next(
+                    row.remote_department_path
+                    for row in store_rows
+                    if row.remote_department_id == remote_store.department_id
+                ),
             )
 
     drafts_by_identity: dict[tuple[str, Department], list[_ReviewerDraft]] = defaultdict(list)
@@ -1079,45 +1301,103 @@ def preview_organization_sync(
         if len(remote_store_ids_for_user) <= 1:
             continue
         for draft in drafts:
-            _, method = _decode_method(draft.row)
             draft.row.status = DingTalkOrgSyncItemStatus.CONFLICT
             draft.row.action = DingTalkOrgSyncAction.NO_CHANGE
             draft.row.change_fields = []
-            draft.row.match_method = _encode_method("CONFLICT", method)
             draft.row.conflict_code = "MANAGER_ASSIGNED_MULTIPLE_STORES"
 
-    previous_batches = list(
-        session.scalars(
-            select(DingTalkOrgSyncBatch)
-            .where(DingTalkOrgSyncBatch.status == DingTalkOrgSyncBatchStatus.PREVIEWED)
-            .order_by(DingTalkOrgSyncBatch.id)
-            .with_for_update()
-        ).all()
-    )
-    previous_ids = [batch.id for batch in previous_batches]
-    if previous_ids:
-        previous_items = list(
+    reviewer_rows = [draft.row for draft in reviewer_drafts]
+    all_rows = [*node_rows, *reviewer_rows]
+    complete_local_baseline = _complete_local_baseline(state)
+    _wrap_baselines(all_rows, complete_local_baseline)
+    planned_baseline_hash = _planned_baseline_hash(all_rows)
+    snapshot_hash = _snapshot_hash(snapshot, encryption_key=encryption_key)
+    root_config_hash = _root_config_hash(resolved_root_mappings)
+    reviewer_metadata = {draft.row.row_key: draft for draft in reviewer_drafts}
+
+    if trigger == DingTalkOrgSyncTrigger.SCHEDULED:
+        reusable_batches = list(
             session.scalars(
-                select(DingTalkOrgSyncItem)
-                .where(DingTalkOrgSyncItem.batch_id.in_(previous_ids))
-                .order_by(DingTalkOrgSyncItem.batch_id, DingTalkOrgSyncItem.id)
+                select(DingTalkOrgSyncBatch)
+                .where(
+                    DingTalkOrgSyncBatch.status == DingTalkOrgSyncBatchStatus.PREVIEWED,
+                    DingTalkOrgSyncBatch.trigger == DingTalkOrgSyncTrigger.SCHEDULED,
+                    DingTalkOrgSyncBatch.root_config_hash == root_config_hash,
+                    DingTalkOrgSyncBatch.snapshot_hash == snapshot_hash,
+                    DingTalkOrgSyncBatch.expires_at > current_time,
+                )
+                .order_by(DingTalkOrgSyncBatch.id.desc())
                 .with_for_update()
             ).all()
         )
-        for batch in previous_batches:
-            batch.status = DingTalkOrgSyncBatchStatus.STALE
-        for item in previous_items:
-            item.remote_user_id_hash = None
+        for reusable in reusable_batches:
+            reusable_items = list(
+                session.scalars(
+                    select(DingTalkOrgSyncItem)
+                    .where(DingTalkOrgSyncItem.batch_id == reusable.id)
+                    .order_by(DingTalkOrgSyncItem.id)
+                    .with_for_update()
+                ).all()
+            )
+            if _planned_baseline_hash(reusable_items) != planned_baseline_hash:
+                continue
+            reusable.last_checked_at = current_time
+            session.flush()
+            result = _organization_preview_result(
+                reusable,
+                reusable_items,
+                state=state,
+                reviewer_metadata=reviewer_metadata,
+            )
+            session.commit()
+            return result
 
-    reviewer_rows = [draft.row for draft in reviewer_drafts]
+    if trigger == DingTalkOrgSyncTrigger.MANUAL:
+        previous_batches = list(
+            session.scalars(
+                select(DingTalkOrgSyncBatch)
+                .where(
+                    DingTalkOrgSyncBatch.status == DingTalkOrgSyncBatchStatus.PREVIEWED,
+                    DingTalkOrgSyncBatch.root_config_hash == root_config_hash,
+                )
+                .order_by(DingTalkOrgSyncBatch.id)
+                .with_for_update()
+            ).all()
+        )
+        previous_ids = [previous.id for previous in previous_batches]
+        if previous_ids:
+            previous_items = list(
+                session.scalars(
+                    select(DingTalkOrgSyncItem)
+                    .where(DingTalkOrgSyncItem.batch_id.in_(previous_ids))
+                    .order_by(DingTalkOrgSyncItem.batch_id, DingTalkOrgSyncItem.id)
+                    .with_for_update()
+                ).all()
+            )
+            for previous in previous_batches:
+                previous.status = DingTalkOrgSyncBatchStatus.STALE
+            _clear_staged_hashes(previous_items)
+
     batch = DingTalkOrgSyncBatch(
         status=DingTalkOrgSyncBatchStatus.PREVIEWED,
-        snapshot_hash=_snapshot_hash(snapshot, encryption_key=encryption_key),
-        root_config_hash=_root_config_hash(root_mapping_pairs),
+        created_at=current_time,
+        updated_at=current_time,
+        snapshot_hash=snapshot_hash,
+        root_config_hash=root_config_hash,
+        trigger=trigger,
         expires_at=current_time + _PREVIEW_TTL,
-        requested_by_user_id=actor[0],
+        requested_by_user_id=actor[0] if actor is not None else None,
+        last_checked_at=current_time,
+        remote_region_count=len(classified.regions),
+        local_region_count=sum(node.type == OrgType.REGION for node in local_authority_nodes),
+        ready_region_count=sum(
+            row.status == DingTalkOrgSyncItemStatus.READY for row in region_rows
+        ),
+        region_conflict_count=sum(
+            row.status == DingTalkOrgSyncItemStatus.CONFLICT for row in region_rows
+        ),
         remote_store_count=len(candidate_departments),
-        local_store_count=len(local_stores),
+        local_store_count=sum(node.type == OrgType.STORE for node in local_authority_nodes),
         ready_store_count=sum(row.status == DingTalkOrgSyncItemStatus.READY for row in store_rows),
         store_conflict_count=sum(
             row.status == DingTalkOrgSyncItemStatus.CONFLICT for row in store_rows
@@ -1128,52 +1408,14 @@ def preview_organization_sync(
         reviewer_conflict_count=sum(
             row.status == DingTalkOrgSyncItemStatus.CONFLICT for row in reviewer_rows
         ),
+        warning_count=len(classified.warning_department_ids),
     )
     session.add(batch)
     session.flush()
-    for item in [*store_rows, *reviewer_rows]:
+    for item in all_rows:
         item.batch_id = batch.id
         session.add(item)
     session.flush()
-
-    proposed_names = {org.id: org.name for org in state.org_units if not org.is_deleted}
-    store_views = tuple(
-        StorePreviewItem(
-            id=row.id,
-            action=_decode_method(row)[0],
-            match_method=_decode_method(row)[1],
-            remote_department_id=row.remote_department_id,
-            remote_department_name=row.remote_department_name,
-            remote_department_path=row.remote_department_path,
-            proposed_org_unit_id=row.proposed_org_unit_id,
-            proposed_org_unit_name=_optional_get(proposed_names, row.proposed_org_unit_id),
-            proposed_parent_org_unit_id=row.proposed_parent_org_unit_id,
-            proposed_parent_org_unit_name=_optional_get(
-                proposed_names, row.proposed_parent_org_unit_id
-            ),
-            status=row.status,
-            conflict_code=row.conflict_code,
-        )
-        for row in store_rows
-    )
-    reviewer_views = tuple(
-        ReviewerPreviewItem(
-            id=draft.row.id,
-            action=_decode_method(draft.row)[0],
-            match_method=_decode_method(draft.row)[1],
-            remote_department_id=draft.row.remote_department_id,
-            remote_department_name=draft.row.remote_department_name,
-            remote_department_path=draft.row.remote_department_path,
-            department=_required_reviewer_department(draft.row),
-            dingtalk_name=draft.dingtalk_name,
-            current_reviewer_name=draft.current_reviewer_name,
-            proposed_employee_id=draft.row.proposed_employee_id,
-            proposed_employee_name=draft.proposed_employee_name,
-            status=draft.row.status,
-            conflict_code=draft.row.conflict_code,
-        )
-        for draft in reviewer_drafts
-    )
     audit.record(
         session,
         action="dingtalk.organization.preview",
@@ -1181,25 +1423,24 @@ def preview_organization_sync(
         target_type="dingtalk_org_sync_batch",
         target_id=batch.id,
         detail={
+            "remote_region_count": batch.remote_region_count,
+            "local_region_count": batch.local_region_count,
+            "ready_region_count": batch.ready_region_count,
+            "region_conflict_count": batch.region_conflict_count,
             "remote_store_count": batch.remote_store_count,
             "local_store_count": batch.local_store_count,
             "ready_store_count": batch.ready_store_count,
             "store_conflict_count": batch.store_conflict_count,
             "ready_reviewer_count": batch.ready_reviewer_count,
             "reviewer_conflict_count": batch.reviewer_conflict_count,
+            "warning_count": batch.warning_count,
         },
     )
-    result = OrganizationPreview(
-        batch_id=batch.public_id,
-        expires_at=batch.expires_at,
-        remote_stores=batch.remote_store_count,
-        local_stores=batch.local_store_count,
-        ready_stores=batch.ready_store_count,
-        store_conflicts=batch.store_conflict_count,
-        ready_reviewers=batch.ready_reviewer_count,
-        reviewer_conflicts=batch.reviewer_conflict_count,
-        store_items=store_views,
-        reviewer_items=reviewer_views,
+    result = _organization_preview_result(
+        batch,
+        all_rows,
+        state=state,
+        reviewer_metadata=reviewer_metadata,
     )
     session.commit()
     return result
@@ -1315,6 +1556,12 @@ def apply_organization_sync(
             "PROVIDER_SNAPSHOT_CHANGED",
             "DingTalk organization changed; preview again",
         )
+    if any(item.kind == DingTalkOrgSyncItemKind.REGION for item in items):
+        session.rollback()
+        raise DingTalkOrganizationSyncError(
+            "ORG_REGION_APPLY_NOT_SUPPORTED",
+            "Region changes require the hierarchy apply transaction",
+        )
     reviewer_conflicts = [
         item
         for item in items
@@ -1341,10 +1588,10 @@ def apply_organization_sync(
     org_units_by_code = {org.code: org for org in state.org_units}
 
     stale = False
+    complete_local_baseline = _complete_local_baseline(state)
     for item in items:
-        action, _ = _decode_method(item)
-        if item.kind == DingTalkOrgSyncItemKind.STORE:
-            if action == "CREATE":
+        if item.kind in (DingTalkOrgSyncItemKind.REGION, DingTalkOrgSyncItemKind.STORE):
+            if item.action == DingTalkOrgSyncAction.CREATE:
                 parent = _optional_get(org_units_by_id, item.proposed_parent_org_unit_id)
                 expected = _create_store_baseline(
                     parent=parent,
@@ -1377,6 +1624,7 @@ def apply_organization_sync(
                 scope_user_ids=scope_user_ids,
                 role_codes_by_user=role_codes_by_user,
             )
+        expected = _fingerprint(expected, complete_local_baseline)
         if expected != item.baseline_fingerprint:
             stale = True
             break
@@ -1414,8 +1662,7 @@ def apply_organization_sync(
 
     # Validate every identity one last time before the first formal mutation.
     for item in ready_reviewer_items:
-        action, method = _decode_method(item)
-        if action == "REMOVE":
+        if item.action == DingTalkOrgSyncAction.REMOVE_SCOPE:
             if item.proposed_employee_id is not None or item.remote_user_id_hash is not None:
                 session.rollback()
                 raise DingTalkOrganizationSyncError(
@@ -1423,8 +1670,8 @@ def apply_organization_sync(
                 )
             continue
         if (
-            action != "ASSIGN"
-            or method not in {"STABLE_ID", "JOB_NUMBER"}
+            item.action != DingTalkOrgSyncAction.ASSIGN_SCOPE
+            or item.match_method not in {"STABLE_ID", "JOB_NUMBER"}
             or item.proposed_employee_id is None
             or item.remote_user_id_hash is None
             or len(fresh_users_by_hash.get(item.remote_user_id_hash, [])) != 1
@@ -1494,9 +1741,9 @@ def apply_organization_sync(
     usernames = {user.username for user in state.users}
     try:
         for item in ready_store_items:
-            action, _ = _decode_method(item)
+            action = item.action
             remote_department_id = item.remote_department_id
-            if remote_department_id is None:
+            if remote_department_id is None and action != DingTalkOrgSyncAction.DEACTIVATE:
                 raise RuntimeError("ready store item is missing its remote department")
             before_store = _optional_get(org_units_by_id, item.proposed_org_unit_id)
             before_state = (
@@ -1508,7 +1755,12 @@ def apply_organization_sync(
                 if before_store is not None
                 else None
             )
-            if action == "CREATE":
+            if action == DingTalkOrgSyncAction.DEACTIVATE:
+                if before_store is None:
+                    raise _ConcurrentChange("store baseline changed")
+                applied_store = before_store
+                applied_store.status = "HISTORICAL"
+            elif action == DingTalkOrgSyncAction.CREATE:
                 parent = _optional_get(org_units_by_id, item.proposed_parent_org_unit_id)
                 duplicate_name = any(
                     org.type == OrgType.STORE
@@ -1541,16 +1793,20 @@ def apply_organization_sync(
                     raise _ConcurrentChange("store baseline changed")
                 applied_store = before_store
                 applied_store.dingtalk_dept_id = remote_department_id
-                if action in {"ACTIVATE", "UPDATE"}:
+                if action in {DingTalkOrgSyncAction.ACTIVATE, DingTalkOrgSyncAction.UPDATE}:
                     applied_store.status = "ACTIVE"
-                if action == "UPDATE":
-                    applied_store.name = item.remote_department_name
-            stores_by_remote_id[remote_department_id] = applied_store
+                if action in {DingTalkOrgSyncAction.ACTIVATE, DingTalkOrgSyncAction.UPDATE}:
+                    if "name" in item.change_fields:
+                        applied_store.name = item.remote_department_name
+                    if "parent_id" in item.change_fields:
+                        applied_store.parent_id = item.proposed_parent_org_unit_id
+            if remote_department_id is not None:
+                stores_by_remote_id[remote_department_id] = applied_store
             item.status = DingTalkOrgSyncItemStatus.APPLIED
             store_changes.append(
                 {
                     "item_id": item.id,
-                    "action": action,
+                    "action": action.value,
                     "before": before_state,
                     "after": {
                         "org_unit_id": applied_store.id,
@@ -1561,7 +1817,7 @@ def apply_organization_sync(
             )
 
         for item in ready_reviewer_items:
-            action, _ = _decode_method(item)
+            action = item.action
             department = _required_reviewer_department(item)
             target_store = _optional_get(org_units_by_id, item.proposed_org_unit_id)
             if target_store is None and item.remote_department_id is not None:
@@ -1581,7 +1837,7 @@ def apply_organization_sync(
             )
             after_user_ids: tuple[int, ...] = ()
             employee_id: int | None = None
-            if action == "ASSIGN":
+            if action == DingTalkOrgSyncAction.ASSIGN_SCOPE:
                 employee = employees_by_id[item.proposed_employee_id]  # type: ignore[index]
                 employee_id = employee.id
                 accounts = accounts_by_employee.get(employee.id, [])
@@ -1633,7 +1889,7 @@ def apply_organization_sync(
             reviewer_changes.append(
                 {
                     "item_id": item.id,
-                    "action": action,
+                    "action": action.value,
                     "org_unit_id": target_store.id,
                     "department": department.value,
                     "employee_id": employee_id,

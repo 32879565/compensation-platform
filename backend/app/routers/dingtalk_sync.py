@@ -167,12 +167,14 @@ class DirectoryApplyOut(BaseModel):
     unmatched: int
 
 
-class OrganizationStoreItemOut(BaseModel):
+class OrganizationNodeItemOut(BaseModel):
     id: int
+    kind: Literal["REGION", "STORE"]
     remote_department_id: int | None
     remote_department_name: str
     remote_department_path: str
-    action: Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "MISSING_IN_DINGTALK"]
+    action: Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE"]
+    change_fields: list[str]
     match_method: str
     proposed_org_unit_id: int | None
     proposed_org_unit_name: str | None
@@ -200,14 +202,23 @@ class OrganizationReviewerItemOut(BaseModel):
 
 class OrganizationPreviewOut(BaseModel):
     batch_id: str
+    trigger: Literal["MANUAL", "SCHEDULED"]
+    created_at: datetime
+    last_checked_at: datetime
     expires_at: datetime
+    remote_regions: int
+    local_regions: int
+    ready_regions: int
+    region_conflicts: int
     remote_stores: int
     local_stores: int
     ready_stores: int
     store_conflicts: int
     ready_reviewers: int
     reviewer_conflicts: int
-    store_items: list[OrganizationStoreItemOut]
+    warnings: int
+    region_items: list[OrganizationNodeItemOut]
+    store_items: list[OrganizationNodeItemOut]
     reviewer_items: list[OrganizationReviewerItemOut]
 
 
@@ -343,23 +354,55 @@ def _organization_preview_response(preview: OrganizationPreview) -> Organization
 
     return OrganizationPreviewOut(
         batch_id=preview.batch_id,
+        trigger=cast(Literal["MANUAL", "SCHEDULED"], preview.trigger.value),
+        created_at=preview.created_at,
+        last_checked_at=preview.last_checked_at,
         expires_at=preview.expires_at,
+        remote_regions=preview.remote_regions,
+        local_regions=preview.local_regions,
+        ready_regions=preview.ready_regions,
+        region_conflicts=preview.region_conflicts,
         remote_stores=preview.remote_stores,
         local_stores=preview.local_stores,
         ready_stores=preview.ready_stores,
         store_conflicts=preview.store_conflicts,
         ready_reviewers=preview.ready_reviewers,
         reviewer_conflicts=preview.reviewer_conflicts,
-        store_items=[
-            OrganizationStoreItemOut(
+        warnings=preview.warnings,
+        region_items=[
+            OrganizationNodeItemOut(
                 id=item.id,
+                kind=cast(Literal["REGION", "STORE"], item.kind.value),
                 remote_department_id=item.remote_department_id,
                 remote_department_name=item.remote_department_name,
                 remote_department_path=item.remote_department_path,
                 action=cast(
-                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "MISSING_IN_DINGTALK"],
-                    item.action,
+                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE"],
+                    item.action.value,
                 ),
+                change_fields=list(item.change_fields),
+                match_method=item.match_method,
+                proposed_org_unit_id=item.proposed_org_unit_id,
+                proposed_org_unit_name=item.proposed_org_unit_name,
+                proposed_parent_org_unit_id=item.proposed_parent_org_unit_id,
+                proposed_parent_org_unit_name=item.proposed_parent_org_unit_name,
+                status=cast(Literal["READY", "CONFLICT"], item.status.value),
+                conflict_code=item.conflict_code,
+            )
+            for item in preview.region_items
+        ],
+        store_items=[
+            OrganizationNodeItemOut(
+                id=item.id,
+                kind=cast(Literal["REGION", "STORE"], item.kind.value),
+                remote_department_id=item.remote_department_id,
+                remote_department_name=item.remote_department_name,
+                remote_department_path=item.remote_department_path,
+                action=cast(
+                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE"],
+                    item.action.value,
+                ),
+                change_fields=list(item.change_fields),
                 match_method=item.match_method,
                 proposed_org_unit_id=item.proposed_org_unit_id,
                 proposed_org_unit_name=item.proposed_org_unit_name,
@@ -628,8 +671,7 @@ def preview_dingtalk_organization(
             snapshot,
             encryption_key=settings.encryption_key,
             actor=(principal.user_id, principal.username),
-            store_root_names=settings.dingtalk_store_root_name_set,
-            root_mapping_pairs=settings.dingtalk_org_root_mapping_pairs,
+            root_mappings=settings.dingtalk_org_root_mapping_pairs,
             dining_manager_titles=settings.dingtalk_dining_manager_title_set,
             kitchen_manager_titles=settings.dingtalk_kitchen_manager_title_set,
         )
@@ -643,7 +685,7 @@ def preview_dingtalk_organization(
             detail="Unable to read the DingTalk organization",
         ) from None
     except DingTalkOrganizationSyncError as exc:
-        http_status = 409 if exc.code == "STORE_ROOT_NOT_FOUND" else 502
+        http_status = 409 if exc.code.startswith("ORG_") else 502
         raise HTTPException(status_code=http_status, detail=str(exc)) from None
     return _organization_preview_response(preview)
 

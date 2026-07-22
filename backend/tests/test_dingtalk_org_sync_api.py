@@ -16,6 +16,7 @@ from app.dingtalk.client import (
     DingTalkOrganizationUser,
     get_dingtalk_client,
 )
+from app.dingtalk.org_sync import preview_organization_sync
 from app.dingtalk.read_sync import blind_index_dingtalk_user_id
 from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserReviewScope, UserRole
@@ -25,6 +26,7 @@ from app.models.dingtalk import (
     DingTalkOrgSyncItem,
     DingTalkOrgSyncItemKind,
     DingTalkOrgSyncItemStatus,
+    DingTalkOrgSyncTrigger,
 )
 from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
@@ -105,7 +107,7 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
-def _settings(*, root_mappings: str = "") -> Settings:
+def _settings(*, root_mappings: str = "10:DIRECT-GROUP") -> Settings:
     return Settings(
         database_url="postgresql+psycopg://test:test@localhost/test",
         secret_key="test-secret-key-only-for-tests-not-production",
@@ -214,6 +216,8 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
     assert body["store_conflicts"] == 0
     assert body["ready_reviewers"] == 2
     assert body["reviewer_conflicts"] == 0
+    assert body["trigger"] == "MANUAL"
+    assert body["created_at"] == body["last_checked_at"]
     assert body["expires_at"] > datetime.now(UTC).isoformat()
     assert {item["department"] for item in body["reviewer_items"]} == {
         "DINING",
@@ -221,7 +225,7 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
     }
     assert {item["action"] for item in body["reviewer_items"]} == {"ASSIGN"}
     assert body["store_items"][0]["action"] == "LINK"
-    assert body["store_items"][0]["match_method"] == "UNIQUE_NAME"
+    assert body["store_items"][0]["match_method"] == "EXACT_RELATIVE_PATH"
     assert "provider-manager" not in response.text
     assert "provider-kitchen" not in response.text
     assert "remote_user_id" not in response.text
@@ -232,7 +236,7 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
     batch = db_session.scalars(
         select(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.public_id == body["batch_id"])
     ).one()
-    assert batch.root_config_hash == _expected_root_config_hash(())
+    assert batch.root_config_hash == _expected_root_config_hash(((10, "DIRECT-GROUP"),))
     staged_items = db_session.scalars(select(DingTalkOrgSyncItem)).all()
     assert len(staged_items) == 3
     assert {
@@ -266,6 +270,8 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
 
 def test_organization_preview_persists_the_configured_root_mapping_hash(client, db_session):
     _seed_store_and_managers(db_session)
+    db_session.add(OrgUnit(code="REGION-B", name="区域乙", type=OrgType.REGION))
+    db_session.commit()
     admin = _group_hr(db_session, "org-sync-root-fingerprint")
     fake = _FakeOrganizationClient()
     from app.main import app
@@ -616,10 +622,10 @@ def test_organization_apply_links_store_and_replaces_reviewer_scopes_idempotentl
 
 
 @pytest.mark.parametrize(
-    ("local_name", "stable_department_id", "expected_action"),
+    ("local_name", "stable_department_id", "expected_change_fields"),
     [
-        ("天河店", None, "ACTIVATE"),
-        ("天河旧店", 101, "UPDATE"),
+        ("天河店", None, ()),
+        ("天河旧店", 101, ("name",)),
     ],
 )
 def test_organization_sync_activates_or_updates_historical_store(
@@ -627,14 +633,14 @@ def test_organization_sync_activates_or_updates_historical_store(
     db_session,
     local_name,
     stable_department_id,
-    expected_action,
+    expected_change_fields,
 ):
     store = _seed_store_and_managers(db_session)
     store.name = local_name
     store.status = "HISTORICAL"
     store.dingtalk_dept_id = stable_department_id
     db_session.commit()
-    admin = _group_hr(db_session, f"org-sync-{expected_action.lower()}")
+    admin = _group_hr(db_session, f"org-sync-activate-{len(expected_change_fields)}")
     fake = _FakeOrganizationClient()
     from app.main import app
 
@@ -645,17 +651,14 @@ def test_organization_sync_activates_or_updates_historical_store(
 
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
-    assert preview["store_items"][0]["action"] == expected_action
+    assert preview["store_items"][0]["action"] == "ACTIVATE"
     staged_store = db_session.scalars(
         select(DingTalkOrgSyncItem).where(DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE)
     ).one()
-    expected_persistence = {
-        "ACTIVATE": (DingTalkOrgSyncAction.ACTIVATE, ("status",)),
-        "UPDATE": (DingTalkOrgSyncAction.UPDATE, ("name",)),
-    }
-    assert (staged_store.action, tuple(staged_store.change_fields)) == expected_persistence[
-        expected_action
-    ]
+    assert (staged_store.action, tuple(staged_store.change_fields)) == (
+        DingTalkOrgSyncAction.ACTIVATE,
+        expected_change_fields,
+    )
     assert staged_store.proposed_org_type == OrgType.STORE
 
     response = client.post(
@@ -702,7 +705,7 @@ def test_organization_sync_conflicts_when_two_departments_target_same_local_stor
     assert {item["action"] for item in conflicting_stores} == {"LINK", "UPDATE"}
     assert {item["proposed_org_unit_id"] for item in conflicting_stores} == {store.id}
     assert {item["status"] for item in conflicting_stores} == {"CONFLICT"}
-    assert {item["conflict_code"] for item in conflicting_stores} == {"STORE_TARGET_CONFLICT"}
+    assert {item["conflict_code"] for item in conflicting_stores} == {"ORG_PATH_AMBIGUOUS"}
     assert preview["store_conflicts"] == 2
     assert preview["reviewer_conflicts"] > 0
 
@@ -850,13 +853,7 @@ def test_organization_sync_creates_remote_only_store_and_assigns_both_reviewers(
         )
     ).one()
     assert staged_create.action == DingTalkOrgSyncAction.CREATE
-    assert staged_create.change_fields == [
-        "code",
-        "name",
-        "parent_id",
-        "type",
-        "dingtalk_dept_id",
-    ]
+    assert staged_create.change_fields == []
     assert staged_create.proposed_org_type == OrgType.STORE
 
     response = client.post(
@@ -935,12 +932,10 @@ def test_organization_sync_surfaces_local_only_store_and_clears_both_scopes(clie
 
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
-    coverage = next(
-        item for item in preview["store_items"] if item["action"] == "MISSING_IN_DINGTALK"
-    )
+    coverage = next(item for item in preview["store_items"] if item["action"] == "DEACTIVATE")
     assert coverage["remote_department_id"] is None
     assert coverage["proposed_org_unit_id"] == hidden_store.id
-    assert coverage["match_method"] == "LOCAL_STORE_NOT_VISIBLE"
+    assert coverage["match_method"] == "MISSING_IN_DINGTALK"
     clears = [
         item
         for item in preview["reviewer_items"]
@@ -961,7 +956,7 @@ def test_organization_sync_surfaces_local_only_store_and_clears_both_scopes(clie
         (
             DingTalkOrgSyncItemKind.STORE,
             DingTalkOrgSyncAction.DEACTIVATE,
-            ("status",),
+            (),
             OrgType.STORE,
         ),
         (
@@ -978,7 +973,9 @@ def test_organization_sync_surfaces_local_only_store_and_clears_both_scopes(clie
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["unresolved"] == 1
+    assert response.json()["unresolved"] == 0
+    db_session.expire_all()
+    assert db_session.get(OrgUnit, hidden_store.id).status == "HISTORICAL"
     assert (
         db_session.scalars(
             select(UserReviewScope).where(UserReviewScope.org_unit_id == hidden_store.id)
@@ -1153,3 +1150,339 @@ def test_organization_apply_marks_batch_stale_when_fresh_dingtalk_snapshot_chang
             select(DingTalkOrgSyncItem).where(DingTalkOrgSyncItem.batch_id == batch.id)
         ).all()
     )
+
+
+def test_organization_preview_stages_region_create_and_authority_deactivate(client, db_session):
+    anchor = OrgUnit(code="DIRECT-GROUP", name="集团", type=OrgType.GROUP)
+    old_region = OrgUnit(code="OLD-REGION", name="旧区", type=OrgType.REGION, parent=anchor)
+    old_store = OrgUnit(code="OLD-STORE", name="旧店", type=OrgType.STORE, parent=old_region)
+    outside_anchor = OrgUnit(code="OUTSIDE-GROUP", name="外部集团", type=OrgType.GROUP)
+    outside_store = OrgUnit(
+        code="OUTSIDE-STORE", name="外部门店", type=OrgType.STORE, parent=outside_anchor
+    )
+    db_session.add_all([anchor, old_region, old_store, outside_anchor, outside_store])
+    db_session.commit()
+    admin = _group_hr(db_session, "org-sync-region-create")
+    fake = _FakeOrganizationClient(
+        departments=(
+            DingTalkDepartment(10, 1, "潮发运营中心"),
+            DingTalkDepartment(110, 10, "广州一区"),
+            DingTalkDepartment(111, 110, "珠江新城店"),
+        ),
+        users=(),
+    )
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["remote_regions"] == 1
+    assert body["local_regions"] == 1
+    assert body["ready_regions"] == 2
+    assert body["region_conflicts"] == 0
+    assert body["warnings"] == 0
+    created_region = next(item for item in body["region_items"] if item["action"] == "CREATE")
+    assert created_region == {
+        "id": created_region["id"],
+        "kind": "REGION",
+        "action": "CREATE",
+        "change_fields": [],
+        "remote_department_id": 110,
+        "remote_department_name": "广州一区",
+        "remote_department_path": "广州一区",
+        "match_method": "NO_LOCAL_PATH_MATCH",
+        "proposed_org_unit_id": None,
+        "proposed_org_unit_name": "广州一区",
+        "proposed_parent_org_unit_id": anchor.id,
+        "proposed_parent_org_unit_name": anchor.name,
+        "status": "READY",
+        "conflict_code": None,
+    }
+    assert (
+        next(item for item in body["store_items"] if item["proposed_org_unit_id"] == old_store.id)[
+            "action"
+        ]
+        == "DEACTIVATE"
+    )
+    assert body["store_conflicts"] == 0
+    assert all(item["proposed_org_unit_id"] != outside_store.id for item in body["store_items"])
+
+
+def test_organization_preview_matches_same_name_stores_by_full_relative_path(client, db_session):
+    anchor = OrgUnit(code="DIRECT-GROUP", name="集团", type=OrgType.GROUP)
+    east = OrgUnit(code="EAST", name="东区", type=OrgType.REGION, parent=anchor)
+    west = OrgUnit(code="WEST", name="西区", type=OrgType.REGION, parent=anchor)
+    east_store = OrgUnit(code="EAST-CENTRAL", name="中心店", type=OrgType.STORE, parent=east)
+    west_store = OrgUnit(code="WEST-CENTRAL", name="中心店", type=OrgType.STORE, parent=west)
+    db_session.add_all([anchor, east, west, east_store, west_store])
+    db_session.commit()
+    admin = _group_hr(db_session, "org-sync-full-path")
+    fake = _FakeOrganizationClient(
+        departments=(
+            DingTalkDepartment(10, 1, "潮发运营中心"),
+            DingTalkDepartment(110, 10, "东区"),
+            DingTalkDepartment(120, 10, "西区"),
+            DingTalkDepartment(210, 110, "中心店"),
+            DingTalkDepartment(220, 120, "中心店"),
+        ),
+        users=(),
+    )
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 200, response.text
+    store_items = {item["remote_department_id"]: item for item in response.json()["store_items"]}
+    assert store_items[210]["proposed_org_unit_id"] == east_store.id
+    assert store_items[220]["proposed_org_unit_id"] == west_store.id
+    assert {store_items[210]["match_method"], store_items[220]["match_method"]} == {
+        "EXACT_RELATIVE_PATH"
+    }
+
+
+def test_organization_preview_conflicts_on_ambiguous_local_relative_path(client, db_session):
+    anchor = OrgUnit(code="DIRECT-GROUP", name="集团", type=OrgType.GROUP)
+    region = OrgUnit(code="SOUTH", name="南区", type=OrgType.REGION, parent=anchor)
+    first = OrgUnit(code="SOUTH-FIRST", name="中心店", type=OrgType.STORE, parent=region)
+    second = OrgUnit(code="SOUTH-SECOND", name="中心店", type=OrgType.STORE, parent=region)
+    db_session.add_all([anchor, region, first, second])
+    db_session.commit()
+    admin = _group_hr(db_session, "org-sync-path-ambiguous")
+    fake = _FakeOrganizationClient(
+        departments=(
+            DingTalkDepartment(10, 1, "潮发运营中心"),
+            DingTalkDepartment(110, 10, "南区"),
+            DingTalkDepartment(210, 110, "中心店"),
+        ),
+        users=(),
+    )
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 200, response.text
+    remote_store = next(
+        item for item in response.json()["store_items"] if item["remote_department_id"] == 210
+    )
+    assert remote_store["status"] == "CONFLICT"
+    assert remote_store["conflict_code"] == "ORG_PATH_AMBIGUOUS"
+    assert response.json()["store_conflicts"] > 0
+
+
+def test_organization_preview_update_lists_exact_name_and_parent_fields(client, db_session):
+    anchor = OrgUnit(code="DIRECT-GROUP", name="集团", type=OrgType.GROUP)
+    east = OrgUnit(code="MOVE-EAST", name="东区", type=OrgType.REGION, parent=anchor)
+    west = OrgUnit(code="MOVE-WEST", name="西区", type=OrgType.REGION, parent=anchor)
+    store = OrgUnit(
+        code="MOVING-STORE",
+        name="旧门店",
+        type=OrgType.STORE,
+        parent=east,
+        dingtalk_dept_id=210,
+    )
+    db_session.add_all([anchor, east, west, store])
+    db_session.commit()
+    admin = _group_hr(db_session, "org-sync-update-fields")
+    fake = _FakeOrganizationClient(
+        departments=(
+            DingTalkDepartment(10, 1, "潮发运营中心"),
+            DingTalkDepartment(110, 10, "东区"),
+            DingTalkDepartment(120, 10, "西区"),
+            DingTalkDepartment(210, 120, "新门店"),
+        ),
+        users=(),
+    )
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 200, response.text
+    item = next(
+        item for item in response.json()["store_items"] if item["remote_department_id"] == 210
+    )
+    assert item["action"] == "UPDATE"
+    assert item["change_fields"] == ["name", "parent_id"]
+    assert item["proposed_parent_org_unit_id"] == west.id
+    staged = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.remote_department_id == 210,
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+        )
+    ).one()
+    assert staged.action == DingTalkOrgSyncAction.UPDATE
+    assert staged.match_method == "STABLE_DEPARTMENT_ID"
+    assert "|" not in staged.match_method
+
+
+@pytest.mark.parametrize(
+    "anchor",
+    [
+        None,
+        OrgUnit(code="DIRECT-GROUP", name="已停用", type=OrgType.REGION, status="HISTORICAL"),
+        OrgUnit(code="DIRECT-GROUP", name="门店锚点", type=OrgType.STORE),
+    ],
+    ids=["missing", "inactive", "store"],
+)
+def test_organization_preview_fails_closed_for_invalid_configured_anchor(
+    client, db_session, anchor
+):
+    if anchor is not None:
+        db_session.add(anchor)
+        db_session.commit()
+    admin = _group_hr(db_session, f"org-sync-invalid-anchor-{anchor.type if anchor else 'missing'}")
+    fake = _FakeOrganizationClient(users=())
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 409
+    assert db_session.scalar(select(func.count()).select_from(DingTalkOrgSyncBatch)) == 0
+
+
+def test_scheduled_organization_preview_reuses_only_complete_unchanged_baseline(db_session):
+    _seed_store_and_managers(db_session)
+    snapshot = _FakeOrganizationClient().list_organization_snapshot(root_department_ids=(10,))
+    first_checked_at = datetime(2026, 7, 22, 9, 0, tzinfo=UTC)
+
+    first = preview_organization_sync(
+        db_session,
+        snapshot,
+        encryption_key=_settings().encryption_key,
+        actor=None,
+        root_mappings=((10, "DIRECT-GROUP"),),
+        trigger=DingTalkOrgSyncTrigger.SCHEDULED,
+        now=first_checked_at,
+    )
+    first_batch_count = db_session.scalar(select(func.count()).select_from(DingTalkOrgSyncBatch))
+    first_item_count = db_session.scalar(select(func.count()).select_from(DingTalkOrgSyncItem))
+
+    reused = preview_organization_sync(
+        db_session,
+        snapshot,
+        encryption_key=_settings().encryption_key,
+        actor=None,
+        root_mappings=((10, "DIRECT-GROUP"),),
+        trigger=DingTalkOrgSyncTrigger.SCHEDULED,
+        now=first_checked_at + timedelta(minutes=1),
+    )
+
+    assert reused.batch_id == first.batch_id
+    assert reused.created_at == first.created_at
+    assert reused.last_checked_at == first_checked_at + timedelta(minutes=1)
+    assert (
+        db_session.scalar(select(func.count()).select_from(DingTalkOrgSyncBatch))
+        == first_batch_count
+    )
+    assert (
+        db_session.scalar(select(func.count()).select_from(DingTalkOrgSyncItem)) == first_item_count
+    )
+
+    expired_replacement = preview_organization_sync(
+        db_session,
+        snapshot,
+        encryption_key=_settings().encryption_key,
+        actor=None,
+        root_mappings=((10, "DIRECT-GROUP"),),
+        trigger=DingTalkOrgSyncTrigger.SCHEDULED,
+        now=first_checked_at + timedelta(minutes=16),
+    )
+    assert expired_replacement.batch_id != first.batch_id
+
+    store = db_session.scalars(select(OrgUnit).where(OrgUnit.code == "DIRECT-STORE")).one()
+    store.name = "本地并发改名店"
+    db_session.commit()
+    changed = preview_organization_sync(
+        db_session,
+        snapshot,
+        encryption_key=_settings().encryption_key,
+        actor=None,
+        root_mappings=((10, "DIRECT-GROUP"),),
+        trigger=DingTalkOrgSyncTrigger.SCHEDULED,
+        now=first_checked_at + timedelta(minutes=17),
+    )
+    assert changed.batch_id != first.batch_id
+
+
+def test_manual_organization_preview_stales_only_the_same_root_hash(db_session):
+    _seed_store_and_managers(db_session)
+    other_anchor = OrgUnit(code="OTHER-GROUP", name="其它集团", type=OrgType.GROUP)
+    db_session.add(other_anchor)
+    db_session.commit()
+    actor = _group_hr(db_session, "org-sync-manual-scope")
+    first_snapshot = _FakeOrganizationClient().list_organization_snapshot(root_department_ids=(10,))
+    other_snapshot = DingTalkOrganizationSnapshot(
+        departments=(
+            DingTalkDepartment(20, 1, "其它运营中心"),
+            DingTalkDepartment(201, 20, "其它门店"),
+        ),
+        users=(),
+    )
+
+    first = preview_organization_sync(
+        db_session,
+        first_snapshot,
+        encryption_key=_settings().encryption_key,
+        actor=(actor.id, actor.username),
+        root_mappings=((10, "DIRECT-GROUP"),),
+    )
+    other = preview_organization_sync(
+        db_session,
+        other_snapshot,
+        encryption_key=_settings().encryption_key,
+        actor=(actor.id, actor.username),
+        root_mappings=((20, "OTHER-GROUP"),),
+    )
+    db_session.expire_all()
+    first_batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.public_id == first.batch_id)
+    ).one()
+    assert first_batch.status.value == "PREVIEWED"
+
+    replacement = preview_organization_sync(
+        db_session,
+        first_snapshot,
+        encryption_key=_settings().encryption_key,
+        actor=(actor.id, actor.username),
+        root_mappings=((10, "DIRECT-GROUP"),),
+    )
+    db_session.expire_all()
+    first_batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.public_id == first.batch_id)
+    ).one()
+    other_batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.public_id == other.batch_id)
+    ).one()
+    assert replacement.batch_id != first.batch_id
+    assert first_batch.status.value == "STALE"
+    assert other_batch.status.value == "PREVIEWED"

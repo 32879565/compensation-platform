@@ -17,6 +17,7 @@ from app.dingtalk.read_sync import (
 )
 from app.models.auth import User, UserReviewScope
 from app.models.dingtalk import (
+    DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncBatchStatus,
     DingTalkOrgSyncItem,
@@ -143,7 +144,7 @@ def require_recent_organization_scopes(
             or item.proposed_employee_id is None
             or item.applied_identity_proof is None
             or item.remote_department_id is None
-            or not item.match_method.startswith("ASSIGN|")
+            or item.action != DingTalkOrgSyncAction.ASSIGN_SCOPE
         ):
             continue
         key = (item.proposed_org_unit_id, item.department)
@@ -370,7 +371,7 @@ def require_current_organization_reviewer(
         and item.proposed_employee_id == employee.id
         and item.remote_department_id == store.dingtalk_dept_id
         and item.applied_identity_proof is not None
-        and item.match_method.startswith("ASSIGN|")
+        and item.action == DingTalkOrgSyncAction.ASSIGN_SCOPE
     ]
     if len(store_items) != 1 or len(reviewer_items) != 1:
         raise DingTalkOrganizationFreshnessError(

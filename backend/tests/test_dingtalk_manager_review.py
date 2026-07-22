@@ -278,7 +278,7 @@ def _make_live_review_world(session, world, settings):
                 proposed_employee_id=employee.id,
                 proposed_org_type=None,
                 department=Department.DINING,
-                match_method="ASSIGN|STABLE_ID",
+                match_method="STABLE_ID",
                 change_fields=["reviewer_scope"],
                 applied_identity_proof=dingtalk_organization_identity_proof(
                     provider_hash,
