@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import delete, event, select
 from sqlalchemy.orm import Session
 
+import app.auth.service as auth_service
 from app.auth.service import (
     AuthError,
     authenticate,
@@ -250,13 +251,30 @@ def test_concurrent_login_then_revoke_leaves_no_active_refresh_token(pg_engine) 
         _cleanup_user(pg_engine, user_id)
 
 
-@pytest.mark.parametrize("revoke_mode", ["account", "presented_token"])
+@pytest.mark.parametrize(
+    ("revoke_mode", "crosses_expiry_while_waiting"),
+    [
+        ("account", False),
+        ("presented_token", False),
+        ("presented_token", True),
+    ],
+)
 def test_concurrent_refresh_then_revoke_revokes_the_rotated_token(
-    pg_engine, revoke_mode: str
+    pg_engine,
+    monkeypatch,
+    revoke_mode: str,
+    crosses_expiry_while_waiting: bool,
 ) -> None:
     user_id, _username = _seed_user(pg_engine, "refresh-revoke")
+    expiry_boundary: datetime | None = None
     with Session(pg_engine) as session:
         raw = issue_refresh_token(session, user_id)
+        if crosses_expiry_while_waiting:
+            token = session.scalars(
+                select(RefreshToken).where(RefreshToken.user_id == user_id)
+            ).one()
+            expiry_boundary = datetime.now(UTC) + timedelta(minutes=5)
+            token.expires_at = expiry_boundary
         session.commit()
 
     refresh_holds_user = threading.Event()
@@ -272,11 +290,12 @@ def test_concurrent_refresh_then_revoke_revokes_the_rotated_token(
                 _conn, _cursor, statement, _parameters, _context, _executemany
             ):
                 normalized = " ".join(statement.upper().split())
-                if (
-                    "FROM APP_USER" in normalized
-                    and "FOR UPDATE" in normalized
-                    and not refresh_holds_user.is_set()
-                ):
+                reached_pause_point = (
+                    normalized.startswith("INSERT INTO REFRESH_TOKEN")
+                    if crosses_expiry_while_waiting
+                    else "FROM APP_USER" in normalized and "FOR UPDATE" in normalized
+                )
+                if reached_pause_point and not refresh_holds_user.is_set():
                     refresh_holds_user.set()
                     if not release_refresh.wait(timeout=5):
                         raise TimeoutError("test did not release the refresh transaction")
@@ -315,6 +334,17 @@ def test_concurrent_refresh_then_revoke_revokes_the_rotated_token(
         with ThreadPoolExecutor(max_workers=2) as executor:
             refresh_future = executor.submit(rotate_while_paused_after_user_lock)
             assert refresh_holds_user.wait(timeout=5)
+            if crosses_expiry_while_waiting:
+                assert expiry_boundary is not None
+                boundary = expiry_boundary
+
+                class _BoundaryClock:
+                    @classmethod
+                    def now(cls, tz) -> datetime:
+                        offset = 1 if revoke_attempted_user_lock.is_set() else -1
+                        return boundary + timedelta(seconds=offset)
+
+                monkeypatch.setattr(auth_service, "datetime", _BoundaryClock)
             revoke_future = executor.submit(revoke_sessions)
             assert revoke_attempted_user_lock.wait(timeout=5)
             assert not revoke_done.wait(timeout=0.2)

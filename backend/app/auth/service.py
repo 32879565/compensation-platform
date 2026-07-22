@@ -356,6 +356,9 @@ def revoke_refresh_token(session: Session, raw_token: str) -> None:
     successor cannot escape logout.
     """
 
+    # Authorization is evaluated when logout begins, not after it has waited
+    # for a concurrent refresh transaction to release the account lock.
+    observed_at = datetime.now(UTC)
     digest = hash_refresh_token(raw_token)
     user_id = session.scalar(select(RefreshToken.user_id).where(RefreshToken.token_hash == digest))
     if user_id is None or _lock_user_for_update(session, user_id) is None:
@@ -365,7 +368,7 @@ def revoke_refresh_token(session: Session, raw_token: str) -> None:
     ).first()
     if rec is None or rec.user_id != user_id:
         return
-    if _expired(rec.expires_at, datetime.now(UTC)):
+    if _expired(rec.expires_at, observed_at):
         return
     revoke_all_for_user(session, user_id)
 
