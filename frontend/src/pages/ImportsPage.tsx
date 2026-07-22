@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Alert, Button, Card, Descriptions, Modal, Space, Table, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import {
@@ -129,6 +129,16 @@ export default function ImportsPage() {
     refetchOnReconnect: false,
   })
   const publishTargets = publishTargetsQuery.data ?? []
+  const publishSelectionLocked =
+    publishTargets.length > 0 && publishTargets.every((target) => target.locked)
+
+  useEffect(() => {
+    const targets = publishTargetsQuery.data
+    if (!targets?.length || !targets.every((target) => target.locked)) return
+    const storeIds = targets.map((target) => target.store_id)
+    setSelectedStoreIds(storeIds)
+    setLockedPublishStoreIds(storeIds)
+  }, [publishTargetsQuery.data])
 
   function orderedStoreIds(storeIds: number[]): number[] {
     const requested = new Set(storeIds)
@@ -546,6 +556,15 @@ export default function ImportsPage() {
                   <Alert type="warning" showIcon message="该批次没有可推送的门店，已禁止推送" />
                 ) : (
                   <>
+                    {publishSelectionLocked ? (
+                      <Alert
+                        type="info"
+                        showIcon
+                        message="该导入批次的推送门店范围已锁定"
+                        description="仅可按下方原范围幂等重试，不能追加或移除门店。"
+                        style={{ marginBottom: 12 }}
+                      />
+                    ) : null}
                     <Space wrap style={{ marginBottom: 12 }}>
                       <Typography.Text>
                         已选择 {selectedStoreIds.length} / {publishTargets.length} 家门店
@@ -556,6 +575,7 @@ export default function ImportsPage() {
                           publishTargetsQuery.isLoading ||
                           publishTargetsQuery.isFetching ||
                           publishTargets.length === 0 ||
+                          publishSelectionLocked ||
                           selectedStoreIds.length === publishTargets.length
                         }
                         onClick={() =>
@@ -566,7 +586,7 @@ export default function ImportsPage() {
                       </Button>
                       <Button
                         size="small"
-                        disabled={selectedStoreIds.length === 0}
+                        disabled={publishSelectionLocked || selectedStoreIds.length === 0}
                         onClick={() => setSelectedStoreIds([])}
                       >
                         清空
@@ -587,15 +607,18 @@ export default function ImportsPage() {
                         rowSelection={{
                           type: 'checkbox',
                           selectedRowKeys: selectedStoreIds,
-                          onChange: (rowKeys) =>
+                          onChange: (rowKeys) => {
+                            if (publishSelectionLocked) return
                             setSelectedStoreIds(
                               orderedStoreIds(rowKeys.map((rowKey) => Number(rowKey))),
-                            ),
+                            )
+                          },
                           getCheckboxProps: (target) =>
                             ({
+                              disabled: publishSelectionLocked,
                               title: `选择门店 ${target.store_name}`,
                               'aria-label': `选择门店 ${target.store_name}`,
-                            }) as { title: string },
+                            }) as { disabled: boolean; title: string },
                         }}
                         scroll={{ x: 620 }}
                         size="small"
@@ -619,7 +642,7 @@ export default function ImportsPage() {
                         setPublishConfirmOpen(true)
                       }}
                     >
-                      推送给店长和厨房经理
+                      {publishSelectionLocked ? '按原范围重试推送' : '推送给店长和厨房经理'}
                     </Button>
                   </>
                 )}
@@ -733,6 +756,23 @@ export default function ImportsPage() {
           publishMutation.mutate({ batchId: batch.id, storeIds })
         }}
       >
+        {publishSelectionLocked ? (
+          <Alert
+            type="info"
+            showIcon
+            message="已锁定范围幂等重试"
+            description={`将按已锁定的 ${pendingPublishStoreIds.length} 家门店原范围重试，不会重复创建薪资批次。`}
+            style={{ marginBottom: 16 }}
+          />
+        ) : (
+          <Alert
+            type="warning"
+            showIcon
+            message="首次推送后门店范围将立即锁定"
+            description={`本次已选择 ${pendingPublishStoreIds.length} 家，未选择 ${Math.max(0, publishTargets.length - pendingPublishStoreIds.length)} 家。未选择的门店将不能再使用该导入批次追加推送。`}
+            style={{ marginBottom: 16 }}
+          />
+        )}
         <Typography.Paragraph>将向以下门店的店长和厨房经理推送薪资复核：</Typography.Paragraph>
         <Typography.Text strong>{targetNames(pendingPublishStoreIds)}</Typography.Text>
       </Modal>

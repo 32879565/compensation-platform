@@ -29,6 +29,7 @@ export interface SalaryImportPublishTarget {
   store_name: string
   employee_count: number
   departments: Array<'DINING' | 'KITCHEN'>
+  locked: boolean
 }
 
 export interface SalaryImportPublishResult {

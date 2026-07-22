@@ -323,6 +323,7 @@ class PublishTargetOut(BaseModel):
     store_name: str
     employee_count: int
     departments: list[Department]
+    locked: bool
 
     model_config = {"from_attributes": True}
 
