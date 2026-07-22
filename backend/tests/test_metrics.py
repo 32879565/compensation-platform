@@ -1,17 +1,21 @@
 import asyncio
 import errno
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from fastapi import Response
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 from starlette.types import Message, Receive, Scope, Send
 
-from app.core.metrics import RequestMetrics, RequestMetricsMiddleware
+from app.core.metrics import RequestMetrics, RequestMetricsMiddleware, render_org_sync_metrics
 from app.main import create_app
+from app.models.audit import AuditLog
+from app.models.dingtalk import DingTalkOrgSyncBatch
 
 
 async def _receive() -> Message:
@@ -31,6 +35,169 @@ def _metrics_scope(
 
 def _metric_line(metric: str, rendered: str) -> str:
     return next(line for line in rendered.splitlines() if line.startswith(metric))
+
+
+def _metric_value(metric: str, rendered: str) -> float:
+    return float(_metric_line(metric, rendered).split()[-1])
+
+
+def _org_batch(
+    *,
+    public_id: str,
+    checked_at: datetime,
+    created_at: datetime,
+    counts: tuple[int, int, int, int, int, int],
+) -> DingTalkOrgSyncBatch:
+    (
+        ready_regions,
+        ready_stores,
+        ready_reviewers,
+        region_conflicts,
+        store_conflicts,
+        reviewer_conflicts,
+    ) = counts
+    return DingTalkOrgSyncBatch(
+        public_id=public_id,
+        snapshot_hash=public_id[0] * 64,
+        root_config_hash=public_id[1] * 64,
+        local_baseline_hash=public_id[2] * 64,
+        expires_at=checked_at + timedelta(hours=1),
+        created_at=created_at,
+        updated_at=created_at,
+        last_checked_at=checked_at,
+        ready_region_count=ready_regions,
+        ready_store_count=ready_stores,
+        ready_reviewer_count=ready_reviewers,
+        region_conflict_count=region_conflicts,
+        store_conflict_count=store_conflicts,
+        reviewer_conflict_count=reviewer_conflicts,
+    )
+
+
+@pytest.mark.usefixtures("pg_engine")
+def test_org_metrics_use_audit_max_and_latest_checked_batch(db_session) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    db_session.add_all(
+        [
+            AuditLog(
+                action="dingtalk.organization.schedule.succeeded",
+                result="SUCCESS",
+                ts=now - timedelta(seconds=10),
+            ),
+            # Inserted later but older: max(ts), not row id, must win.
+            AuditLog(
+                action="dingtalk.organization.schedule.succeeded",
+                result="SUCCESS",
+                ts=now - timedelta(seconds=30),
+            ),
+            AuditLog(
+                action="dingtalk.organization.schedule.failed",
+                result="FAILURE",
+                ts=now - timedelta(seconds=20),
+            ),
+            _org_batch(
+                public_id="abc" + "0" * 29,
+                checked_at=now - timedelta(minutes=5),
+                created_at=now,
+                counts=(90, 90, 90, 90, 90, 90),
+            ),
+            _org_batch(
+                public_id="def" + "1" * 29,
+                checked_at=now - timedelta(minutes=1),
+                created_at=now - timedelta(days=1),
+                counts=(1, 2, 3, 4, 5, 6),
+            ),
+            # Tied last_checked_at: highest id must be selected.
+            _org_batch(
+                public_id="ghi" + "2" * 29,
+                checked_at=now - timedelta(minutes=1),
+                created_at=now - timedelta(days=2),
+                counts=(7, 8, 9, 10, 11, 12),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    rendered = render_org_sync_metrics(db_session, now=now)
+
+    assert (
+        _metric_value("compensation_dingtalk_org_sync_last_success_timestamp_seconds", rendered)
+        == (now - timedelta(seconds=10)).timestamp()
+    )
+    assert (
+        _metric_value("compensation_dingtalk_org_sync_last_failure_timestamp_seconds", rendered)
+        == (now - timedelta(seconds=20)).timestamp()
+    )
+    assert _metric_value("compensation_dingtalk_org_sync_ready_changes", rendered) == 24
+    assert _metric_value("compensation_dingtalk_org_sync_conflicts", rendered) == 33
+    assert _metric_value("compensation_dingtalk_org_sync_stale_seconds", rendered) == 10
+    assert "{" not in rendered
+    assert "abc" not in rendered
+    assert "ghi" not in rendered
+
+
+@pytest.mark.usefixtures("pg_engine")
+def test_org_metrics_empty_database_is_numeric_and_never_run_is_stale(db_session) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+
+    rendered = render_org_sync_metrics(db_session, now=now)
+
+    assert (
+        _metric_value("compensation_dingtalk_org_sync_last_success_timestamp_seconds", rendered)
+        == 0
+    )
+    assert (
+        _metric_value("compensation_dingtalk_org_sync_last_failure_timestamp_seconds", rendered)
+        == 0
+    )
+    assert _metric_value("compensation_dingtalk_org_sync_ready_changes", rendered) == 0
+    assert _metric_value("compensation_dingtalk_org_sync_conflicts", rendered) == 0
+    assert (
+        _metric_value("compensation_dingtalk_org_sync_stale_seconds", rendered) == now.timestamp()
+    )
+
+
+@pytest.mark.usefixtures("pg_engine")
+def test_org_metrics_clamp_future_success_staleness_to_zero(db_session) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    db_session.add(
+        AuditLog(
+            action="dingtalk.organization.schedule.succeeded",
+            result="SUCCESS",
+            ts=now + timedelta(minutes=1),
+        )
+    )
+    db_session.commit()
+
+    rendered = render_org_sync_metrics(db_session, now=now)
+
+    assert _metric_value("compensation_dingtalk_org_sync_stale_seconds", rendered) == 0
+
+
+def test_metrics_endpoint_omits_org_series_when_database_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main_module
+
+    def unavailable_session() -> object:
+        raise SQLAlchemyError("private database topology")
+
+    monkeypatch.setattr(main_module, "SessionLocal", unavailable_session)
+    app = create_app()
+
+    @app.get("/metrics-db-probe")
+    def metrics_db_probe() -> Response:
+        return Response(status_code=200)
+
+    client = TestClient(app)
+    assert client.get("/metrics-db-probe").status_code == 200
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "compensation_http_requests_total" in response.text
+    assert 'route="/metrics-db-probe"' in response.text
+    assert "compensation_dingtalk_org_sync_" not in response.text
+    assert "private database topology" not in response.text
 
 
 def test_metrics_render_deterministic_aggregate_series() -> None:

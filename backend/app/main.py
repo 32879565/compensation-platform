@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi import FastAPI, HTTPException, Response
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -6,8 +8,8 @@ from app.audit.middleware import ClientIpMiddleware
 from app.auth.router import router as auth_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
-from app.core.metrics import RequestMetrics, RequestMetricsMiddleware
-from app.db.session import engine
+from app.core.metrics import RequestMetrics, RequestMetricsMiddleware, render_org_sync_metrics
+from app.db.session import SessionLocal, engine
 from app.routers.approval import router as approval_router
 from app.routers.attendance import router as attendance_router
 from app.routers.attendance_schedule import router as attendance_schedule_router
@@ -57,8 +59,16 @@ def create_app() -> FastAPI:
     @app.get("/metrics", include_in_schema=False)
     def metrics() -> Response:
         """Expose aggregate operational metrics only on the backend listener."""
+        content = request_metrics.render_prometheus()
+        try:
+            with SessionLocal() as session:
+                content += render_org_sync_metrics(session, now=datetime.now(UTC))
+        except SQLAlchemyError:
+            # A scrape remains useful during a database outage. Omitting the
+            # database-backed series is distinguishable from healthy zeroes.
+            pass
         return Response(
-            content=request_metrics.render_prometheus(),
+            content=content,
             media_type="text/plain; version=0.0.4",
         )
 

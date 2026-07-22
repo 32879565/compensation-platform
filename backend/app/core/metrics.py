@@ -9,18 +9,92 @@ from __future__ import annotations
 
 from asyncio import CancelledError
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from errno import ECONNABORTED, ECONNRESET, ENOTCONN, EPIPE
 from math import isfinite
 from threading import Lock
 from time import perf_counter
 
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from app.models.audit import AuditLog
+from app.models.dingtalk import DingTalkOrgSyncBatch
 
 _ALLOWED_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
 _METRICS_ROUTE = "/metrics"
 _UNMATCHED_ROUTE = "/unmatched"
 _CLOSED_CLIENT_SEND_ERRNOS = frozenset({ECONNABORTED, ECONNRESET, ENOTCONN, EPIPE})
+_ORG_SYNC_SUCCESS_ACTION = "dingtalk.organization.schedule.succeeded"
+_ORG_SYNC_FAILURE_ACTION = "dingtalk.organization.schedule.failed"
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _timestamp(value: datetime | None) -> float:
+    return 0.0 if value is None else _as_utc(value).timestamp()
+
+
+def render_org_sync_metrics(session: Session, *, now: datetime) -> str:
+    """Render database-backed organization scheduler gauges without labels."""
+
+    last_success = session.scalar(
+        select(func.max(AuditLog.ts)).where(AuditLog.action == _ORG_SYNC_SUCCESS_ACTION)
+    )
+    last_failure = session.scalar(
+        select(func.max(AuditLog.ts)).where(AuditLog.action == _ORG_SYNC_FAILURE_ACTION)
+    )
+    latest_batch = session.scalars(
+        select(DingTalkOrgSyncBatch)
+        .order_by(DingTalkOrgSyncBatch.last_checked_at.desc(), DingTalkOrgSyncBatch.id.desc())
+        .limit(1)
+    ).first()
+
+    if latest_batch is None:
+        ready_changes = 0
+        conflicts = 0
+    else:
+        ready_changes = (
+            latest_batch.ready_region_count
+            + latest_batch.ready_store_count
+            + latest_batch.ready_reviewer_count
+        )
+        conflicts = (
+            latest_batch.region_conflict_count
+            + latest_batch.store_conflict_count
+            + latest_batch.reviewer_conflict_count
+        )
+
+    success_timestamp = _timestamp(last_success)
+    failure_timestamp = _timestamp(last_failure)
+    stale_seconds = max(0.0, _as_utc(now).timestamp() - success_timestamp)
+    lines = [
+        "# HELP compensation_dingtalk_org_sync_last_success_timestamp_seconds "
+        "Unix timestamp of the latest successful scheduled organization preview.",
+        "# TYPE compensation_dingtalk_org_sync_last_success_timestamp_seconds gauge",
+        "compensation_dingtalk_org_sync_last_success_timestamp_seconds " f"{success_timestamp:.6f}",
+        "# HELP compensation_dingtalk_org_sync_last_failure_timestamp_seconds "
+        "Unix timestamp of the latest failed scheduled organization preview.",
+        "# TYPE compensation_dingtalk_org_sync_last_failure_timestamp_seconds gauge",
+        "compensation_dingtalk_org_sync_last_failure_timestamp_seconds " f"{failure_timestamp:.6f}",
+        "# HELP compensation_dingtalk_org_sync_ready_changes "
+        "Ready changes in the most recently checked organization preview.",
+        "# TYPE compensation_dingtalk_org_sync_ready_changes gauge",
+        f"compensation_dingtalk_org_sync_ready_changes {ready_changes}",
+        "# HELP compensation_dingtalk_org_sync_conflicts "
+        "Conflicts in the most recently checked organization preview.",
+        "# TYPE compensation_dingtalk_org_sync_conflicts gauge",
+        f"compensation_dingtalk_org_sync_conflicts {conflicts}",
+        "# HELP compensation_dingtalk_org_sync_stale_seconds "
+        "Seconds since the latest successful scheduled organization preview.",
+        "# TYPE compensation_dingtalk_org_sync_stale_seconds gauge",
+        f"compensation_dingtalk_org_sync_stale_seconds {stale_seconds:.6f}",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 @dataclass
