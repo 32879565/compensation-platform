@@ -226,13 +226,23 @@ def test_employee_preview_and_confirmation_bind_only_safe_matches(client, db_ses
     assert "远端王芳" not in audit_text
 
 
-def test_attendance_preview_is_aggregate_only_and_does_not_write_payroll_inputs(client, db_session):
+def test_attendance_preview_is_aggregate_only_and_does_not_write_payroll_inputs(
+    client, db_session, monkeypatch
+):
     _seed_employees(db_session)
     admin = _user(db_session, "attendance-sync-admin", "GROUP_HR")
     fake = _FakeReadClient()
     settings = _settings(enabled=True)
     from app.main import app
     from app.models.attendance import AttendanceRecord
+    from app.routers import dingtalk_sync
+
+    period_bounds = dingtalk_sync._period_bounds
+    monkeypatch.setattr(
+        dingtalk_sync,
+        "_period_bounds",
+        lambda period: period_bounds(period, today=date(2026, 7, 21)),
+    )
 
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_dingtalk_client] = lambda: fake
