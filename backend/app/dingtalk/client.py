@@ -779,6 +779,7 @@ class DingTalkClient:
         title: str,
         markdown: str,
         action_url: str,
+        action_title: str = "查看并申诉",
     ) -> DingTalkSendResult:
         recipient = recipient_user_id.strip()
         if not recipient or len(recipient) > 256:
@@ -789,6 +790,11 @@ class DingTalkClient:
             raise DingTalkClientError("The DingTalk notification body is invalid")
         if not action_url.startswith("https://") or len(action_url) > 500:
             raise DingTalkClientError("The DingTalk notification action URL is invalid")
+        if not isinstance(action_title, str):
+            raise DingTalkClientError("The DingTalk notification action title is invalid")
+        normalized_action_title = action_title.strip()
+        if not normalized_action_title or len(normalized_action_title) > 32:
+            raise DingTalkClientError("The DingTalk notification action title is invalid")
 
         token, _expires_in = self.access_token()
         message = {
@@ -796,7 +802,7 @@ class DingTalkClient:
             "action_card": {
                 "title": title,
                 "markdown": markdown,
-                "single_title": "查看并申诉",
+                "single_title": normalized_action_title,
                 "single_url": action_url,
             },
         }

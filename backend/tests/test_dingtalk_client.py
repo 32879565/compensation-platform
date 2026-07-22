@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from urllib.error import HTTPError
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -55,8 +56,32 @@ def test_token_is_cached_and_action_card_uses_fixed_provider_destinations(monkey
     assert requests[1][0].full_url.startswith(
         "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2?"
     )
+    payload = json.loads(parse_qs(requests[1][0].data.decode("utf-8"))["msg"][0])
+    assert payload["action_card"]["single_title"] == "查看并申诉"
     assert result.task_id == 42
     assert result.request_id == "req-1"
+
+
+def test_action_card_accepts_purpose_specific_button(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_perform(request):
+        captured["message"] = json.loads(parse_qs(request.data.decode("utf-8"))["msg"][0])
+        return {"errcode": 0, "task_id": 7}
+
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+    monkeypatch.setattr(client, "access_token", lambda: ("provider-token", 3600))
+    monkeypatch.setattr(client, "_perform", fake_perform)
+
+    client.send_action_card(
+        recipient_user_id="ding-1",
+        title="组织同步待确认",
+        markdown="发现 3 项待应用变更，1 项冲突。",
+        action_url="https://pay.example.test/org",
+        action_title="查看组织同步",
+    )
+
+    assert captured["message"]["action_card"]["single_title"] == "查看组织同步"
 
 
 def test_provider_http_errors_are_sanitized(monkeypatch):
