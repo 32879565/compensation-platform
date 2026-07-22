@@ -78,16 +78,20 @@ export interface DingTalkEmployeeApplyResult {
 
 export type DingTalkOrganizationSyncItemStatus = 'READY' | 'CONFLICT'
 export type DingTalkReviewerDepartment = 'DINING' | 'KITCHEN'
-export type DingTalkOrganizationStoreAction =
-  'LINK' | 'CREATE' | 'ACTIVATE' | 'UPDATE' | 'MISSING_IN_DINGTALK'
+export type DingTalkOrganizationNodeKind = 'REGION' | 'STORE'
+export type DingTalkOrganizationNodeAction =
+  'LINK' | 'CREATE' | 'ACTIVATE' | 'UPDATE' | 'DEACTIVATE'
+export type DingTalkOrganizationChangeField = 'name' | 'parent_id'
 export type DingTalkOrganizationReviewerAction = 'ASSIGN' | 'REMOVE' | 'CONFLICT'
 
-export interface DingTalkOrganizationStoreItem {
+export interface DingTalkOrganizationNodeItem {
   id: number
+  kind: DingTalkOrganizationNodeKind
   remote_department_id: number | null
   remote_department_name: string
   remote_department_path: string
-  action: DingTalkOrganizationStoreAction
+  action: DingTalkOrganizationNodeAction
+  change_fields: DingTalkOrganizationChangeField[]
   match_method: string
   proposed_org_unit_id: number | null
   proposed_org_unit_name: string | null
@@ -116,13 +120,18 @@ export interface DingTalkOrganizationReviewerItem {
 export interface DingTalkOrganizationPreview {
   batch_id: string
   expires_at: string
+  remote_regions: number
+  local_regions: number
+  ready_regions: number
+  region_conflicts: number
   remote_stores: number
   local_stores: number
   ready_stores: number
   store_conflicts: number
   ready_reviewers: number
   reviewer_conflicts: number
-  store_items: DingTalkOrganizationStoreItem[]
+  region_items: DingTalkOrganizationNodeItem[]
+  store_items: DingTalkOrganizationNodeItem[]
   reviewer_items: DingTalkOrganizationReviewerItem[]
 }
 
@@ -228,15 +237,17 @@ function toAppealSummary(appeal: CompAppealResponse): CompAppeal {
   }
 }
 
-function toOrganizationStoreItem(
-  item: DingTalkOrganizationStoreItem,
-): DingTalkOrganizationStoreItem {
+function toOrganizationNodeItem(
+  item: DingTalkOrganizationNodeItem,
+): DingTalkOrganizationNodeItem {
   return {
     id: item.id,
+    kind: item.kind,
     remote_department_id: item.remote_department_id,
     remote_department_name: item.remote_department_name,
     remote_department_path: item.remote_department_path,
     action: item.action,
+    change_fields: [...item.change_fields],
     match_method: item.match_method,
     proposed_org_unit_id: item.proposed_org_unit_id,
     proposed_org_unit_name: item.proposed_org_unit_name,
@@ -304,13 +315,18 @@ export async function previewDingTalkOrganization(): Promise<DingTalkOrganizatio
   return {
     batch_id: preview.batch_id,
     expires_at: preview.expires_at,
+    remote_regions: preview.remote_regions,
+    local_regions: preview.local_regions,
+    ready_regions: preview.ready_regions,
+    region_conflicts: preview.region_conflicts,
     remote_stores: preview.remote_stores,
     local_stores: preview.local_stores,
     ready_stores: preview.ready_stores,
     store_conflicts: preview.store_conflicts,
     ready_reviewers: preview.ready_reviewers,
     reviewer_conflicts: preview.reviewer_conflicts,
-    store_items: preview.store_items.map(toOrganizationStoreItem),
+    region_items: preview.region_items.map(toOrganizationNodeItem),
+    store_items: preview.store_items.map(toOrganizationNodeItem),
     reviewer_items: preview.reviewer_items.map(toOrganizationReviewerItem),
   }
 }

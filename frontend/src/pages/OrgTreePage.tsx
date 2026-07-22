@@ -19,11 +19,12 @@ import { useState } from 'react'
 import {
   applyDingTalkOrganization,
   previewDingTalkOrganization,
+  type DingTalkOrganizationNodeAction,
+  type DingTalkOrganizationNodeItem,
+  type DingTalkOrganizationNodeKind,
   type DingTalkOrganizationPreview,
   type DingTalkOrganizationReviewerAction,
   type DingTalkOrganizationReviewerItem,
-  type DingTalkOrganizationStoreAction,
-  type DingTalkOrganizationStoreItem,
   type DingTalkOrganizationSyncItemStatus,
 } from '../api/dingtalk'
 import { fetchOrgTree, type OrgTreeNode } from '../api/masterdata'
@@ -41,20 +42,32 @@ const DEPARTMENT_LABEL: Record<DingTalkOrganizationReviewerItem['department'], s
   KITCHEN: '厨房',
 }
 
-const STORE_ACTION_LABEL: Record<DingTalkOrganizationStoreAction, string> = {
-  LINK: '关联已有门店',
-  CREATE: '创建新门店',
-  ACTIVATE: '启用门店',
-  UPDATE: '更新门店',
-  MISSING_IN_DINGTALK: '钉钉中缺失',
+const ORGANIZATION_ACTION_LABEL: Record<
+  DingTalkOrganizationNodeKind,
+  Record<DingTalkOrganizationNodeAction, string>
+> = {
+  REGION: {
+    LINK: '关联已有区域',
+    CREATE: '创建新区域',
+    ACTIVATE: '启用区域',
+    UPDATE: '更新区域',
+    DEACTIVATE: '停用区域',
+  },
+  STORE: {
+    LINK: '关联已有门店',
+    CREATE: '创建新门店',
+    ACTIVATE: '启用门店',
+    UPDATE: '更新门店',
+    DEACTIVATE: '停用门店',
+  },
 }
 
-const STORE_ACTION_COLOR: Record<DingTalkOrganizationStoreAction, string> = {
+const ORGANIZATION_ACTION_COLOR: Record<DingTalkOrganizationNodeAction, string> = {
   LINK: 'blue',
   CREATE: 'green',
   ACTIVATE: 'cyan',
   UPDATE: 'geekblue',
-  MISSING_IN_DINGTALK: 'orange',
+  DEACTIVATE: 'orange',
 }
 
 const REVIEWER_ACTION_LABEL: Record<DingTalkOrganizationReviewerAction, string> = {
@@ -92,33 +105,40 @@ function localTargetLabel(name: string | null, id: number | null): string {
   return id === null ? name : `${name}（ID ${id}）`
 }
 
-const storeColumns: ColumnsType<DingTalkOrganizationStoreItem> = [
-  {
-    title: '动作',
-    render: (_value, item) => (
-      <Tag color={STORE_ACTION_COLOR[item.action]}>{STORE_ACTION_LABEL[item.action]}</Tag>
-    ),
-  },
-  {
-    title: '钉钉门店',
-    render: (_value, item) =>
-      remoteDepartmentLabel(item.remote_department_name, item.remote_department_id),
-  },
-  { title: '钉钉完整路径', dataIndex: 'remote_department_path' },
-  { title: '匹配方式', dataIndex: 'match_method' },
-  {
-    title: '本地门店',
-    render: (_value, item) =>
-      localTargetLabel(item.proposed_org_unit_name, item.proposed_org_unit_id),
-  },
-  {
-    title: '上级组织',
-    render: (_value, item) =>
-      localTargetLabel(item.proposed_parent_org_unit_name, item.proposed_parent_org_unit_id),
-  },
-  { title: '状态', render: (_value, item) => statusTag(item.status) },
-  { title: '冲突代码', render: (_value, item) => item.conflict_code ?? '—' },
-]
+function organizationColumns(
+  kind: DingTalkOrganizationNodeKind,
+): ColumnsType<DingTalkOrganizationNodeItem> {
+  const organizationLabel = kind === 'REGION' ? '区域' : '门店'
+  return [
+    {
+      title: '动作',
+      render: (_value, item) => (
+        <Tag color={ORGANIZATION_ACTION_COLOR[item.action]}>
+          {ORGANIZATION_ACTION_LABEL[kind][item.action]}
+        </Tag>
+      ),
+    },
+    {
+      title: `钉钉${organizationLabel}`,
+      render: (_value, item) =>
+        remoteDepartmentLabel(item.remote_department_name, item.remote_department_id),
+    },
+    { title: '钉钉完整路径', dataIndex: 'remote_department_path' },
+    { title: '匹配方式', dataIndex: 'match_method' },
+    {
+      title: `本地${organizationLabel}`,
+      render: (_value, item) =>
+        localTargetLabel(item.proposed_org_unit_name, item.proposed_org_unit_id),
+    },
+    {
+      title: '上级组织',
+      render: (_value, item) =>
+        localTargetLabel(item.proposed_parent_org_unit_name, item.proposed_parent_org_unit_id),
+    },
+    { title: '状态', render: (_value, item) => statusTag(item.status) },
+    { title: '冲突代码', render: (_value, item) => item.conflict_code ?? '—' },
+  ]
+}
 
 const reviewerColumns: ColumnsType<DingTalkOrganizationReviewerItem> = [
   {
@@ -160,18 +180,24 @@ const reviewerColumns: ColumnsType<DingTalkOrganizationReviewerItem> = [
   { title: '冲突代码', render: (_value, item) => item.conflict_code ?? '—' },
 ]
 
-function StoreChangesSection({ items }: { items: DingTalkOrganizationStoreItem[] }) {
+interface OrganizationChangesSectionProps {
+  kind: DingTalkOrganizationNodeKind
+  items: DingTalkOrganizationNodeItem[]
+}
+
+function OrganizationChangesSection({ kind, items }: OrganizationChangesSectionProps) {
+  const organizationLabel = kind === 'REGION' ? '区域' : '门店'
   const createCount = items.filter(
     (item) => item.action === 'CREATE' && item.status === 'READY',
   ).length
 
   return (
-    <section aria-label={`门店变更（${items.length}）`}>
+    <section aria-label={`${organizationLabel}变更（${items.length}）`}>
       <Space direction="vertical" size="small" style={{ width: '100%' }}>
         <Typography.Title level={4} style={{ margin: 0 }}>
-          门店变更（{items.length}）
+          {organizationLabel}变更（{items.length}）
         </Typography.Title>
-        {createCount > 0 ? (
+        {kind === 'STORE' && createCount > 0 ? (
           <Alert
             type="info"
             showIcon
@@ -182,15 +208,23 @@ function StoreChangesSection({ items }: { items: DingTalkOrganizationStoreItem[]
         <Table
           rowKey="id"
           size="small"
-          columns={storeColumns}
+          columns={organizationColumns(kind)}
           dataSource={items}
-          locale={{ emptyText: '无门店变更' }}
+          locale={{ emptyText: `无${organizationLabel}变更` }}
           pagination={{ pageSize: 8, hideOnSinglePage: true }}
           scroll={{ x: 1200 }}
         />
       </Space>
     </section>
   )
+}
+
+function totalReadyItems(preview: DingTalkOrganizationPreview): number {
+  return preview.ready_regions + preview.ready_stores + preview.ready_reviewers
+}
+
+function totalConflicts(preview: DingTalkOrganizationPreview): number {
+  return preview.region_conflicts + preview.store_conflicts + preview.reviewer_conflicts
 }
 
 interface ReviewerChangesSectionProps {
@@ -285,8 +319,8 @@ export default function OrgTreePage() {
   function applyPreview(): void {
     if (
       !syncPreview ||
-      syncPreview.reviewer_conflicts > 0 ||
-      syncPreview.ready_stores + syncPreview.ready_reviewers === 0
+      totalConflicts(syncPreview) > 0 ||
+      totalReadyItems(syncPreview) === 0
     ) {
       return
     }
@@ -295,10 +329,9 @@ export default function OrgTreePage() {
 
   if (orgTreeQuery.isLoading) return <Spin />
 
-  const hasApplicableItems =
-    syncPreview !== null && syncPreview.ready_stores + syncPreview.ready_reviewers > 0
+  const hasApplicableItems = syncPreview !== null && totalReadyItems(syncPreview) > 0
   const canApplyPreview =
-    syncPreview !== null && hasApplicableItems && syncPreview.reviewer_conflicts === 0
+    syncPreview !== null && hasApplicableItems && totalConflicts(syncPreview) === 0
   const reviewerAssignments =
     syncPreview?.reviewer_items.filter((item) => item.action === 'ASSIGN') ?? []
   const reviewerRemovals =
@@ -342,16 +375,16 @@ export default function OrgTreePage() {
             <Alert
               type="info"
               showIcon
-              message={`待应用：${syncPreview.ready_stores} 项门店变更、${syncPreview.ready_reviewers} 项负责人变更`}
-              description="确认后将应用预览中的门店变更、负责人分配和负责人撤销。"
+              message={`待应用：${syncPreview.ready_regions} 项区域变更、${syncPreview.ready_stores} 项门店变更、${syncPreview.ready_reviewers} 项负责人变更`}
+              description="确认后将应用预览中的区域变更、门店变更、负责人分配和负责人撤销。"
             />
             <Alert
               type={
-                syncPreview.store_conflicts + syncPreview.reviewer_conflicts ? 'warning' : 'info'
+                totalConflicts(syncPreview) > 0 ? 'warning' : 'info'
               }
               showIcon
-              message={`冲突项：${syncPreview.store_conflicts} 项门店覆盖冲突、${syncPreview.reviewer_conflicts} 项负责人冲突`}
-              description={`钉钉门店 ${syncPreview.remote_stores} 家，本地门店 ${syncPreview.local_stores} 家。门店覆盖冲突会保留显示，不会被应用。`}
+              message={`冲突项：${syncPreview.region_conflicts} 项区域冲突、${syncPreview.store_conflicts} 项门店冲突、${syncPreview.reviewer_conflicts} 项负责人冲突`}
+              description={`钉钉区域 ${syncPreview.remote_regions} 个，本地区域 ${syncPreview.local_regions} 个；钉钉门店 ${syncPreview.remote_stores} 家，本地门店 ${syncPreview.local_stores} 家。`}
             />
             {syncPreview.reviewer_conflicts > 0 ? (
               <Alert
@@ -365,7 +398,8 @@ export default function OrgTreePage() {
             <Typography.Text type="secondary">
               本预览批次有效期至 {new Date(syncPreview.expires_at).toLocaleString('zh-CN')}。
             </Typography.Text>
-            <StoreChangesSection items={syncPreview.store_items} />
+            <OrganizationChangesSection kind="REGION" items={syncPreview.region_items} />
+            <OrganizationChangesSection kind="STORE" items={syncPreview.store_items} />
             <ReviewerChangesSection action="ASSIGN" items={reviewerAssignments} />
             <ReviewerChangesSection action="REMOVE" items={reviewerRemovals} />
             <ReviewerChangesSection action="CONFLICT" items={reviewerConflicts} />

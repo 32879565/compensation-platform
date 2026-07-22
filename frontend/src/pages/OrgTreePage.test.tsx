@@ -53,19 +53,43 @@ const originalTree = [
 const preview: DingTalkOrganizationPreview = {
   batch_id: '3fe80f532f184247b477694427bad0ce',
   expires_at: '2026-07-22T04:00:00Z',
+  remote_regions: 2,
+  local_regions: 1,
+  ready_regions: 1,
+  region_conflicts: 0,
   remote_stores: 4,
   local_stores: 5,
-  ready_stores: 4,
-  store_conflicts: 1,
+  ready_stores: 5,
+  store_conflicts: 0,
   ready_reviewers: 2,
   reviewer_conflicts: 1,
+  region_items: [
+    {
+      id: 100,
+      kind: 'REGION',
+      remote_department_id: 8001,
+      remote_department_name: '广州区域',
+      remote_department_path: '集团 / 广州区域',
+      action: 'CREATE',
+      change_fields: ['name'],
+      match_method: 'REMOTE_ONLY',
+      proposed_org_unit_id: null,
+      proposed_org_unit_name: '广州区域',
+      proposed_parent_org_unit_id: 1,
+      proposed_parent_org_unit_name: '集团',
+      status: 'READY',
+      conflict_code: null,
+    },
+  ],
   store_items: [
     {
       id: 101,
+      kind: 'STORE',
       remote_department_id: 9001,
       remote_department_name: '天河店',
       remote_department_path: '集团 / 潮发运营中心 / 天河店',
       action: 'LINK',
+      change_fields: [],
       match_method: 'STABLE_DEPARTMENT_ID',
       proposed_org_unit_id: 11,
       proposed_org_unit_name: '天河店',
@@ -76,10 +100,12 @@ const preview: DingTalkOrganizationPreview = {
     },
     {
       id: 102,
+      kind: 'STORE',
       remote_department_id: 9002,
       remote_department_name: '新DNA店',
       remote_department_path: '集团 / 九亩地 / 新DNA店',
       action: 'CREATE',
+      change_fields: [],
       match_method: 'REMOTE_ONLY',
       proposed_org_unit_id: null,
       proposed_org_unit_name: '新DNA店',
@@ -90,10 +116,12 @@ const preview: DingTalkOrganizationPreview = {
     },
     {
       id: 103,
+      kind: 'STORE',
       remote_department_id: 9003,
       remote_department_name: '北城店',
       remote_department_path: '集团 / 中山 / 北城店',
       action: 'ACTIVATE',
+      change_fields: [],
       match_method: 'STABLE_DEPARTMENT_ID',
       proposed_org_unit_id: 13,
       proposed_org_unit_name: '北城店',
@@ -104,10 +132,12 @@ const preview: DingTalkOrganizationPreview = {
     },
     {
       id: 104,
+      kind: 'STORE',
       remote_department_id: 9004,
       remote_department_name: '西城店',
       remote_department_path: '集团 / 潮发运营中心 / 西城店',
       action: 'UPDATE',
+      change_fields: ['name'],
       match_method: 'STABLE_DEPARTMENT_ID',
       proposed_org_unit_id: 14,
       proposed_org_unit_name: '西城店',
@@ -118,17 +148,19 @@ const preview: DingTalkOrganizationPreview = {
     },
     {
       id: 105,
+      kind: 'STORE',
       remote_department_id: null,
       remote_department_name: '旧城店',
       remote_department_path: '本地 / 旧城店',
-      action: 'MISSING_IN_DINGTALK',
+      action: 'DEACTIVATE',
+      change_fields: [],
       match_method: 'LOCAL_STORE_NOT_VISIBLE',
       proposed_org_unit_id: 15,
       proposed_org_unit_name: '旧城店',
       proposed_parent_org_unit_id: 1,
       proposed_parent_org_unit_name: '广州区域',
-      status: 'CONFLICT',
-      conflict_code: 'STORE_MISSING_IN_DINGTALK',
+      status: 'READY',
+      conflict_code: null,
     },
   ],
   reviewer_items: [
@@ -251,6 +283,67 @@ describe('OrgTreePage DingTalk organization sync', () => {
     expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
   })
 
+  it('renders safe region changes and allows a region-only preview', async () => {
+    const regionOnlyPreview = {
+      ...preview,
+      ready_stores: 0,
+      store_items: [],
+      ready_reviewers: 0,
+      reviewer_conflicts: 0,
+      reviewer_items: [],
+    }
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(regionOnlyPreview)
+
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+    const regionChanges = within(dialog).getByRole('region', { name: '区域变更（1）' })
+    expect(within(regionChanges).getByText('创建新区域')).toBeTruthy()
+    expect(within(regionChanges).getByText('集团 / 广州区域')).toBeTruthy()
+
+    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
+    expect((applyButton as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(applyButton)
+
+    await waitFor(() =>
+      expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledWith(
+        '3fe80f532f184247b477694427bad0ce',
+      ),
+    )
+  })
+
+  it('blocks apply when the preview contains a region conflict', async () => {
+    const regionConflictPreview = {
+      ...preview,
+      region_conflicts: 1,
+      ready_stores: 1,
+      store_items: [preview.store_items[0]],
+      ready_reviewers: 0,
+      reviewer_conflicts: 0,
+      reviewer_items: [],
+      region_items: [
+        ...preview.region_items,
+        {
+          ...preview.region_items[0],
+          id: 106,
+          status: 'CONFLICT' as const,
+          conflict_code: 'ORG_PATH_AMBIGUOUS',
+        },
+      ],
+    }
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(regionConflictPreview)
+
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(applyButton)
+    expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
+  })
+
   it('shows every store action and applies the exact staged batch once conflicts are resolved', async () => {
     const resolvedPreview: DingTalkOrganizationPreview = {
       ...preview,
@@ -289,7 +382,7 @@ describe('OrgTreePage DingTalk organization sync', () => {
     expect(within(storeChanges).getByText('创建新门店')).toBeTruthy()
     expect(within(storeChanges).getByText('启用门店')).toBeTruthy()
     expect(within(storeChanges).getByText('更新门店')).toBeTruthy()
-    expect(within(storeChanges).getByText('钉钉中缺失')).toBeTruthy()
+    expect(within(storeChanges).getByText('停用门店')).toBeTruthy()
     expect(within(dialog).getByText('新建门店的城市信息需人事后续配置')).toBeTruthy()
     expect(within(storeChanges).getByText('本地 / 旧城店')).toBeTruthy()
 
