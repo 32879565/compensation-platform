@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -74,6 +75,71 @@ def blind_index_dingtalk_user_id(value: str, *, key: str) -> str:
         b"compensation-platform:dingtalk-user-id:v1\0" + key.encode("utf-8")
     ).digest()
     return hmac.new(derived_key, normalized.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def dingtalk_organization_identity_proof(
+    user_id_hash: str,
+    *,
+    key: str,
+    tenant_id: str,
+    batch_public_id: str,
+    snapshot_hash: str,
+    remote_department_id: int,
+    org_unit_id: int,
+    department: str,
+    employee_id: int,
+) -> str:
+    """Authenticate every field used by an applied reviewer decision."""
+
+    normalized_hash = user_id_hash.strip().lower()
+    if len(normalized_hash) != 64:
+        raise ValueError("DingTalk user blind index is invalid")
+    try:
+        bytes.fromhex(normalized_hash)
+    except ValueError as exc:
+        raise ValueError("DingTalk user blind index is invalid") from exc
+    if not key:
+        raise ValueError("organization identity proof key is required")
+    normalized_tenant = tenant_id.strip()
+    normalized_batch = batch_public_id.strip().lower()
+    normalized_snapshot = snapshot_hash.strip().lower()
+    normalized_department = department.strip().upper()
+    if not normalized_tenant or len(normalized_tenant) > 256:
+        raise ValueError("organization tenant identifier is invalid")
+    if len(normalized_batch) != 32 or any(
+        character not in "0123456789abcdef" for character in normalized_batch
+    ):
+        raise ValueError("organization batch identifier is invalid")
+    if len(normalized_snapshot) != 64:
+        raise ValueError("organization snapshot digest is invalid")
+    try:
+        bytes.fromhex(normalized_snapshot)
+    except ValueError as exc:
+        raise ValueError("organization snapshot digest is invalid") from exc
+    if remote_department_id <= 0 or org_unit_id <= 0 or employee_id <= 0:
+        raise ValueError("organization proof identifiers must be positive")
+    if normalized_department not in {"DINING", "KITCHEN"}:
+        raise ValueError("organization review department is invalid")
+    payload = json.dumps(
+        {
+            "batch_public_id": normalized_batch,
+            "department": normalized_department,
+            "employee_id": employee_id,
+            "org_unit_id": org_unit_id,
+            "remote_department_id": remote_department_id,
+            "snapshot_hash": normalized_snapshot,
+            "tenant_id": normalized_tenant,
+            "user_id_hash": normalized_hash,
+            "version": 2,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    derived_key = hashlib.sha256(
+        b"compensation-platform:dingtalk-org-identity-proof:v2\0" + key.encode("utf-8")
+    ).digest()
+    return hmac.new(derived_key, payload, hashlib.sha256).hexdigest()
 
 
 def match_directory_users(

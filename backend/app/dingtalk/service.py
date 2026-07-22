@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, aliased
 
 from app.approval import service as approvals
@@ -27,6 +27,12 @@ from app.dingtalk.client import (
     DingTalkSendOutcomeUnknown,
     get_dingtalk_client,
 )
+from app.dingtalk.authorization import lock_review_authorization_tables
+from app.dingtalk.org_freshness import (
+    DingTalkOrganizationFreshnessError,
+    require_recent_organization_scopes,
+)
+from app.dingtalk.org_sync import take_organization_access_lock
 from app.models.approval import ApprovalActionType, ApprovalBusinessType, ApprovalInstance
 from app.models.auth import Permission, RolePermission, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
@@ -61,21 +67,24 @@ class DeliveryStageSummary:
     scopes: int = 0
 
 
+@dataclass(frozen=True)
+class _ReviewDeliveryPlan:
+    confirmation: BatchConfirmation
+    recipient_user_id: int | None
+    initial_status: DingTalkDeliveryStatus
+    error_code: str | None
+    idempotency_key: str
+    existing_delivery: DingTalkDelivery | None
+
+
 def _now(session: Session) -> datetime:
     return session.scalar(select(func.now()))  # type: ignore[return-value]
-
-
-_REVIEW_AUTHORIZATION_TABLE_LOCK = text(
-    "LOCK TABLE app_user, permission, role_permission, user_review_scope, user_role "
-    "IN SHARE MODE"
-)
 
 
 def _lock_review_authorization_tables(session: Session) -> None:
     """Freeze reviewer eligibility while a delivery is rendered and sent."""
 
-    if session.get_bind().dialect.name == "postgresql":
-        session.execute(_REVIEW_AUTHORIZATION_TABLE_LOCK)
+    lock_review_authorization_tables(session)
 
 
 def _review_recipient_ids(
@@ -209,6 +218,7 @@ _REVIEW_CONFIGURATION_ERROR_CODES = {
     "AMBIGUOUS_ELIGIBLE_RECIPIENT",
     "MISSING_DINGTALK_USER_ID",
     "RECIPIENT_NOT_AUTHORIZED",
+    "ORGANIZATION_SYNC_STALE",
 }
 
 
@@ -319,8 +329,11 @@ def stage_review_deliveries(
             if confirmation.org_unit_id in selected_org_unit_ids
         ]
 
-    routed = configuration_failures = existing = 0
-    pending_deliveries: list[DingTalkDelivery] = []
+    if active_settings.dingtalk_mode is DingTalkMode.LIVE:
+        take_organization_access_lock(session)
+        _lock_review_authorization_tables(session)
+
+    plans: list[_ReviewDeliveryPlan] = []
     for confirmation in confirmations:
         recipients = _review_recipient_ids(
             session,
@@ -347,13 +360,51 @@ def stage_review_deliveries(
             department=confirmation.department,
             recipient_user_id=recipient_id,
         )
-        delivery = _existing_review_delivery(
-            session,
-            batch=batch,
-            org_unit_id=confirmation.org_unit_id,
-            department=confirmation.department,
-            idempotency_key=idempotency_key,
+        plans.append(
+            _ReviewDeliveryPlan(
+                confirmation=confirmation,
+                recipient_user_id=recipient_id,
+                initial_status=initial_status,
+                error_code=error_code,
+                idempotency_key=idempotency_key,
+                existing_delivery=_existing_review_delivery(
+                    session,
+                    batch=batch,
+                    org_unit_id=confirmation.org_unit_id,
+                    department=confirmation.department,
+                    idempotency_key=idempotency_key,
+                ),
+            )
         )
+
+    if active_settings.dingtalk_mode is DingTalkMode.LIVE:
+        scopes_requiring_freshness = {
+            (plan.confirmation.org_unit_id, plan.confirmation.department)
+            for plan in plans
+            if plan.existing_delivery is None
+            or plan.existing_delivery.status is DingTalkDeliveryStatus.PENDING
+            or _is_reusable_review_configuration_failure(plan.existing_delivery)
+        }
+        try:
+            require_recent_organization_scopes(
+                session,
+                scopes_requiring_freshness,
+                encryption_key=active_settings.encryption_key,
+                tenant_id=active_settings.dingtalk_corp_id or "",
+                freshness_minutes=active_settings.dingtalk_org_sync_freshness_minutes,
+            )
+        except DingTalkOrganizationFreshnessError as exc:
+            raise DingTalkError(str(exc)) from None
+
+    routed = configuration_failures = existing = 0
+    pending_deliveries: list[DingTalkDelivery] = []
+    for plan in plans:
+        confirmation = plan.confirmation
+        recipient_id = plan.recipient_user_id
+        initial_status = plan.initial_status
+        error_code = plan.error_code
+        idempotency_key = plan.idempotency_key
+        delivery = plan.existing_delivery
         created = delivery is None
         if delivery is None:
             delivery, created = _add_delivery_if_missing(
@@ -500,6 +551,29 @@ def _appeal_status_action_card(
     return title, markdown, action_url
 
 
+def _cancel_unsent_delivery_marker(
+    session: Session,
+    *,
+    delivery: DingTalkDelivery,
+    error_code: str,
+) -> None:
+    """Undo a durable pre-send marker when no provider request was attempted."""
+
+    delivery.attempt_count = max(0, delivery.attempt_count - 1)
+    delivery.dispatched_at = None
+    delivery.status = DingTalkDeliveryStatus.FAILED
+    delivery.error_code = error_code
+    audit.record(
+        session,
+        action="dingtalk.delivery.dispatch.cancelled",
+        result="FAIL",
+        target_type="dingtalk_delivery",
+        target_id=delivery.id,
+        detail={"error_code": error_code},
+    )
+    session.commit()
+
+
 def dispatch_live_delivery(
     session: Session,
     *,
@@ -512,6 +586,7 @@ def dispatch_live_delivery(
     active_settings = settings or get_settings()
     if active_settings.dingtalk_mode is not DingTalkMode.LIVE:
         raise DingTalkError("Live DingTalk delivery is disabled")
+    take_organization_access_lock(session)
     _lock_review_authorization_tables(session)
     delivery = session.scalars(
         select(DingTalkDelivery).where(DingTalkDelivery.id == delivery_id).with_for_update()
@@ -533,6 +608,19 @@ def dispatch_live_delivery(
         raise DingTalkError("A sandbox delivery cannot be promoted to a live notification")
     recipient = None
     if delivery.kind is DingTalkDeliveryKind.PAYROLL_REVIEW:
+        try:
+            require_recent_organization_scopes(
+                session,
+                {(delivery.org_unit_id, delivery.department)},
+                encryption_key=active_settings.encryption_key,
+                tenant_id=active_settings.dingtalk_corp_id or "",
+                freshness_minutes=active_settings.dingtalk_org_sync_freshness_minutes,
+            )
+        except DingTalkOrganizationFreshnessError:
+            delivery.status = DingTalkDeliveryStatus.FAILED
+            delivery.error_code = "ORGANIZATION_SYNC_STALE"
+            session.flush()
+            return delivery
         recipient = _locked_authorized_review_recipient(session, delivery=delivery)
         if delivery.recipient_user_id is not None and recipient is None:
             delivery.status = DingTalkDeliveryStatus.FAILED
@@ -586,6 +674,7 @@ def dispatch_live_delivery(
     session.flush()
     session.commit()
 
+    take_organization_access_lock(session)
     _lock_review_authorization_tables(session)
     delivery = session.scalars(
         select(DingTalkDelivery).where(DingTalkDelivery.id == delivery_id).with_for_update()
@@ -600,18 +689,42 @@ def dispatch_live_delivery(
     ):
         raise DingTalkError("DingTalk delivery state changed before dispatch")
     if delivery.kind is DingTalkDeliveryKind.PAYROLL_REVIEW:
+        try:
+            require_recent_organization_scopes(
+                session,
+                {(delivery.org_unit_id, delivery.department)},
+                encryption_key=active_settings.encryption_key,
+                tenant_id=active_settings.dingtalk_corp_id or "",
+                freshness_minutes=active_settings.dingtalk_org_sync_freshness_minutes,
+            )
+        except DingTalkOrganizationFreshnessError:
+            # The provider boundary has not been crossed.  Undo the durable
+            # unknown-outcome marker so a newly confirmed organization sync can
+            # safely restage this delivery instead of permanently wedging it.
+            _cancel_unsent_delivery_marker(
+                session,
+                delivery=delivery,
+                error_code="ORGANIZATION_SYNC_STALE",
+            )
+            return delivery
         recipient = _locked_authorized_review_recipient(session, delivery=delivery)
         if delivery.recipient_user_id is not None and recipient is None:
-            delivery.error_code = "RECIPIENT_NOT_AUTHORIZED"
-            session.commit()
+            _cancel_unsent_delivery_marker(
+                session,
+                delivery=delivery,
+                error_code="RECIPIENT_NOT_AUTHORIZED",
+            )
             return delivery
     elif delivery.recipient_user_id is not None:
         recipient = session.get(User, delivery.recipient_user_id)
     else:
         recipient = None
     if recipient is None or not recipient.dingtalk_user_id:
-        delivery.error_code = "MISSING_DINGTALK_USER_ID"
-        session.commit()
+        _cancel_unsent_delivery_marker(
+            session,
+            delivery=delivery,
+            error_code="MISSING_DINGTALK_USER_ID",
+        )
         return delivery
 
     try:
@@ -656,6 +769,7 @@ def dispatch_live_deliveries(delivery_ids: tuple[int, ...]) -> None:
 def retry_sandbox_delivery(session: Session, *, delivery_id: int) -> DingTalkDelivery:
     """Requeue a sandbox delivery without creating another notification payload."""
 
+    take_organization_access_lock(session)
     _lock_review_authorization_tables(session)
     delivery = session.scalars(
         select(DingTalkDelivery).where(DingTalkDelivery.id == delivery_id).with_for_update()

@@ -7,15 +7,20 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit import service as audit
 from app.auth.deps import require_permission
 from app.auth.permissions import Perm
 from app.auth.service import Principal, resolve_permission_org_scope, revoke_all_for_user
+from app.core.config import Settings, get_settings
 from app.db.session import get_session
+from app.dingtalk.org_freshness import invalidate_applied_reviewer_proofs
+from app.dingtalk.org_sync import take_organization_sync_lock
+from app.dingtalk.read_sync import blind_index_dingtalk_user_id
 from app.models.auth import Role, User, UserReviewScope, UserRole
-from app.models.employee import Department
+from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -181,13 +186,19 @@ def replace_review_scopes(
     # Serializing replacements on the durable user row prevents two writers
     # from each deleting an empty/old scope set and accidentally committing the
     # union of their requested scopes.
+    take_organization_sync_lock(session)
     _target_user_or_404(session, user_id, for_update=True)
     _ensure_active_store_scopes(session, body.scopes)
+    before_rows = list(
+        session.scalars(
+            select(UserReviewScope)
+            .where(UserReviewScope.user_id == user_id)
+            .order_by(UserReviewScope.org_unit_id, UserReviewScope.department)
+        ).all()
+    )
     before = [
         {"org_unit_id": row.org_unit_id, "department": row.department.value}
-        for row in session.scalars(
-            select(UserReviewScope).where(UserReviewScope.user_id == user_id)
-        ).all()
+        for row in before_rows
     ]
     session.execute(delete(UserReviewScope).where(UserReviewScope.user_id == user_id))
     rows = [
@@ -199,7 +210,22 @@ def replace_review_scopes(
         for scope in body.scopes
     ]
     session.add_all(rows)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="同一门店和部门只能配置一位负责人",
+        ) from None
+    before_scopes = {(row.org_unit_id, row.department) for row in before_rows}
+    after_scopes = {(row.org_unit_id, row.department) for row in rows}
+    invalidated_proof_count = 0
+    if before_scopes != after_scopes:
+        invalidated_proof_count = invalidate_applied_reviewer_proofs(
+            session,
+            scopes=before_scopes | after_scopes,
+        )
     audit.record(
         session,
         action="user.review_scope.replace",
@@ -211,6 +237,7 @@ def replace_review_scopes(
             "after": [
                 {"org_unit_id": row.org_unit_id, "department": row.department.value} for row in rows
             ],
+            "invalidated_sync_proof_count": invalidated_proof_count,
         },
     )
     session.commit()
@@ -277,14 +304,119 @@ def replace_dingtalk_recipient(
     user_id: int,
     body: DingTalkRecipientBody,
     principal: Principal = Depends(_require_global_user_manager),
+    settings: Settings = Depends(get_settings),
     session: Session = Depends(get_session),
 ) -> DingTalkRecipientOut:
     """Replace an encrypted provider userid without ever reading it back via API."""
 
+    # Take the same advisory lock as organization confirmation before any row
+    # lock.  Then inspect only non-reversible identity digests/booleans for
+    # other accounts; do not bulk-decrypt provider userids merely to compare.
+    take_organization_sync_lock(session)
     user = _target_user_or_404(session, user_id, for_update=True)
     before_configured = user.dingtalk_user_id is not None
+    old_hash = user.dingtalk_user_id_hash
+    identity_changed = body.dingtalk_user_id != user.dingtalk_user_id
+    if identity_changed:
+        has_review_scope = session.scalar(
+            select(UserReviewScope.id).where(UserReviewScope.user_id == user.id).limit(1)
+        )
+        if has_review_scope is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="已配置工资复核范围的负责人只能通过钉钉组织同步换绑",
+            )
+    new_hash = (
+        blind_index_dingtalk_user_id(
+            body.dingtalk_user_id,
+            key=settings.encryption_key,
+        )
+        if body.dingtalk_user_id is not None
+        else None
+    )
+    employee_bindings = session.execute(
+        select(Employee.id, Employee.dingtalk_user_id_hash)
+        .where(
+            (Employee.dingtalk_user_id_hash.is_not(None))
+            | (Employee.id == user.employee_id)
+        )
+        .order_by(Employee.id)
+        .with_for_update()
+    ).all()
+    if new_hash is not None and any(
+        employee_hash == new_hash and employee_id != user.employee_id
+        for employee_id, employee_hash in employee_bindings
+    ):
+        raise HTTPException(status_code=409, detail="该钉钉账号已绑定其他员工")
+    if new_hash is not None and user.employee_id is None and any(
+        employee_hash == new_hash for _employee_id, employee_hash in employee_bindings
+    ):
+        raise HTTPException(status_code=409, detail="该钉钉账号已绑定员工，不能用于未关联员工的账号")
+    account_bindings = session.execute(
+        select(
+            User.id,
+            User.employee_id,
+            User.dingtalk_user_id_hash,
+            User.dingtalk_user_id.is_not(None).label("provider_id_configured"),
+        )
+        .where(User.id != user.id)
+        .order_by(User.id)
+        .with_for_update()
+    ).all()
+    configured_accounts = [
+        account
+        for account in account_bindings
+        if account.provider_id_configured or account.dingtalk_user_id_hash is not None
+    ]
+    if body.dingtalk_user_id is not None:
+        if any(
+            account.provider_id_configured and account.dingtalk_user_id_hash is None
+            for account in configured_accounts
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="存在未完成迁移的钉钉账号绑定，请先修复身份索引",
+            )
+        if any(account.dingtalk_user_id_hash == new_hash for account in configured_accounts):
+            raise HTTPException(status_code=409, detail="该钉钉账号已绑定其他用户")
+    if user.employee_id is not None:
+        employee = session.scalars(
+            select(Employee).where(Employee.id == user.employee_id).with_for_update()
+        ).one_or_none()
+        if employee is None or employee.is_deleted:
+            raise HTTPException(status_code=409, detail="关联员工不存在")
+        sibling_accounts = [
+            account for account in configured_accounts if account.employee_id == user.employee_id
+        ]
+        if identity_changed and sibling_accounts:
+            raise HTTPException(
+                status_code=409,
+                detail="同一员工存在另一个已配置钉钉身份的账号，请先清理账号绑定",
+            )
+        if identity_changed:
+            if employee.dingtalk_user_id_hash not in {
+                None,
+                old_hash,
+                new_hash,
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail="员工钉钉身份与账号不一致，请通过组织同步修正",
+                )
+            employee.dingtalk_user_id_hash = new_hash
     user.dingtalk_user_id = body.dingtalk_user_id
-    session.flush()
+    user.dingtalk_user_id_hash = new_hash
+    invalidated_proof_count = 0
+    if identity_changed and user.employee_id is not None:
+        invalidated_proof_count = invalidate_applied_reviewer_proofs(
+            session,
+            employee_ids={user.employee_id},
+        )
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="该钉钉账号已绑定其他用户") from None
     audit.record(
         session,
         action="user.dingtalk_recipient.replace",
@@ -294,6 +426,7 @@ def replace_dingtalk_recipient(
         detail={
             "before_configured": before_configured,
             "after_configured": user.dingtalk_user_id is not None,
+            "invalidated_sync_proof_count": invalidated_proof_count,
         },
     )
     session.commit()

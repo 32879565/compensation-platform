@@ -42,6 +42,11 @@ from app.models.dingtalk import (
     DingTalkDelivery,
     DingTalkDeliveryKind,
     DingTalkDeliveryStatus,
+    DingTalkOrgSyncBatch,
+    DingTalkOrgSyncBatchStatus,
+    DingTalkOrgSyncItem,
+    DingTalkOrgSyncItemKind,
+    DingTalkOrgSyncItemStatus,
 )
 from app.models.employee import Department, Employee, EmployeeStatus, EmploymentType
 from app.models.grade import JobGrade, SalaryBand
@@ -143,6 +148,11 @@ __all__ = [
     "DingTalkAttendanceSnapshot",
     "DingTalkAttendanceSync",
     "DingTalkAttendanceSyncStatus",
+    "DingTalkOrgSyncBatch",
+    "DingTalkOrgSyncBatchStatus",
+    "DingTalkOrgSyncItem",
+    "DingTalkOrgSyncItemKind",
+    "DingTalkOrgSyncItemStatus",
     "CompAppeal",
     "AppealStatus",
     "CompAppealCorrectionWorkItem",

@@ -26,6 +26,9 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     """
 
     __tablename__ = "app_user"
+    __table_args__ = (
+        UniqueConstraint("dingtalk_user_id_hash", name="uq_app_user_dingtalk_user_id_hash"),
+    )
 
     username: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -36,6 +39,10 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     # treated as PII.  API responses expose only a configured/not-configured
     # capability bit; the value is decrypted only immediately before sending.
     dingtalk_user_id: Mapped[str | None] = mapped_column(EncryptedString(512), nullable=True)
+    # Keyed one-way digest used for equality matching and uniqueness checks.
+    # The encrypted provider identifier above is still required only at the
+    # outbound API boundary and is never used as a lookup key.
+    dingtalk_user_id_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ACTIVE", server_default="ACTIVE"
     )
@@ -105,6 +112,11 @@ class UserReviewScope(Base):
     __tablename__ = "user_review_scope"
     __table_args__ = (
         UniqueConstraint("user_id", "org_unit_id", "department", name="uq_user_review_scope"),
+        UniqueConstraint(
+            "org_unit_id",
+            "department",
+            name="uq_user_review_scope_org_department",
+        ),
     )
 
     user_id: Mapped[int] = mapped_column(ForeignKey("app_user.id"), nullable=False, index=True)

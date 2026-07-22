@@ -33,6 +33,7 @@ export const Perm = {
   DASHBOARD_READ: 'dashboard:read',
   EXPORT_DATA: 'export:data',
   NOTIFICATION_MANAGE: 'notification:manage',
+  DINGTALK_ORG_SYNC: 'dingtalk_org:sync',
   IMPORT_RUN: 'import:run',
   AUDIT_READ: 'audit:read',
   USER_MANAGE: 'user:manage',

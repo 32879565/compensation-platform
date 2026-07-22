@@ -1,14 +1,24 @@
-"""Explicit, read-only DingTalk contact and attendance synchronization previews."""
+"""DingTalk contact, attendance, and confirmed organization synchronization."""
 
 from __future__ import annotations
 
 import calendar
+import threading
 from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Literal
+from typing import Literal, cast
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    Response,
+    status,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, insert, select
 from sqlalchemy.exc import IntegrityError
@@ -21,7 +31,20 @@ from app.auth.service import Principal, resolve_permission_org_scope
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.db.session import SessionLocal, get_session
-from app.dingtalk.client import DingTalkClient, DingTalkClientError, get_dingtalk_client
+from app.dingtalk.client import (
+    DingTalkClient,
+    DingTalkClientError,
+    DingTalkOrganizationSnapshot,
+    get_dingtalk_client,
+)
+from app.dingtalk.org_sync import (
+    DingTalkOrganizationSyncError,
+    OrganizationPreview,
+    apply_organization_sync,
+    get_applied_organization_sync_result,
+    preview_organization_sync,
+    take_organization_sync_lock,
+)
 from app.dingtalk.read_sync import (
     AttendancePreviewRow,
     DirectoryMatchResult,
@@ -40,6 +63,19 @@ router = APIRouter(prefix="/api/dingtalk/sync", tags=["dingtalk"])
 _PREVIEW_ROW_LIMIT = 200
 _logger = get_logger("app.dingtalk_sync")
 AttendanceRefreshRunner = Callable[[str, tuple[int, str]], None]
+_ORGANIZATION_READ_LOCK = threading.Lock()
+
+
+def _read_organization_snapshot(client: DingTalkClient) -> DingTalkOrganizationSnapshot:
+    if not _ORGANIZATION_READ_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="A DingTalk organization read is already in progress",
+        )
+    try:
+        return client.list_organization_snapshot()
+    finally:
+        _ORGANIZATION_READ_LOCK.release()
 
 
 def _require_global_sync_manager(
@@ -83,6 +119,14 @@ def _require_attendance_reader(
     return principal
 
 
+def _require_organization_sync_manager(
+    principal: Principal = Depends(_require_global_sync_manager),
+    session: Session = Depends(get_session),
+) -> Principal:
+    _require_global_permission(session, principal, Perm.DINGTALK_ORG_SYNC)
+    return principal
+
+
 def _require_read_sync_enabled(settings: Settings = Depends(get_settings)) -> Settings:
     if not settings.dingtalk_read_sync_enabled:
         raise HTTPException(status_code=409, detail="DingTalk read sync is not enabled")
@@ -118,6 +162,57 @@ class DirectoryApplyOut(BaseModel):
     unchanged: int
     ambiguous: int
     unmatched: int
+
+
+class OrganizationStoreItemOut(BaseModel):
+    id: int
+    remote_department_id: int | None
+    remote_department_name: str
+    remote_department_path: str
+    action: Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "MISSING_IN_DINGTALK"]
+    match_method: str
+    proposed_org_unit_id: int | None
+    proposed_org_unit_name: str | None
+    proposed_parent_org_unit_id: int | None
+    proposed_parent_org_unit_name: str | None
+    status: Literal["READY", "CONFLICT"]
+    conflict_code: str | None
+
+
+class OrganizationReviewerItemOut(BaseModel):
+    id: int
+    remote_department_id: int | None
+    remote_department_name: str
+    remote_department_path: str
+    department: Literal["DINING", "KITCHEN"]
+    action: Literal["ASSIGN", "REMOVE", "CONFLICT"]
+    match_method: str
+    dingtalk_name: str | None
+    current_reviewer_name: str | None
+    proposed_employee_id: int | None
+    proposed_employee_name: str | None
+    status: Literal["READY", "CONFLICT"]
+    conflict_code: str | None
+
+
+class OrganizationPreviewOut(BaseModel):
+    batch_id: str
+    expires_at: datetime
+    remote_stores: int
+    local_stores: int
+    ready_stores: int
+    store_conflicts: int
+    ready_reviewers: int
+    reviewer_conflicts: int
+    store_items: list[OrganizationStoreItemOut]
+    reviewer_items: list[OrganizationReviewerItemOut]
+
+
+class OrganizationApplyOut(BaseModel):
+    applied_stores: int
+    applied_reviewers: int
+    unresolved: int
+    already_applied: bool
 
 
 class AttendancePreviewRequest(BaseModel):
@@ -171,17 +266,18 @@ def _period_bounds(
     )
 
 
-def _active_employees(session: Session) -> list[Employee]:
-    return list(
-        session.scalars(
-            select(Employee)
-            .where(
-                Employee.is_deleted.is_(False),
-                Employee.status == EmployeeStatus.ACTIVE,
-            )
-            .order_by(Employee.id)
-        ).all()
+def _active_employees(session: Session, *, for_update: bool = False) -> list[Employee]:
+    statement = (
+        select(Employee)
+        .where(
+            Employee.is_deleted.is_(False),
+            Employee.status == EmployeeStatus.ACTIVE,
+        )
+        .order_by(Employee.id)
     )
+    if for_update:
+        statement = statement.with_for_update()
+    return list(session.scalars(statement).all())
 
 
 def _match_directory(
@@ -235,6 +331,59 @@ def _directory_preview(
                 match_method=match.method,
             )
             for match in visible_matches
+        ],
+    )
+
+
+def _organization_preview_response(preview: OrganizationPreview) -> OrganizationPreviewOut:
+    """Map only the explicitly approved preview fields across the HTTP boundary."""
+
+    return OrganizationPreviewOut(
+        batch_id=preview.batch_id,
+        expires_at=preview.expires_at,
+        remote_stores=preview.remote_stores,
+        local_stores=preview.local_stores,
+        ready_stores=preview.ready_stores,
+        store_conflicts=preview.store_conflicts,
+        ready_reviewers=preview.ready_reviewers,
+        reviewer_conflicts=preview.reviewer_conflicts,
+        store_items=[
+            OrganizationStoreItemOut(
+                id=item.id,
+                remote_department_id=item.remote_department_id,
+                remote_department_name=item.remote_department_name,
+                remote_department_path=item.remote_department_path,
+                action=cast(
+                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "MISSING_IN_DINGTALK"],
+                    item.action,
+                ),
+                match_method=item.match_method,
+                proposed_org_unit_id=item.proposed_org_unit_id,
+                proposed_org_unit_name=item.proposed_org_unit_name,
+                proposed_parent_org_unit_id=item.proposed_parent_org_unit_id,
+                proposed_parent_org_unit_name=item.proposed_parent_org_unit_name,
+                status=cast(Literal["READY", "CONFLICT"], item.status.value),
+                conflict_code=item.conflict_code,
+            )
+            for item in preview.store_items
+        ],
+        reviewer_items=[
+            OrganizationReviewerItemOut(
+                id=item.id,
+                remote_department_id=item.remote_department_id,
+                remote_department_name=item.remote_department_name,
+                remote_department_path=item.remote_department_path,
+                department=cast(Literal["DINING", "KITCHEN"], item.department.value),
+                action=cast(Literal["ASSIGN", "REMOVE", "CONFLICT"], item.action),
+                match_method=item.match_method,
+                dingtalk_name=item.dingtalk_name,
+                current_reviewer_name=item.current_reviewer_name,
+                proposed_employee_id=item.proposed_employee_id,
+                proposed_employee_name=item.proposed_employee_name,
+                status=cast(Literal["READY", "CONFLICT"], item.status.value),
+                conflict_code=item.conflict_code,
+            )
+            for item in preview.reviewer_items
         ],
     )
 
@@ -450,6 +599,100 @@ def get_attendance_refresh_runner() -> AttendanceRefreshRunner:
     return _run_attendance_refresh
 
 
+@router.post("/organization/preview", response_model=OrganizationPreviewOut)
+def preview_dingtalk_organization(
+    response: Response,
+    principal: Principal = Depends(_require_organization_sync_manager),
+    settings: Settings = Depends(_require_read_sync_enabled),
+    client: DingTalkClient = Depends(get_dingtalk_client),
+    session: Session = Depends(get_session),
+) -> OrganizationPreviewOut:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        # Authentication has completed; release that read transaction before
+        # the potentially long provider traversal, then open a short staging
+        # transaction only after the snapshot is complete.
+        session.rollback()
+        snapshot = _read_organization_snapshot(client)
+        preview = preview_organization_sync(
+            session,
+            snapshot,
+            encryption_key=settings.encryption_key,
+            actor=(principal.user_id, principal.username),
+            store_root_names=settings.dingtalk_store_root_name_set,
+            dining_manager_titles=settings.dingtalk_dining_manager_title_set,
+            kitchen_manager_titles=settings.dingtalk_kitchen_manager_title_set,
+        )
+    except DingTalkClientError as exc:
+        _logger.warning(
+            "DingTalk organization read failed",
+            extra={"context": {"error_type": type(exc).__name__}},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to read the DingTalk organization",
+        ) from None
+    except DingTalkOrganizationSyncError as exc:
+        http_status = 409 if exc.code == "STORE_ROOT_NOT_FOUND" else 502
+        raise HTTPException(status_code=http_status, detail=str(exc)) from None
+    return _organization_preview_response(preview)
+
+
+@router.post(
+    "/organization/{batch_id}/apply",
+    response_model=OrganizationApplyOut,
+)
+def apply_dingtalk_organization(
+    response: Response,
+    batch_id: str = Path(pattern=r"^[0-9a-f]{32}$"),
+    principal: Principal = Depends(_require_organization_sync_manager),
+    settings: Settings = Depends(_require_read_sync_enabled),
+    client: DingTalkClient = Depends(get_dingtalk_client),
+    session: Session = Depends(get_session),
+) -> OrganizationApplyOut:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        result = get_applied_organization_sync_result(session, batch_id)
+        if result is not None:
+            session.rollback()
+            return OrganizationApplyOut(
+                applied_stores=result.applied_stores,
+                applied_reviewers=result.applied_reviewers,
+                unresolved=result.unresolved,
+                already_applied=result.already_applied,
+            )
+        # Re-read DingTalk at confirmation time so a manager transfer made
+        # after preview cannot be applied from a stale staged identity.
+        session.rollback()
+        snapshot = _read_organization_snapshot(client)
+        result = apply_organization_sync(
+            session,
+            batch_id,
+            fresh_snapshot=snapshot,
+            encryption_key=settings.encryption_key,
+            tenant_id=settings.dingtalk_corp_id or "",
+            actor=(principal.user_id, principal.username),
+        )
+    except DingTalkClientError as exc:
+        _logger.warning(
+            "DingTalk organization confirmation read failed",
+            extra={"context": {"error_type": type(exc).__name__}},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to read the DingTalk organization",
+        ) from None
+    except DingTalkOrganizationSyncError as exc:
+        http_status = 404 if exc.code == "BATCH_NOT_FOUND" else 409
+        raise HTTPException(status_code=http_status, detail=str(exc)) from None
+    return OrganizationApplyOut(
+        applied_stores=result.applied_stores,
+        applied_reviewers=result.applied_reviewers,
+        unresolved=result.unresolved,
+        already_applied=result.already_applied,
+    )
+
+
 @router.post("/employees/preview", response_model=DirectoryPreviewOut)
 def preview_employee_directory(
     principal: Principal = Depends(_require_directory_reader),
@@ -482,7 +725,29 @@ def apply_employee_directory_matches(
     client: DingTalkClient = Depends(get_dingtalk_client),
     session: Session = Depends(get_session),
 ) -> DirectoryApplyOut:
-    employees, result, _remote_count = _match_directory(session, client, settings)
+    # Never keep a stale employee snapshot across the provider call.  The
+    # organization apply and manual identity endpoint use the same advisory
+    # lock, so reload and match only after the remote read is complete.
+    session.rollback()
+    try:
+        remote_users = client.list_directory_users()
+    except DingTalkClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    take_organization_sync_lock(session)
+    employees = _active_employees(session, for_update=True)
+    result = match_directory_users(
+        [
+            LocalEmployeeIdentity(
+                employee_id=employee.id,
+                emp_no=employee.emp_no,
+                name=employee.name,
+                dingtalk_user_id_hash=employee.dingtalk_user_id_hash,
+            )
+            for employee in employees
+        ],
+        remote_users,
+        encryption_key=settings.encryption_key,
+    )
     employee_by_id = {employee.id: employee for employee in employees}
     linked = 0
     unchanged = 0

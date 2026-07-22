@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
+from queue import Queue
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.orm import Session
 
 from app.auth.bootstrap import seed_rbac
 from app.core.config import Settings, get_settings
@@ -12,6 +17,12 @@ from app.dingtalk.client import (
     DingTalkAttendanceResult,
     DingTalkDirectoryUser,
     get_dingtalk_client,
+)
+from app.dingtalk.org_sync import take_organization_sync_lock
+from app.dingtalk.read_sync import (
+    LocalEmployeeIdentity,
+    blind_index_dingtalk_user_id,
+    match_directory_users,
 )
 from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserRole
@@ -88,6 +99,7 @@ def _settings(*, enabled: bool) -> Settings:
         dingtalk_client_id="test-client-id",
         dingtalk_client_secret="test-client-secret-value",
         dingtalk_agent_id=123,
+        dingtalk_corp_id="ding-test-corp",
         dingtalk_read_sync_enabled=enabled,
     )
 
@@ -224,6 +236,155 @@ def test_employee_preview_and_confirmation_bind_only_safe_matches(client, db_ses
     assert "provider-job" not in audit_text
     assert "provider-name" not in audit_text
     assert "远端王芳" not in audit_text
+
+
+def test_employee_apply_reads_provider_before_shared_lock_and_current_rows(
+    client, db_session, monkeypatch
+):
+    _seed_employees(db_session)
+    admin = _user(db_session, "sync-ordered-apply", "GROUP_HR")
+    events: list[str] = []
+
+    class OrderedClient(_FakeReadClient):
+        def list_directory_users(self):
+            events.append("provider")
+            return super().list_directory_users()
+
+    fake = OrderedClient()
+    settings = _settings(enabled=True)
+    from app.main import app
+    from app.routers import dingtalk_sync
+
+    original_lock = dingtalk_sync.take_organization_sync_lock
+    original_active_employees = dingtalk_sync._active_employees
+
+    def ordered_lock(session):
+        events.append("lock")
+        return original_lock(session)
+
+    def ordered_active_employees(session, *, for_update=False):
+        events.append(f"employees:{for_update}")
+        return original_active_employees(session, for_update=for_update)
+
+    monkeypatch.setattr(dingtalk_sync, "take_organization_sync_lock", ordered_lock)
+    monkeypatch.setattr(dingtalk_sync, "_active_employees", ordered_active_employees)
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/employees/apply",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 200, response.text
+    assert events == ["provider", "lock", "employees:True"]
+
+
+def test_directory_apply_reloads_after_waiting_for_concurrent_identity_change(pg_engine):
+    from app.routers.dingtalk_sync import _active_employees
+
+    suffix = uuid.uuid4().hex[:12]
+    with Session(pg_engine) as setup:
+        store = OrgUnit(
+            code=f"DIR-CONC-{suffix}",
+            name=f"Directory concurrency {suffix}",
+            type=OrgType.STORE,
+        )
+        setup.add(store)
+        setup.flush()
+        employee = Employee(
+            emp_no=f"DIR-{suffix}",
+            name="Concurrent employee",
+            org_unit_id=store.id,
+        )
+        setup.add(employee)
+        setup.commit()
+        employee_id = employee.id
+        store_id = store.id
+
+    key = "test-encryption-key-only-for-tests"
+    first_hash = blind_index_dingtalk_user_id("provider-first", key=key)
+    remote_after_provider_read = (
+        DingTalkDirectoryUser(
+            "provider-second",
+            "Concurrent employee",
+            f"DIR-{suffix}",
+            True,
+        ),
+    )
+    backend_pid: Queue[int] = Queue()
+
+    def delayed_apply() -> tuple[int, str | None]:
+        with Session(pg_engine) as worker:
+            pid = worker.scalar(select(func.pg_backend_pid()))
+            assert pid is not None
+            backend_pid.put(pid)
+            take_organization_sync_lock(worker)
+            employees = _active_employees(worker, for_update=True)
+            result = match_directory_users(
+                [
+                    LocalEmployeeIdentity(
+                        employee_id=row.id,
+                        emp_no=row.emp_no,
+                        name=row.name,
+                        dingtalk_user_id_hash=row.dingtalk_user_id_hash,
+                    )
+                    for row in employees
+                    if row.id == employee_id
+                ],
+                remote_after_provider_read,
+                encryption_key=key,
+            )
+            for match in result.matches:
+                matched_employee = worker.get(Employee, match.employee_id)
+                assert matched_employee is not None
+                matched_employee.dingtalk_user_id_hash = match.user_id_hash
+            worker.commit()
+            current_hash = worker.scalar(
+                select(Employee.dingtalk_user_id_hash).where(Employee.id == employee_id)
+            )
+            return len(result.matches), current_hash
+
+    try:
+        with Session(pg_engine) as first_writer:
+            take_organization_sync_lock(first_writer)
+            current = first_writer.scalars(
+                select(Employee).where(Employee.id == employee_id).with_for_update()
+            ).one()
+            current.dingtalk_user_id_hash = first_hash
+            first_writer.flush()
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(delayed_apply)
+                worker_pid = backend_pid.get(timeout=5)
+                waiting = False
+                with Session(pg_engine) as observer:
+                    for _attempt in range(100):
+                        waiting = bool(
+                            observer.scalar(
+                                text(
+                                    "SELECT EXISTS ("
+                                    "SELECT 1 FROM pg_stat_activity "
+                                    "WHERE pid = :pid AND wait_event = 'advisory'"
+                                    ")"
+                                ),
+                                {"pid": worker_pid},
+                            )
+                        )
+                        if waiting:
+                            break
+                        time.sleep(0.02)
+                assert waiting, "the second session never waited on the organization lock"
+                first_writer.commit()
+                matched, final_hash = future.result(timeout=5)
+
+        assert matched == 0
+        assert final_hash == first_hash
+    finally:
+        with Session(pg_engine) as cleanup:
+            cleanup.execute(delete(Employee).where(Employee.id == employee_id))
+            cleanup.execute(delete(OrgUnit).where(OrgUnit.id == store_id))
+            cleanup.commit()
 
 
 def test_attendance_preview_is_aggregate_only_and_does_not_write_payroll_inputs(

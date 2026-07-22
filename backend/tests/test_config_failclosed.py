@@ -89,6 +89,7 @@ def test_live_dingtalk_manager_review_requires_corp_id(monkeypatch):
         Settings(_env_file=None)
 
     monkeypatch.setenv("COMP_DINGTALK_CORP_ID", "ding-corp")
+    monkeypatch.setenv("COMP_DINGTALK_READ_SYNC_ENABLED", "true")
     assert Settings(_env_file=None).dingtalk_corp_id == "ding-corp"
 
 
@@ -102,4 +103,51 @@ def test_dingtalk_read_sync_cannot_be_enabled_without_complete_credentials(monke
     monkeypatch.delenv("COMP_DINGTALK_AGENT_ID", raising=False)
 
     with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_dingtalk_store_roots_are_configurable_and_deduplicated(monkeypatch):
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.setenv("COMP_DINGTALK_STORE_ROOT_NAMES", " 华南 ,华东,华南 ")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.dingtalk_store_root_name_set == frozenset({"华南", "华东"})
+
+
+def test_dingtalk_read_sync_requires_tenant_corp_id(monkeypatch):
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.setenv("COMP_DINGTALK_CLIENT_ID", "ding-client")
+    monkeypatch.setenv("COMP_DINGTALK_CLIENT_SECRET", "c" * 48)
+    monkeypatch.setenv("COMP_DINGTALK_AGENT_ID", "123")
+    monkeypatch.setenv("COMP_DINGTALK_READ_SYNC_ENABLED", "true")
+    monkeypatch.delenv("COMP_DINGTALK_CORP_ID", raising=False)
+
+    with pytest.raises(ValidationError, match="corp_id"):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("COMP_DINGTALK_CORP_ID", "ding-corp")
+    assert Settings(_env_file=None).dingtalk_read_sync_enabled is True
+
+
+def test_dingtalk_manager_titles_and_review_link_ttl_are_configurable(monkeypatch):
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.setenv("COMP_DINGTALK_DINING_MANAGER_TITLES", " 店长 ,厅面负责人,店长 ")
+    monkeypatch.setenv("COMP_DINGTALK_KITCHEN_MANAGER_TITLES", "厨房经理,厨师长")
+    monkeypatch.setenv("COMP_DINGTALK_REVIEW_LINK_TTL_HOURS", "72")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.dingtalk_dining_manager_title_set == frozenset({"店长", "厅面负责人"})
+    assert settings.dingtalk_kitchen_manager_title_set == frozenset({"厨房经理", "厨师长"})
+    assert settings.dingtalk_review_link_ttl_hours == 72
+
+    monkeypatch.setenv("COMP_DINGTALK_KITCHEN_MANAGER_TITLES", "厨房经理, 店长 ")
+    with pytest.raises(ValidationError, match="must not overlap"):
         Settings(_env_file=None)

@@ -76,6 +76,63 @@ export interface DingTalkEmployeeApplyResult {
   unmatched: number
 }
 
+export type DingTalkOrganizationSyncItemStatus = 'READY' | 'CONFLICT'
+export type DingTalkReviewerDepartment = 'DINING' | 'KITCHEN'
+export type DingTalkOrganizationStoreAction =
+  'LINK' | 'CREATE' | 'ACTIVATE' | 'UPDATE' | 'MISSING_IN_DINGTALK'
+export type DingTalkOrganizationReviewerAction = 'ASSIGN' | 'REMOVE' | 'CONFLICT'
+
+export interface DingTalkOrganizationStoreItem {
+  id: number
+  remote_department_id: number | null
+  remote_department_name: string
+  remote_department_path: string
+  action: DingTalkOrganizationStoreAction
+  match_method: string
+  proposed_org_unit_id: number | null
+  proposed_org_unit_name: string | null
+  proposed_parent_org_unit_id: number | null
+  proposed_parent_org_unit_name: string | null
+  status: DingTalkOrganizationSyncItemStatus
+  conflict_code: string | null
+}
+
+export interface DingTalkOrganizationReviewerItem {
+  id: number
+  remote_department_id: number | null
+  remote_department_name: string
+  remote_department_path: string
+  department: DingTalkReviewerDepartment
+  action: DingTalkOrganizationReviewerAction
+  dingtalk_name: string | null
+  proposed_employee_id: number | null
+  proposed_employee_name: string | null
+  match_method: string
+  current_reviewer_name: string | null
+  status: DingTalkOrganizationSyncItemStatus
+  conflict_code: string | null
+}
+
+export interface DingTalkOrganizationPreview {
+  batch_id: string
+  expires_at: string
+  remote_stores: number
+  local_stores: number
+  ready_stores: number
+  store_conflicts: number
+  ready_reviewers: number
+  reviewer_conflicts: number
+  store_items: DingTalkOrganizationStoreItem[]
+  reviewer_items: DingTalkOrganizationReviewerItem[]
+}
+
+export interface DingTalkOrganizationApplyResult {
+  applied_stores: number
+  applied_reviewers: number
+  unresolved: number
+  already_applied: boolean
+}
+
 export interface DingTalkAttendancePreviewRow {
   employee_id: number
   emp_no: string
@@ -100,11 +157,7 @@ export interface DingTalkAttendancePreview {
 }
 
 export type DingTalkAttendanceSyncStatus =
-  | 'NOT_STARTED'
-  | 'QUEUED'
-  | 'RUNNING'
-  | 'COMPLETED'
-  | 'FAILED'
+  'NOT_STARTED' | 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED'
 
 export interface DingTalkAttendanceSnapshot extends DingTalkAttendancePreview {
   status: DingTalkAttendanceSyncStatus
@@ -175,6 +228,45 @@ function toAppealSummary(appeal: CompAppealResponse): CompAppeal {
   }
 }
 
+function toOrganizationStoreItem(
+  item: DingTalkOrganizationStoreItem,
+): DingTalkOrganizationStoreItem {
+  return {
+    id: item.id,
+    remote_department_id: item.remote_department_id,
+    remote_department_name: item.remote_department_name,
+    remote_department_path: item.remote_department_path,
+    action: item.action,
+    match_method: item.match_method,
+    proposed_org_unit_id: item.proposed_org_unit_id,
+    proposed_org_unit_name: item.proposed_org_unit_name,
+    proposed_parent_org_unit_id: item.proposed_parent_org_unit_id,
+    proposed_parent_org_unit_name: item.proposed_parent_org_unit_name,
+    status: item.status,
+    conflict_code: item.conflict_code,
+  }
+}
+
+function toOrganizationReviewerItem(
+  item: DingTalkOrganizationReviewerItem,
+): DingTalkOrganizationReviewerItem {
+  return {
+    id: item.id,
+    remote_department_id: item.remote_department_id,
+    remote_department_name: item.remote_department_name,
+    remote_department_path: item.remote_department_path,
+    department: item.department,
+    action: item.action,
+    dingtalk_name: item.dingtalk_name,
+    proposed_employee_id: item.proposed_employee_id,
+    proposed_employee_name: item.proposed_employee_name,
+    match_method: item.match_method,
+    current_reviewer_name: item.current_reviewer_name,
+    status: item.status,
+    conflict_code: item.conflict_code,
+  }
+}
+
 export async function fetchDingTalkDeliveries(batchId?: number): Promise<DingTalkDelivery[]> {
   const response =
     batchId === undefined
@@ -205,6 +297,34 @@ export async function applyDingTalkEmployeeMatches(): Promise<DingTalkEmployeeAp
   return (await api.post<DingTalkEmployeeApplyResult>('/api/dingtalk/sync/employees/apply')).data
 }
 
+export async function previewDingTalkOrganization(): Promise<DingTalkOrganizationPreview> {
+  const preview = (
+    await api.post<DingTalkOrganizationPreview>('/api/dingtalk/sync/organization/preview')
+  ).data
+  return {
+    batch_id: preview.batch_id,
+    expires_at: preview.expires_at,
+    remote_stores: preview.remote_stores,
+    local_stores: preview.local_stores,
+    ready_stores: preview.ready_stores,
+    store_conflicts: preview.store_conflicts,
+    ready_reviewers: preview.ready_reviewers,
+    reviewer_conflicts: preview.reviewer_conflicts,
+    store_items: preview.store_items.map(toOrganizationStoreItem),
+    reviewer_items: preview.reviewer_items.map(toOrganizationReviewerItem),
+  }
+}
+
+export async function applyDingTalkOrganization(
+  batchId: string,
+): Promise<DingTalkOrganizationApplyResult> {
+  return (
+    await api.post<DingTalkOrganizationApplyResult>(
+      `/api/dingtalk/sync/organization/${batchId}/apply`,
+    )
+  ).data
+}
+
 export async function previewDingTalkAttendance(
   period: string,
 ): Promise<DingTalkAttendancePreview> {
@@ -232,8 +352,9 @@ export async function refreshDingTalkAttendance(
 }
 
 export async function stageReviewDeliveries(batchId: number): Promise<DeliveryStageSummary> {
-  return (await api.post<DeliveryStageSummary>('/api/dingtalk/batches/' + batchId + '/review-deliveries'))
-    .data
+  return (
+    await api.post<DeliveryStageSummary>('/api/dingtalk/batches/' + batchId + '/review-deliveries')
+  ).data
 }
 
 export async function retryDingTalkDelivery(deliveryId: number): Promise<DingTalkDelivery> {

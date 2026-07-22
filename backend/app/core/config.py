@@ -1,4 +1,5 @@
 import enum
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 
@@ -69,10 +70,20 @@ class Settings(BaseSettings):
     dingtalk_public_base_url: AnyHttpUrl | None = None
     dingtalk_timeout_seconds: float = 5.0
     dingtalk_review_session_ttl_minutes: int = 15
+    dingtalk_review_session_max_attempts: int = 10
+    dingtalk_review_session_ip_max_attempts: int = 300
+    dingtalk_review_session_attempt_window_minutes: int = 15
+    dingtalk_review_link_ttl_hours: int = 168
     # Contact/attendance reads are a separate, explicit capability.  Keeping
     # outbound transport in sandbox does not disable these reads once an
     # administrator deliberately enables them.
     dingtalk_read_sync_enabled: bool = False
+    # Comma-separated top-level DingTalk departments whose descendant `*店`
+    # nodes may be created as new local stores after an HR preview.
+    dingtalk_store_root_names: str = "潮发运营中心,九亩地,中山"
+    dingtalk_dining_manager_titles: str = "店长"
+    dingtalk_kitchen_manager_titles: str = "厨房经理"
+    dingtalk_org_sync_freshness_minutes: int = 5
 
     @field_validator("secret_key", "encryption_key")
     @classmethod
@@ -141,6 +152,65 @@ class Settings(BaseSettings):
             raise ValueError("must be between 5 and 30 minutes")
         return value
 
+    @field_validator("dingtalk_review_session_max_attempts")
+    @classmethod
+    def validate_dingtalk_review_session_max_attempts(cls, value: int) -> int:
+        if not 3 <= value <= 100:
+            raise ValueError("must be between 3 and 100 attempts")
+        return value
+
+    @field_validator("dingtalk_review_session_ip_max_attempts")
+    @classmethod
+    def validate_dingtalk_review_session_ip_max_attempts(cls, value: int) -> int:
+        if not 10 <= value <= 5000:
+            raise ValueError("must be between 10 and 5000 attempts")
+        return value
+
+    @field_validator("dingtalk_review_session_attempt_window_minutes")
+    @classmethod
+    def validate_dingtalk_review_session_attempt_window(cls, value: int) -> int:
+        if not 1 <= value <= 60:
+            raise ValueError("must be between 1 and 60 minutes")
+        return value
+
+    @field_validator("dingtalk_review_link_ttl_hours")
+    @classmethod
+    def validate_dingtalk_review_link_ttl(cls, value: int) -> int:
+        if not 1 <= value <= 720:
+            raise ValueError("must be between 1 and 720 hours")
+        return value
+
+    @field_validator("dingtalk_store_root_names")
+    @classmethod
+    def validate_dingtalk_store_root_names(cls, value: str) -> str:
+        names = [
+            " ".join(unicodedata.normalize("NFKC", name).split())
+            for name in value.split(",")
+            if name.strip()
+        ]
+        if not names or len(names) > 20 or any(len(name) > 128 for name in names):
+            raise ValueError("must contain between 1 and 20 valid department names")
+        return ",".join(dict.fromkeys(names))
+
+    @field_validator("dingtalk_dining_manager_titles", "dingtalk_kitchen_manager_titles")
+    @classmethod
+    def validate_dingtalk_manager_titles(cls, value: str) -> str:
+        titles = [
+            " ".join(unicodedata.normalize("NFKC", title).split())
+            for title in value.split(",")
+            if title.strip()
+        ]
+        if not titles or len(titles) > 20 or any(len(title) > 64 for title in titles):
+            raise ValueError("must contain between 1 and 20 valid manager titles")
+        return ",".join(dict.fromkeys(titles))
+
+    @field_validator("dingtalk_org_sync_freshness_minutes")
+    @classmethod
+    def validate_dingtalk_org_sync_freshness(cls, value: int) -> int:
+        if not 1 <= value <= 15:
+            raise ValueError("must be between 1 and 15 minutes")
+        return value
+
     @model_validator(mode="after")
     def validate_dingtalk_configuration(self) -> "Settings":
         credential_parts = (
@@ -167,8 +237,21 @@ class Settings(BaseSettings):
                 raise ValueError("DingTalk live mode requires dingtalk_public_base_url")
             if self.dingtalk_public_base_url.scheme != "https":
                 raise ValueError("DingTalk live mode requires an HTTPS public base URL")
+            if not self.dingtalk_read_sync_enabled:
+                raise ValueError("DingTalk live mode requires read sync for manager authorization")
         if self.dingtalk_read_sync_enabled and not all(credential_parts):
             raise ValueError("DingTalk read sync requires complete application credentials")
+        if self.dingtalk_read_sync_enabled and self.dingtalk_corp_id is None:
+            raise ValueError("DingTalk read sync requires dingtalk_corp_id")
+        dining_titles = {title.casefold() for title in self.dingtalk_dining_manager_title_set}
+        kitchen_titles = {title.casefold() for title in self.dingtalk_kitchen_manager_title_set}
+        if dining_titles & kitchen_titles:
+            raise ValueError("DingTalk manager title sets must not overlap")
+        if (
+            self.dingtalk_review_session_ip_max_attempts
+            < self.dingtalk_review_session_max_attempts
+        ):
+            raise ValueError("DingTalk session IP attempt limit must cover the per-review limit")
         return self
 
     @property
@@ -178,6 +261,18 @@ class Settings(BaseSettings):
             and self.dingtalk_client_secret is not None
             and self.dingtalk_agent_id is not None
         )
+
+    @property
+    def dingtalk_store_root_name_set(self) -> frozenset[str]:
+        return frozenset(self.dingtalk_store_root_names.split(","))
+
+    @property
+    def dingtalk_dining_manager_title_set(self) -> frozenset[str]:
+        return frozenset(self.dingtalk_dining_manager_titles.split(","))
+
+    @property
+    def dingtalk_kitchen_manager_title_set(self) -> frozenset[str]:
+        return frozenset(self.dingtalk_kitchen_manager_titles.split(","))
 
 
 @lru_cache

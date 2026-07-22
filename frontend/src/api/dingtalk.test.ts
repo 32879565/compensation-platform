@@ -6,6 +6,7 @@ vi.mock('./client', () => ({ api: client }))
 
 import {
   createCompAppeal,
+  applyDingTalkOrganization,
   fetchCompAppeal,
   fetchCompAppeals,
   fetchDingTalkDeliveries,
@@ -15,6 +16,7 @@ import {
   applyDingTalkEmployeeMatches,
   previewDingTalkAttendance,
   previewDingTalkEmployees,
+  previewDingTalkOrganization,
   refreshDingTalkAttendance,
   retryDingTalkDelivery,
   stageReviewDeliveries,
@@ -131,14 +133,8 @@ describe('DingTalk and compensation appeal API client', () => {
     })
     expect(client.get).toHaveBeenNthCalledWith(3, '/api/comp-appeals')
     expect(client.get).toHaveBeenNthCalledWith(4, '/api/comp-appeals/5')
-    expect(client.post).toHaveBeenNthCalledWith(
-      1,
-      '/api/dingtalk/integration/test',
-    )
-    expect(client.post).toHaveBeenNthCalledWith(
-      2,
-      '/api/dingtalk/batches/42/review-deliveries',
-    )
+    expect(client.post).toHaveBeenNthCalledWith(1, '/api/dingtalk/integration/test')
+    expect(client.post).toHaveBeenNthCalledWith(2, '/api/dingtalk/batches/42/review-deliveries')
     expect(client.post).toHaveBeenNthCalledWith(3, '/api/dingtalk/deliveries/7/retry')
     expect(client.post).toHaveBeenNthCalledWith(4, '/api/comp-appeals', {
       delivery_id: 7,
@@ -168,9 +164,7 @@ describe('DingTalk and compensation appeal API client', () => {
   })
 
   it('does not return personal identifiers or free text to query consumers', async () => {
-    client.get
-      .mockResolvedValueOnce({ data: [delivery] })
-      .mockResolvedValueOnce({ data: [appeal] })
+    client.get.mockResolvedValueOnce({ data: [delivery] }).mockResolvedValueOnce({ data: [appeal] })
 
     const [listedDelivery] = await fetchDingTalkDeliveries()
     const [listedAppeal] = await fetchCompAppeals()
@@ -222,5 +216,103 @@ describe('DingTalk and compensation appeal API client', () => {
     })
     expect(cached.total_records).toBe(3)
     expect(queued.status).toBe('QUEUED')
+  })
+
+  it('previews and applies a staged DingTalk organization sync without sending item data back', async () => {
+    const preview = {
+      batch_id: '3fe80f532f184247b477694427bad0ce',
+      expires_at: '2026-07-22T04:00:00Z',
+      remote_stores: 2,
+      local_stores: 2,
+      ready_stores: 1,
+      store_conflicts: 1,
+      ready_reviewers: 2,
+      reviewer_conflicts: 1,
+      store_items: [
+        {
+          id: 101,
+          remote_department_id: null,
+          remote_department_name: '旧城店',
+          remote_department_path: '本地 / 旧城店',
+          action: 'MISSING_IN_DINGTALK',
+          match_method: 'LOCAL_STORE_NOT_VISIBLE',
+          proposed_org_unit_id: 11,
+          proposed_org_unit_name: '旧城店',
+          proposed_parent_org_unit_id: 1,
+          proposed_parent_org_unit_name: '广州区域',
+          status: 'CONFLICT',
+          conflict_code: 'STORE_MISSING_IN_DINGTALK',
+          provider_department_secret: 'must-not-reach-query-consumers',
+        },
+      ],
+      reviewer_items: [
+        {
+          id: 201,
+          remote_department_id: null,
+          remote_department_name: '天河店',
+          remote_department_path: '集团 / 潮发运营中心 / 天河店',
+          department: 'DINING',
+          action: 'REMOVE',
+          dingtalk_name: null,
+          proposed_employee_id: null,
+          proposed_employee_name: null,
+          match_method: 'CLEAR_MISSING_MANAGER',
+          current_reviewer_name: '旧店长',
+          status: 'READY',
+          conflict_code: null,
+          provider_userid: 'must-not-reach-query-consumers',
+          remote_user_id: 'must-not-reach-query-consumers-either',
+        },
+      ],
+    }
+    const applied = {
+      applied_stores: 1,
+      applied_reviewers: 2,
+      unresolved: 2,
+      already_applied: false,
+    }
+    client.post.mockResolvedValueOnce({ data: preview }).mockResolvedValueOnce({ data: applied })
+
+    const staged = await previewDingTalkOrganization()
+    const result = await applyDingTalkOrganization(staged.batch_id)
+
+    expect(client.post).toHaveBeenNthCalledWith(1, '/api/dingtalk/sync/organization/preview')
+    expect(client.post).toHaveBeenNthCalledWith(
+      2,
+      '/api/dingtalk/sync/organization/3fe80f532f184247b477694427bad0ce/apply',
+    )
+    expect(staged.reviewer_items[0]).not.toHaveProperty('provider_userid')
+    expect(staged.reviewer_items[0]).not.toHaveProperty('remote_user_id')
+    expect(staged.store_items[0]).not.toHaveProperty('provider_department_secret')
+    expect(staged.store_items[0]).toEqual({
+      id: 101,
+      remote_department_id: null,
+      remote_department_name: '旧城店',
+      remote_department_path: '本地 / 旧城店',
+      action: 'MISSING_IN_DINGTALK',
+      match_method: 'LOCAL_STORE_NOT_VISIBLE',
+      proposed_org_unit_id: 11,
+      proposed_org_unit_name: '旧城店',
+      proposed_parent_org_unit_id: 1,
+      proposed_parent_org_unit_name: '广州区域',
+      status: 'CONFLICT',
+      conflict_code: 'STORE_MISSING_IN_DINGTALK',
+    })
+    expect(staged.reviewer_items[0]).toEqual({
+      id: 201,
+      remote_department_id: null,
+      remote_department_name: '天河店',
+      remote_department_path: '集团 / 潮发运营中心 / 天河店',
+      department: 'DINING',
+      action: 'REMOVE',
+      dingtalk_name: null,
+      proposed_employee_id: null,
+      proposed_employee_name: null,
+      match_method: 'CLEAR_MISSING_MANAGER',
+      current_reviewer_name: '旧店长',
+      status: 'READY',
+      conflict_code: null,
+    })
+    expect(result).toEqual(applied)
   })
 })

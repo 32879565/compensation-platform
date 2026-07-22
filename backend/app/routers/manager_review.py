@@ -5,28 +5,44 @@ from __future__ import annotations
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased
 
 from app.audit import service as audit
 from app.auth.permissions import Perm
 from app.core.config import get_settings
 from app.db.session import get_session
-from app.dingtalk.client import DingTalkClientError, get_dingtalk_client
+from app.dingtalk.authorization import lock_review_authorization_tables
+from app.dingtalk.client import (
+    DingTalkClientError,
+    DingTalkOrganizationAccess,
+    get_dingtalk_client,
+)
 from app.dingtalk.manager_security import (
     ManagerReviewClaims,
     ManagerReviewTokenError,
     create_manager_review_token,
     decode_manager_review_token,
 )
+from app.dingtalk.org_freshness import (
+    DingTalkOrganizationFreshnessError,
+    require_current_organization_reviewer,
+)
+from app.dingtalk.org_sync import take_organization_access_lock
+from app.dingtalk.session_throttle import (
+    ManagerSessionThrottle,
+    ManagerSessionThrottleUnavailable,
+)
 from app.models.auth import Permission, RolePermission, User, UserReviewScope, UserRole
 from app.models.dingtalk import DingTalkDelivery, DingTalkDeliveryKind, DingTalkDeliveryStatus
 from app.models.employee import Department, Employee
-from app.models.payroll_batch import PayrollBatch
+from app.models.payroll_batch import BatchStatus, PayrollBatch
 from app.models.payroll_result import BatchConfirmation, PayrollResult
 from app.payroll.batch_service import BatchError, confirm_scope, raise_dispute
 
@@ -37,6 +53,13 @@ _REVIEWABLE_DELIVERY_STATUSES = frozenset(
     {DingTalkDeliveryStatus.SANDBOXED, DingTalkDeliveryStatus.SENT}
 )
 _AUTH_FAILURE_DETAIL = "Unable to authorize this payroll review."
+_THROTTLE_SETTINGS = get_settings()
+_SESSION_THROTTLE = ManagerSessionThrottle(
+    ip_max_attempts=_THROTTLE_SETTINGS.dingtalk_review_session_ip_max_attempts,
+    review_max_attempts=_THROTTLE_SETTINGS.dingtalk_review_session_max_attempts,
+    window_minutes=_THROTTLE_SETTINGS.dingtalk_review_session_attempt_window_minutes,
+    secret=_THROTTLE_SETTINGS.secret_key,
+)
 
 
 class ManagerReviewConfigOut(BaseModel):
@@ -129,6 +152,10 @@ class _ManagerReviewContext:
     batch: PayrollBatch
 
 
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def _no_store(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -139,6 +166,28 @@ def _unauthorized() -> HTTPException:
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=_AUTH_FAILURE_DETAIL,
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _manager_auth_unavailable(session: Session) -> HTTPException:
+    session.rollback()
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Manager review authentication is temporarily unavailable.",
+    )
+
+
+def _manager_session_throttled(
+    session: Session, retry_after_seconds: int | None
+) -> HTTPException:
+    try:
+        session.commit()
+    except SQLAlchemyError:
+        return _manager_auth_unavailable(session)
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="Too many manager review authentication attempts.",
+        headers={"Retry-After": str(retry_after_seconds or 1)},
     )
 
 
@@ -189,6 +238,61 @@ def _delivery_is_currently_authorized(
     )
 
 
+def _lock_manager_authorization(session: Session) -> None:
+    """Freeze local authorization state for the complete salary operation."""
+
+    take_organization_access_lock(session)
+    lock_review_authorization_tables(session)
+    session.expire_all()
+
+
+def _delivery_link_is_current(session: Session, delivery: DingTalkDelivery) -> bool:
+    anchor = delivery.dispatched_at
+    if anchor is None and delivery.status is DingTalkDeliveryStatus.SANDBOXED:
+        anchor = delivery.created_at
+    current_time = session.scalar(select(func.now()))
+    if anchor is None or current_time is None:
+        return False
+    return _as_utc(anchor) + timedelta(
+        hours=get_settings().dingtalk_review_link_ttl_hours
+    ) > _as_utc(current_time)
+
+
+def _read_live_organization_access(user_id: str) -> DingTalkOrganizationAccess:
+    try:
+        return get_dingtalk_client().get_organization_access(user_id)
+    except DingTalkClientError:
+        raise _unauthorized() from None
+
+
+def _require_live_organization_access(
+    session: Session,
+    *,
+    delivery: DingTalkDelivery,
+    user: User,
+    access: DingTalkOrganizationAccess | None,
+) -> None:
+    if delivery.status is not DingTalkDeliveryStatus.SENT:
+        return
+    if access is None:
+        raise _unauthorized()
+    settings = get_settings()
+    try:
+        require_current_organization_reviewer(
+            session,
+            user_id=user.id,
+            org_unit_id=delivery.org_unit_id,
+            department=delivery.department,
+            access=access,
+            encryption_key=settings.encryption_key,
+            tenant_id=settings.dingtalk_corp_id or "",
+            dining_manager_titles=settings.dingtalk_dining_manager_title_set,
+            kitchen_manager_titles=settings.dingtalk_kitchen_manager_title_set,
+        )
+    except DingTalkOrganizationFreshnessError:
+        raise _unauthorized() from None
+
+
 def _load_review_context(
     review_id: str, request: Request, session: Session
 ) -> _ManagerReviewContext:
@@ -196,19 +300,49 @@ def _load_review_context(
         claims = decode_manager_review_token(_bearer_token(request))
     except ManagerReviewTokenError:
         raise _unauthorized() from None
-    delivery = session.scalars(
+    preliminary_delivery = session.scalars(
         select(DingTalkDelivery).where(
             DingTalkDelivery.id == claims.delivery_id,
             DingTalkDelivery.review_public_id == review_id,
         )
     ).first()
+    if preliminary_delivery is None or preliminary_delivery.batch_version != claims.batch_version:
+        raise _unauthorized()
+    preliminary_user = session.get(User, claims.user_id)
+    preliminary_status = preliminary_delivery.status
+    preliminary_provider_user_id = (
+        preliminary_user.dingtalk_user_id if preliminary_user is not None else None
+    )
+    session.rollback()
+    access = None
+    if preliminary_status is DingTalkDeliveryStatus.SENT:
+        if preliminary_provider_user_id is None:
+            raise _unauthorized()
+        access = _read_live_organization_access(preliminary_provider_user_id)
+
+    _lock_manager_authorization(session)
+    delivery = session.scalars(
+        select(DingTalkDelivery)
+        .where(
+            DingTalkDelivery.id == claims.delivery_id,
+            DingTalkDelivery.review_public_id == review_id,
+        )
+        .execution_options(populate_existing=True)
+    ).first()
     if delivery is None or delivery.batch_version != claims.batch_version:
         raise _unauthorized()
-    user = session.get(User, claims.user_id)
+    user = session.scalars(
+        select(User).where(User.id == claims.user_id).execution_options(populate_existing=True)
+    ).one_or_none()
     if user is None or not _delivery_is_currently_authorized(session, delivery=delivery, user=user):
         raise _unauthorized()
+    if not _delivery_link_is_current(session, delivery):
+        raise _unauthorized()
+    _require_live_organization_access(session, delivery=delivery, user=user, access=access)
     batch = session.get(PayrollBatch, delivery.batch_id)
     if batch is None:
+        raise _unauthorized()
+    if batch.status in {BatchStatus.CONFIRMED, BatchStatus.LOCKED}:
         raise _unauthorized()
     if batch.version != delivery.batch_version:
         raise HTTPException(
@@ -311,23 +445,43 @@ def manager_review_config(response: Response) -> ManagerReviewConfigOut:
     )
 
 
-@router.post("/session", response_model=ManagerSessionOut)
-def create_manager_session(
+def _create_manager_session(
     body: ManagerSessionBody,
-    response: Response,
-    session: Session = Depends(get_session),
+    session: Session,
 ) -> ManagerSessionOut:
-    _no_store(response)
-    delivery = session.scalars(
+    preliminary_delivery = session.scalars(
         select(DingTalkDelivery).where(DingTalkDelivery.review_public_id == body.review_id)
     ).first()
-    if delivery is None or delivery.recipient_user_id is None:
+    if preliminary_delivery is None or preliminary_delivery.recipient_user_id is None:
         raise _unauthorized()
+    preliminary_delivery_id = preliminary_delivery.id
+    preliminary_status = preliminary_delivery.status
+    session.rollback()
+    client = get_dingtalk_client()
     try:
-        identity = get_dingtalk_client().resolve_login_code(body.auth_code)
+        identity = client.resolve_login_code(body.auth_code)
     except DingTalkClientError:
         raise _unauthorized() from None
-    user = session.get(User, delivery.recipient_user_id)
+    access = None
+    if preliminary_status is DingTalkDeliveryStatus.SENT:
+        try:
+            access = client.get_organization_access(identity.user_id)
+        except DingTalkClientError:
+            raise _unauthorized() from None
+
+    _lock_manager_authorization(session)
+    delivery = session.scalars(
+        select(DingTalkDelivery)
+        .where(DingTalkDelivery.id == preliminary_delivery_id)
+        .execution_options(populate_existing=True)
+    ).one_or_none()
+    if delivery is None or delivery.review_public_id != body.review_id:
+        raise _unauthorized()
+    user = session.scalars(
+        select(User)
+        .where(User.id == delivery.recipient_user_id)
+        .execution_options(populate_existing=True)
+    ).one_or_none()
     if (
         user is None
         or user.dingtalk_user_id is None
@@ -335,8 +489,13 @@ def create_manager_session(
         or not _delivery_is_currently_authorized(session, delivery=delivery, user=user)
     ):
         raise _unauthorized()
+    if not _delivery_link_is_current(session, delivery):
+        raise _unauthorized()
+    _require_live_organization_access(session, delivery=delivery, user=user, access=access)
     batch = session.get(PayrollBatch, delivery.batch_id)
     if batch is None:
+        raise _unauthorized()
+    if batch.status in {BatchStatus.CONFIRMED, BatchStatus.LOCKED}:
         raise _unauthorized()
     if batch.version != delivery.batch_version:
         raise HTTPException(
@@ -361,6 +520,35 @@ def create_manager_session(
         access_token=token,
         expires_in=get_settings().dingtalk_review_session_ttl_minutes * 60,
     )
+
+
+@router.post("/session", response_model=ManagerSessionOut)
+def create_manager_session(
+    body: ManagerSessionBody,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session),
+) -> ManagerSessionOut:
+    _no_store(response)
+    source_ip = _SESSION_THROTTLE.canonical_ip(
+        request.client.host if request.client else "unknown"
+    )
+    try:
+        decision = _SESSION_THROTTLE.consume(
+            session,
+            ip=source_ip,
+            review_id=body.review_id,
+        )
+    except (ManagerSessionThrottleUnavailable, SQLAlchemyError):
+        raise _manager_auth_unavailable(session) from None
+    if not decision.allowed:
+        raise _manager_session_throttled(session, decision.retry_after_seconds)
+    try:
+        session.commit()
+    except SQLAlchemyError:
+        raise _manager_auth_unavailable(session) from None
+
+    return _create_manager_session(body, session)
 
 
 @router.get("/reviews/{review_id}", response_model=ManagerReviewOut)

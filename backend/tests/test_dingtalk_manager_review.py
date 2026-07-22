@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -11,7 +12,13 @@ from sqlalchemy import select
 
 from app.auth.bootstrap import seed_rbac
 from app.core.security import create_access_token, hash_password
-from app.dingtalk.client import DingTalkClient
+from app.core.config import get_settings
+from app.dingtalk.client import (
+    DingTalkClient,
+    DingTalkClientError,
+    DingTalkOrganizationAccess,
+    DingTalkOrganizationUser,
+)
 from app.dingtalk.manager_security import (
     ManagerReviewTokenError,
     create_manager_review_token,
@@ -22,6 +29,11 @@ from app.models.dingtalk import (
     DingTalkDelivery,
     DingTalkDeliveryKind,
     DingTalkDeliveryStatus,
+    DingTalkOrgSyncBatch,
+    DingTalkOrgSyncBatchStatus,
+    DingTalkOrgSyncItem,
+    DingTalkOrgSyncItemKind,
+    DingTalkOrgSyncItemStatus,
 )
 from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
@@ -31,6 +43,10 @@ from app.models.payroll_result import (
     CompDispute,
     ConfirmStatus,
     PayrollResult,
+)
+from app.dingtalk.read_sync import (
+    blind_index_dingtalk_user_id,
+    dingtalk_organization_identity_proof,
 )
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
@@ -189,6 +205,101 @@ class _LoginClient:
         return type("Identity", (), {"user_id": self.user_id})()
 
 
+class _LiveLoginClient(_LoginClient):
+    def __init__(self, access: DingTalkOrganizationAccess):
+        super().__init__(access.user.user_id)
+        self.access = access
+        self.fail_access = False
+
+    def get_organization_access(self, user_id: str) -> DingTalkOrganizationAccess:
+        if self.fail_access:
+            raise DingTalkClientError("provider unavailable")
+        assert user_id == self.access.user.user_id
+        return self.access
+
+
+def _make_live_review_world(session, world, settings):
+    manager = world["manager"]
+    employee = world["dining_employee"]
+    store = world["store"]
+    delivery = world["delivery"]
+    provider_hash = blind_index_dingtalk_user_id(
+        "ding-manager-1",
+        key=settings.encryption_key,
+    )
+    manager.employee_id = employee.id
+    manager.dingtalk_user_id_hash = provider_hash
+    employee.dingtalk_user_id_hash = provider_hash
+    store.dingtalk_dept_id = 700
+    delivery.status = DingTalkDeliveryStatus.SENT
+    delivery.dispatched_at = datetime.now(UTC)
+    sync_batch = DingTalkOrgSyncBatch(
+        status=DingTalkOrgSyncBatchStatus.APPLIED,
+        snapshot_hash="a" * 64,
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        requested_by_user_id=manager.id,
+        applied_by_user_id=manager.id,
+        applied_at=datetime.now(UTC),
+    )
+    session.add(sync_batch)
+    session.flush()
+    session.add_all(
+        [
+            DingTalkOrgSyncItem(
+                batch_id=sync_batch.id,
+                row_key="STORE:700",
+                kind=DingTalkOrgSyncItemKind.STORE,
+                status=DingTalkOrgSyncItemStatus.APPLIED,
+                remote_department_id=700,
+                remote_department_name=store.name,
+                remote_department_path=f"Group / {store.name}",
+                proposed_org_unit_id=store.id,
+                match_method="LINK|STABLE_DEPARTMENT_ID",
+                baseline_fingerprint="b" * 64,
+            ),
+            DingTalkOrgSyncItem(
+                batch_id=sync_batch.id,
+                row_key="REVIEWER:700:DINING",
+                kind=DingTalkOrgSyncItemKind.REVIEWER,
+                status=DingTalkOrgSyncItemStatus.APPLIED,
+                remote_department_id=700,
+                remote_department_name=store.name,
+                remote_department_path=f"Group / {store.name}",
+                proposed_org_unit_id=store.id,
+                proposed_employee_id=employee.id,
+                department=Department.DINING,
+                match_method="ASSIGN|STABLE_ID",
+                applied_identity_proof=dingtalk_organization_identity_proof(
+                    provider_hash,
+                    key=settings.encryption_key,
+                    tenant_id=settings.dingtalk_corp_id or "",
+                    batch_public_id=sync_batch.public_id,
+                    snapshot_hash=sync_batch.snapshot_hash,
+                    remote_department_id=700,
+                    org_unit_id=store.id,
+                    department=Department.DINING.value,
+                    employee_id=employee.id,
+                ),
+                baseline_fingerprint="c" * 64,
+            ),
+        ]
+    )
+    session.commit()
+    return _LiveLoginClient(
+        DingTalkOrganizationAccess(
+            user=DingTalkOrganizationUser(
+                user_id="ding-manager-1",
+                name="Manager",
+                job_number="MR-001",
+                title="店长",
+                active=True,
+                department_ids=(701,),
+            ),
+            parent_department_paths=((701, 700, 1),),
+        )
+    )
+
+
 def _exchange(client, monkeypatch, world, *, provider_user_id: str = "ding-manager-1") -> str:
     from app.routers import manager_review
 
@@ -327,3 +438,140 @@ def test_manager_can_confirm_only_the_delivery_store_department(client, db_sessi
     db_session.refresh(world["kitchen_confirmation"])
     assert world["dining_confirmation"].status is ConfirmStatus.CONFIRMED
     assert world["kitchen_confirmation"].status is ConfirmStatus.PENDING
+
+
+def _install_live_manager_review(monkeypatch, live_client):
+    from app.routers import manager_review
+
+    settings = get_settings().model_copy(
+        update={
+            "dingtalk_corp_id": "ding-test-corp",
+            "dingtalk_dining_manager_titles": "店长",
+            "dingtalk_kitchen_manager_titles": "厨房经理",
+            "dingtalk_review_link_ttl_hours": 168,
+        }
+    )
+    monkeypatch.setattr(manager_review, "get_settings", lambda: settings)
+    monkeypatch.setattr(manager_review, "get_dingtalk_client", lambda: live_client)
+    return settings
+
+
+def test_live_manager_access_is_rechecked_after_token_and_rejects_unsynced_transfer(
+    client, db_session, monkeypatch
+):
+    world = _review_world(db_session)
+    settings = get_settings().model_copy(update={"dingtalk_corp_id": "ding-test-corp"})
+    live_client = _make_live_review_world(db_session, world, settings)
+    _install_live_manager_review(monkeypatch, live_client)
+    session_response = client.post(
+        "/api/manager-review/session",
+        json={
+            "review_id": world["delivery"].review_public_id,
+            "auth_code": "one-time-code",
+        },
+    )
+    assert session_response.status_code == 200, session_response.text
+    headers = {"Authorization": f"Bearer {session_response.json()['access_token']}"}
+    review_url = f"/api/manager-review/reviews/{world['delivery'].review_public_id}"
+    assert client.get(review_url, headers=headers).status_code == 200
+
+    live_client.access = replace(
+        live_client.access,
+        user=replace(live_client.access.user, department_ids=(801,)),
+        parent_department_paths=((801, 800, 1),),
+    )
+
+    rejected = client.get(review_url, headers=headers)
+    assert rejected.status_code == 401
+    assert rejected.json() == {"detail": "Unable to authorize this payroll review."}
+
+
+def test_live_manager_access_rejects_ambiguous_multi_store_membership(
+    client, db_session, monkeypatch
+):
+    world = _review_world(db_session)
+    settings = get_settings().model_copy(update={"dingtalk_corp_id": "ding-test-corp"})
+    live_client = _make_live_review_world(db_session, world, settings)
+    other_store = OrgUnit(
+        code="MR-OTHER-STORE",
+        name="Other Store",
+        type=OrgType.STORE,
+        dingtalk_dept_id=800,
+        status="ACTIVE",
+    )
+    db_session.add(other_store)
+    db_session.commit()
+    live_client.access = replace(
+        live_client.access,
+        user=replace(live_client.access.user, department_ids=(701, 801)),
+        parent_department_paths=((701, 700, 1), (801, 800, 1)),
+    )
+    _install_live_manager_review(monkeypatch, live_client)
+
+    response = client.post(
+        "/api/manager-review/session",
+        json={
+            "review_id": world["delivery"].review_public_id,
+            "auth_code": "one-time-code",
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_live_manager_link_expires_and_provider_failures_fail_closed(
+    client, db_session, monkeypatch
+):
+    world = _review_world(db_session)
+    settings = get_settings().model_copy(update={"dingtalk_corp_id": "ding-test-corp"})
+    live_client = _make_live_review_world(db_session, world, settings)
+    configured = _install_live_manager_review(monkeypatch, live_client)
+    world["delivery"].dispatched_at = datetime.now(UTC) - timedelta(
+        hours=configured.dingtalk_review_link_ttl_hours + 1
+    )
+    db_session.commit()
+
+    expired = client.post(
+        "/api/manager-review/session",
+        json={
+            "review_id": world["delivery"].review_public_id,
+            "auth_code": "one-time-code",
+        },
+    )
+    assert expired.status_code == 401
+
+    world["delivery"].dispatched_at = datetime.now(UTC)
+    db_session.commit()
+    live_client.fail_access = True
+    unavailable = client.post(
+        "/api/manager-review/session",
+        json={
+            "review_id": world["delivery"].review_public_id,
+            "auth_code": "one-time-code",
+        },
+    )
+    assert unavailable.status_code == 401
+
+
+def test_manager_session_throttles_repeated_failed_provider_identities(
+    client, db_session, monkeypatch
+):
+    world = _review_world(db_session)
+    from app.routers import manager_review
+
+    monkeypatch.setattr(
+        manager_review,
+        "get_dingtalk_client",
+        lambda: _LoginClient("different-user"),
+    )
+    body = {
+        "review_id": world["delivery"].review_public_id,
+        "auth_code": "one-time-code",
+    }
+
+    for _attempt in range(get_settings().dingtalk_review_session_max_attempts):
+        assert client.post("/api/manager-review/session", json=body).status_code == 401
+
+    throttled = client.post("/api/manager-review/session", json=body)
+    assert throttled.status_code == 429
+    assert "retry-after" in throttled.headers

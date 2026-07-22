@@ -43,6 +43,7 @@ class Perm:
     DASHBOARD_READ = "dashboard:read"
     EXPORT_DATA = "export:data"
     NOTIFICATION_MANAGE = "notification:manage"
+    DINGTALK_ORG_SYNC = "dingtalk_org:sync"
     IMPORT_RUN = "import:run"
     SALARY_READ = "salary:read"
     AUDIT_READ = "audit:read"
@@ -83,6 +84,7 @@ PERMISSION_CATALOG: dict[str, str] = {
     Perm.DASHBOARD_READ: "查看看板",
     Perm.EXPORT_DATA: "导出数据",
     Perm.NOTIFICATION_MANAGE: "管理薪酬通知",
+    Perm.DINGTALK_ORG_SYNC: "同步钉钉门店与负责人",
     Perm.IMPORT_RUN: "导入薪资数据",
     Perm.SALARY_READ: "查询薪资记录",
     Perm.AUDIT_READ: "查看审计日志",
@@ -146,6 +148,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             Perm.DASHBOARD_READ,
             Perm.EXPORT_DATA,
             Perm.NOTIFICATION_MANAGE,
+            Perm.DINGTALK_ORG_SYNC,
             Perm.IMPORT_RUN,
             Perm.SALARY_READ,
         ),

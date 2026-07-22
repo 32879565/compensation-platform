@@ -15,6 +15,7 @@ from app.core.config import Settings
 from app.core.security import hash_password
 from app.dingtalk import service as dingtalk_service
 from app.dingtalk.client import DingTalkClientError, DingTalkSendResult
+from app.dingtalk.org_sync import take_organization_access_lock, take_organization_sync_lock
 from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
@@ -46,6 +47,17 @@ def client(db_session):
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legacy_delivery_tests_from_org_sync(monkeypatch):
+    """Organization freshness integration is covered in its dedicated test module."""
+
+    monkeypatch.setattr(
+        dingtalk_service,
+        "require_recent_organization_scopes",
+        lambda _session, _scopes, **_kwargs: 1,
+    )
 
 
 def _user(session, username: str, roles: list[str], review_scopes=()) -> User:
@@ -493,6 +505,7 @@ def _live_settings() -> Settings:
         dingtalk_client_secret="test-dingtalk-secret-value",
         dingtalk_agent_id=123,
         dingtalk_public_base_url="https://payroll.example.test",
+        dingtalk_read_sync_enabled=True,
     )
 
 
@@ -505,19 +518,42 @@ def test_review_authorization_lock_is_a_safe_sqlite_noop():
         engine.dispose()
 
 
-def test_review_authorization_lock_blocks_a_concurrent_scope_writer(pg_engine):
+@pytest.mark.parametrize("table_name", ["user_review_scope", "employee", "org_unit"])
+def test_review_authorization_lock_blocks_concurrent_authorization_writers(
+    pg_engine, table_name
+):
     with Session(pg_engine) as dispatch_session, Session(pg_engine) as writer_session:
         dingtalk_service._lock_review_authorization_tables(dispatch_session)
 
         with pytest.raises(OperationalError):
             writer_session.execute(
-                text("LOCK TABLE user_review_scope IN ROW EXCLUSIVE MODE NOWAIT")
+                text(f"LOCK TABLE {table_name} IN ROW EXCLUSIVE MODE NOWAIT")
             )
         writer_session.rollback()
 
         dispatch_session.rollback()
-        writer_session.execute(text("LOCK TABLE user_review_scope IN ROW EXCLUSIVE MODE NOWAIT"))
+        writer_session.execute(text(f"LOCK TABLE {table_name} IN ROW EXCLUSIVE MODE NOWAIT"))
         writer_session.rollback()
+
+
+def test_manager_organization_access_locks_are_shared_but_block_sync_writers(pg_engine):
+    with (
+        Session(pg_engine) as first_reader,
+        Session(pg_engine) as second_reader,
+        Session(pg_engine) as writer,
+    ):
+        take_organization_access_lock(first_reader)
+        take_organization_access_lock(second_reader)
+        writer.execute(text("SET LOCAL lock_timeout = '100ms'"))
+
+        with pytest.raises(OperationalError):
+            take_organization_sync_lock(writer)
+        writer.rollback()
+
+        first_reader.rollback()
+        second_reader.rollback()
+        take_organization_sync_lock(writer)
+        writer.rollback()
 
 
 @pytest.mark.parametrize("operation", ["live_dispatch", "sandbox_retry"])
@@ -566,8 +602,8 @@ def test_review_authorization_table_lock_precedes_every_delivery_row_lock(
         index
         for index, statement in enumerate(normalized)
         if statement.startswith(
-            "LOCK TABLE APP_USER, PERMISSION, ROLE_PERMISSION, USER_REVIEW_SCOPE, USER_ROLE "
-            "IN SHARE MODE"
+            "LOCK TABLE APP_USER, EMPLOYEE, ORG_UNIT, PERMISSION, ROLE_PERMISSION, "
+            "USER_REVIEW_SCOPE, USER_ROLE IN SHARE MODE"
         )
     )
     row_lock_indices = [
@@ -655,7 +691,7 @@ def test_live_dispatch_revalidates_staged_reviewer_authorization(
     assert fake_client.messages == []
 
 
-def test_live_dispatch_fails_closed_when_review_routing_becomes_ambiguous(db_session):
+def test_live_dispatch_fails_closed_when_reviewer_is_reassigned(db_session):
     store, _employee, batch = _seed_review_round(db_session)
     staged_manager = _user(
         db_session,
@@ -670,13 +706,19 @@ def test_live_dispatch_fails_closed_when_review_routing_becomes_ambiguous(db_ses
     )
     assert len(staged.pending_delivery_ids) == 1
 
-    added_manager = _user(
+    db_session.execute(
+        delete(UserReviewScope).where(
+            UserReviewScope.org_unit_id == store.id,
+            UserReviewScope.department == Department.DINING,
+        )
+    )
+    replacement_manager = _user(
         db_session,
-        "added-live-reviewer",
+        "replacement-live-reviewer",
         ["STORE_MANAGER"],
         review_scopes=[(store.id, Department.DINING)],
     )
-    added_manager.dingtalk_user_id = "provider-added-reviewer"
+    replacement_manager.dingtalk_user_id = "provider-replacement-reviewer"
     db_session.flush()
     fake_client = _FakeDingTalkClient()
 
@@ -1033,6 +1075,91 @@ def test_live_delivery_requires_provider_userid_and_sends_ephemeral_action_card(
         f"https://payroll.example.test/manager-review/{sent.review_public_id}"
     )
     assert not hasattr(sent, "message_body")
+
+
+@pytest.mark.parametrize(
+    ("between_transaction_change", "expected_error"),
+    [
+        ("authorization", "RECIPIENT_NOT_AUTHORIZED"),
+        ("provider_identity", "MISSING_DINGTALK_USER_ID"),
+    ],
+)
+def test_live_delivery_cancels_unsent_marker_after_recipient_changes(
+    db_session,
+    monkeypatch,
+    between_transaction_change: str,
+    expected_error: str,
+):
+    store, _employee, batch = _seed_review_round(db_session)
+    manager = _user(
+        db_session,
+        f"between-transaction-{between_transaction_change}",
+        ["STORE_MANAGER"],
+        review_scopes=[(store.id, Department.DINING)],
+    )
+    manager.dingtalk_user_id = f"provider-{between_transaction_change}"
+    settings = _live_settings()
+    staged = dingtalk_service.stage_review_deliveries(
+        db_session, batch_id=batch.id, settings=settings
+    )
+    delivery_id = staged.pending_delivery_ids[0]
+    db_session.commit()
+
+    original_lookup = dingtalk_service._locked_authorized_review_recipient
+    lookup_count = 0
+
+    def changing_lookup(session, *, delivery):
+        nonlocal lookup_count
+        lookup_count += 1
+        recipient = original_lookup(session, delivery=delivery)
+        if lookup_count != 2:
+            return recipient
+        if between_transaction_change == "authorization":
+            return None
+        assert recipient is not None
+        recipient.dingtalk_user_id = None
+        session.flush()
+        return recipient
+
+    monkeypatch.setattr(
+        dingtalk_service,
+        "_locked_authorized_review_recipient",
+        changing_lookup,
+    )
+
+    class ClientMustNotBeCalled:
+        def send_action_card(self, **_kwargs):
+            raise AssertionError("provider must not be called after recipient changes")
+
+    delivery = dingtalk_service.dispatch_live_delivery(
+        db_session,
+        delivery_id=delivery_id,
+        settings=settings,
+        client=ClientMustNotBeCalled(),  # type: ignore[arg-type]
+    )
+
+    assert lookup_count == 2
+    assert delivery.status.value == "FAILED"
+    assert delivery.error_code == expected_error
+    assert delivery.attempt_count == 0
+    assert delivery.dispatched_at is None
+
+    if between_transaction_change == "provider_identity":
+        manager.dingtalk_user_id = "provider-restored-after-cancel"
+        db_session.flush()
+    monkeypatch.setattr(
+        dingtalk_service,
+        "_locked_authorized_review_recipient",
+        original_lookup,
+    )
+    restaged = dingtalk_service.stage_review_deliveries(
+        db_session,
+        batch_id=batch.id,
+        settings=settings,
+    )
+    assert restaged.existing == 1
+    assert restaged.routed == 1
+    assert restaged.pending_delivery_ids == (delivery_id,)
 
 
 def test_live_delivery_never_blindly_retries_an_unknown_provider_outcome(db_session):

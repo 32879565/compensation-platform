@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 
 from app.auth.bootstrap import seed_rbac
 from app.core.config import Settings
+from app.dingtalk import service as dingtalk_service
 from app.dingtalk.service import stage_review_deliveries
 from app.importing import publish as publish_module
 from app.importing.header_rules import MONEY_FIELDS
@@ -21,6 +22,17 @@ from app.models.payroll_result import BatchConfirmation, PayrollResult
 from app.models.salary import SalaryRecord
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_publish_tests_from_org_sync(monkeypatch):
+    """Organization freshness integration is covered in its dedicated test module."""
+
+    monkeypatch.setattr(
+        dingtalk_service,
+        "require_recent_organization_scopes",
+        lambda _session, _scopes, **_kwargs: 1,
+    )
 
 
 def _employee(session, store, *, emp_no: str, name: str) -> Employee:
@@ -113,6 +125,7 @@ def _live_dingtalk_settings() -> Settings:
         dingtalk_client_secret="test-dingtalk-secret-value",
         dingtalk_agent_id=123,
         dingtalk_public_base_url="https://payroll.example.test",
+        dingtalk_read_sync_enabled=True,
     )
 
 

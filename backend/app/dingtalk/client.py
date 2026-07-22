@@ -27,6 +27,10 @@ _TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"  # nosec B105
 _WORK_NOTIFICATION_URL = "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2"
 _DEPARTMENT_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/department/listsub"
 _DEPARTMENT_USER_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/user/list"
+_USER_DETAIL_URL = "https://oapi.dingtalk.com/topapi/v2/user/get"
+_USER_PARENT_DEPARTMENTS_URL = (
+    "https://oapi.dingtalk.com/topapi/v2/department/listparentbyuser"
+)
 _ATTENDANCE_RESULT_URL = "https://oapi.dingtalk.com/attendance/list"
 _LOGIN_USERINFO_URL = "https://oapi.dingtalk.com/topapi/v2/user/getuserinfo"
 _MAX_RESPONSE_BYTES = 64 * 1024
@@ -80,6 +84,43 @@ class DingTalkDirectoryUser:
     name: str
     job_number: str | None
     active: bool
+
+
+@dataclass(frozen=True)
+class DingTalkDepartment:
+    """A department node read from DingTalk's organization hierarchy."""
+
+    department_id: int
+    parent_id: int | None
+    name: str
+
+
+@dataclass(frozen=True)
+class DingTalkOrganizationUser:
+    """A DingTalk organization member with all direct department memberships."""
+
+    user_id: str
+    name: str
+    job_number: str | None
+    title: str | None
+    active: bool
+    department_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DingTalkOrganizationSnapshot:
+    """A bounded point-in-time view of DingTalk departments and members."""
+
+    departments: tuple[DingTalkDepartment, ...]
+    users: tuple[DingTalkOrganizationUser, ...]
+
+
+@dataclass(frozen=True)
+class DingTalkOrganizationAccess:
+    """A current user record and every direct-department-to-root path."""
+
+    user: DingTalkOrganizationUser
+    parent_department_paths: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -213,6 +254,116 @@ class DingTalkClient:
             raise DingTalkClientError("DingTalk login returned an invalid identity")
         return DingTalkLoginIdentity(user_id=user_id)
 
+    def get_organization_access(self, user_id: str) -> DingTalkOrganizationAccess:
+        """Read one user's current role and complete organization ancestry.
+
+        The two provider reads are cross-checked so a transfer between them is
+        rejected instead of authorizing a mixture of old and new membership.
+        """
+
+        normalized_user_id = user_id.strip()
+        if not normalized_user_id or len(normalized_user_id) > 256:
+            raise DingTalkClientError("The DingTalk user identifier is invalid")
+        detail_payload = self._post_legacy_json(
+            _USER_DETAIL_URL,
+            {"userid": normalized_user_id, "language": "zh_CN"},
+        )
+        raw_user = detail_payload.get("result")
+        if not isinstance(raw_user, dict):
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+        returned_user_id = raw_user.get("userid")
+        raw_name = raw_user.get("name")
+        if (
+            not isinstance(returned_user_id, str)
+            or returned_user_id.strip() != normalized_user_id
+            or not isinstance(raw_name, str)
+            or not raw_name.strip()
+            or len(raw_name.strip()) > 128
+        ):
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+        raw_job_number = raw_user.get("job_number")
+        job_number = (
+            raw_job_number.strip()
+            if isinstance(raw_job_number, str) and raw_job_number.strip()
+            else None
+        )
+        raw_title = raw_user.get("title")
+        title = raw_title.strip() if isinstance(raw_title, str) and raw_title.strip() else None
+        if (job_number is not None and len(job_number) > 128) or (
+            title is not None and len(title) > 128
+        ):
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+        raw_active = raw_user.get("active")
+        if isinstance(raw_active, bool):
+            active = raw_active
+        elif isinstance(raw_active, str) and raw_active.casefold() in {"true", "false"}:
+            active = raw_active.casefold() == "true"
+        else:
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+        raw_department_ids = raw_user.get("dept_id_list")
+        if not isinstance(raw_department_ids, list) or not raw_department_ids:
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+        if any(
+            not isinstance(department_id, int)
+            or isinstance(department_id, bool)
+            or department_id <= 0
+            for department_id in raw_department_ids
+        ):
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+        department_ids = tuple(sorted(set(raw_department_ids)))
+        if len(department_ids) != len(raw_department_ids) or len(department_ids) > 100:
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+
+        parent_payload = self._post_legacy_json(
+            _USER_PARENT_DEPARTMENTS_URL,
+            {"userid": normalized_user_id},
+        )
+        parent_result = parent_payload.get("result")
+        raw_parent_list = parent_result.get("parent_list") if isinstance(parent_result, dict) else None
+        if not isinstance(raw_parent_list, list) or not raw_parent_list:
+            raise DingTalkClientError("DingTalk returned an invalid organization access")
+        paths: list[tuple[int, ...]] = []
+        for raw_path_entry in raw_parent_list:
+            raw_path = (
+                raw_path_entry.get("parent_dept_id_list")
+                if isinstance(raw_path_entry, dict)
+                else None
+            )
+            if (
+                not isinstance(raw_path, list)
+                or not raw_path
+                or len(raw_path) > _MAX_DIRECTORY_DEPARTMENTS
+                or any(
+                    not isinstance(department_id, int)
+                    or isinstance(department_id, bool)
+                    or department_id <= 0
+                    for department_id in raw_path
+                )
+            ):
+                raise DingTalkClientError("DingTalk returned an invalid organization access")
+            path = tuple(raw_path)
+            if len(set(path)) != len(path) or path[-1] != 1:
+                raise DingTalkClientError("DingTalk returned an invalid organization access")
+            paths.append(path)
+        parent_department_paths = tuple(sorted(paths))
+        if (
+            len(set(parent_department_paths)) != len(parent_department_paths)
+            or {path[0] for path in parent_department_paths} != set(department_ids)
+        ):
+            raise DingTalkClientError("DingTalk returned inconsistent organization access")
+
+        return DingTalkOrganizationAccess(
+            user=DingTalkOrganizationUser(
+                user_id=normalized_user_id,
+                name=raw_name.strip(),
+                job_number=job_number,
+                title=title,
+                active=active,
+                department_ids=department_ids,
+            ),
+            parent_department_paths=parent_department_paths,
+        )
+
     def _post_legacy_json(self, url: str, body: dict[str, object]) -> dict[str, Any]:
         """POST JSON to one of this module's fixed legacy OpenAPI destinations."""
 
@@ -258,39 +409,58 @@ class DingTalkClient:
             raise DingTalkClientError("DingTalk returned an invalid directory response")
         return value
 
-    def list_directory_users(self) -> tuple[DingTalkDirectoryUser, ...]:
-        """Read every visible department and its direct members.
+    def list_organization_snapshot(self) -> DingTalkOrganizationSnapshot:
+        """Read a bounded snapshot of visible departments and their direct members.
 
         DingTalk's department and member endpoints are direct-child/direct-member
         APIs, so both hierarchies are traversed explicitly with hard limits and
-        bounded parallelism. Users appearing in several departments are
-        deduplicated by provider ID.
+        bounded parallelism. The implicit root department (ID 1) has no metadata
+        in ``listsub`` and is therefore represented only in user memberships.
         """
 
-        def child_department_ids(department_id: int) -> tuple[int, ...]:
+        def child_departments(department_id: int) -> tuple[DingTalkDepartment, ...]:
             payload = self._post_legacy_json(
                 _DEPARTMENT_LIST_URL,
                 {"dept_id": department_id},
             )
             children = self._require_list(payload.get("result"))
-            child_ids: list[int] = []
+            normalized_children: list[DingTalkDepartment] = []
             for raw_child in children:
                 if not isinstance(raw_child, dict):
                     raise DingTalkClientError("DingTalk returned an invalid directory response")
                 child_id = raw_child.get("dept_id")
                 if not isinstance(child_id, int) or isinstance(child_id, bool) or child_id <= 0:
                     raise DingTalkClientError("DingTalk returned an invalid directory response")
-                child_ids.append(child_id)
-            return tuple(child_ids)
+                raw_parent_id = raw_child.get("parent_id", department_id)
+                if (
+                    not isinstance(raw_parent_id, int)
+                    or isinstance(raw_parent_id, bool)
+                    or raw_parent_id != department_id
+                ):
+                    raise DingTalkClientError("DingTalk returned an invalid directory response")
+                raw_name = raw_child.get("name")
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    raise DingTalkClientError("DingTalk returned an invalid directory response")
+                name = raw_name.strip()
+                if len(name) > 128:
+                    raise DingTalkClientError("DingTalk returned an invalid directory response")
+                normalized_children.append(
+                    DingTalkDepartment(
+                        department_id=child_id,
+                        parent_id=raw_parent_id,
+                        name=name,
+                    )
+                )
+            return tuple(normalized_children)
 
         page_lock = threading.Lock()
         page_count = 0
 
-        def department_users(department_id: int) -> tuple[DingTalkDirectoryUser, ...]:
+        def department_users(department_id: int) -> tuple[DingTalkOrganizationUser, ...]:
             nonlocal page_count
             page_cursor = 0
             seen_cursors: set[int] = set()
-            users: list[DingTalkDirectoryUser] = []
+            users: list[DingTalkOrganizationUser] = []
             while True:
                 if page_cursor in seen_cursors:
                     raise DingTalkClientError("DingTalk returned an invalid directory cursor")
@@ -332,14 +502,32 @@ class DingTalkClient:
                     )
                     if job_number is not None and len(job_number) > 128:
                         raise DingTalkClientError("DingTalk returned an invalid directory response")
-                    raw_active = raw_user.get("active", True)
-                    active = raw_active if isinstance(raw_active, bool) else True
+                    raw_title = raw_user.get("title")
+                    title = (
+                        raw_title.strip()
+                        if isinstance(raw_title, str) and raw_title.strip()
+                        else None
+                    )
+                    if title is not None and len(title) > 128:
+                        raise DingTalkClientError("DingTalk returned an invalid directory response")
+                    raw_active = raw_user.get("active")
+                    if isinstance(raw_active, bool):
+                        active = raw_active
+                    elif isinstance(raw_active, str) and raw_active.casefold() in {
+                        "true",
+                        "false",
+                    }:
+                        active = raw_active.casefold() == "true"
+                    else:
+                        raise DingTalkClientError("DingTalk returned an invalid directory response")
                     users.append(
-                        DingTalkDirectoryUser(
+                        DingTalkOrganizationUser(
                             user_id=normalized_user_id,
                             name=name.strip(),
                             job_number=job_number,
+                            title=title,
                             active=active,
+                            department_ids=(department_id,),
                         )
                     )
                 has_more = result.get("has_more", False)
@@ -358,21 +546,26 @@ class DingTalkClient:
 
         department_ids = [1]
         known_department_ids = {1}
+        departments: list[DingTalkDepartment] = []
         frontier = [1]
-        users_by_id: dict[str, DingTalkDirectoryUser] = {}
+        users_by_id: dict[str, DingTalkOrganizationUser] = {}
         with ThreadPoolExecutor(
             max_workers=_READ_MAX_WORKERS,
             thread_name_prefix="dingtalk-directory",
         ) as executor:
             while frontier:
-                child_groups = executor.map(child_department_ids, frontier)
+                child_groups = executor.map(child_departments, frontier)
                 next_frontier: list[int] = []
-                for child_ids in child_groups:
-                    for child_id in child_ids:
+                for children in child_groups:
+                    for child in children:
+                        child_id = child.department_id
                         if child_id in known_department_ids:
-                            continue
+                            raise DingTalkClientError(
+                                "DingTalk returned a duplicate organization department"
+                            )
                         known_department_ids.add(child_id)
                         department_ids.append(child_id)
+                        departments.append(child)
                         next_frontier.append(child_id)
                         if len(department_ids) > _MAX_DIRECTORY_DEPARTMENTS:
                             raise DingTalkClientError("DingTalk directory exceeds the safety limit")
@@ -380,11 +573,56 @@ class DingTalkClient:
 
             for users in executor.map(department_users, department_ids):
                 for user in users:
-                    users_by_id[user.user_id] = user
+                    existing = users_by_id.get(user.user_id)
+                    if existing is None:
+                        users_by_id[user.user_id] = user
+                    else:
+                        if (
+                            existing.name != user.name
+                            or (
+                                existing.job_number is not None
+                                and user.job_number is not None
+                                and existing.job_number != user.job_number
+                            )
+                            or (
+                                existing.title is not None
+                                and user.title is not None
+                                and existing.title != user.title
+                            )
+                        ):
+                            raise DingTalkClientError(
+                                "DingTalk returned inconsistent organization users"
+                            )
+                        users_by_id[user.user_id] = DingTalkOrganizationUser(
+                            user_id=user.user_id,
+                            name=user.name,
+                            job_number=existing.job_number or user.job_number,
+                            title=existing.title or user.title,
+                            active=existing.active and user.active,
+                            department_ids=tuple(
+                                sorted(set(existing.department_ids + user.department_ids))
+                            ),
+                        )
                     if len(users_by_id) > _MAX_DIRECTORY_USERS:
                         raise DingTalkClientError("DingTalk directory exceeds the safety limit")
 
-        return tuple(users_by_id.values())
+        return DingTalkOrganizationSnapshot(
+            departments=tuple(departments),
+            users=tuple(users_by_id.values()),
+        )
+
+    def list_directory_users(self) -> tuple[DingTalkDirectoryUser, ...]:
+        """Read the legacy identity-matching view from an organization snapshot."""
+
+        return tuple(
+            DingTalkDirectoryUser(
+                user_id=user.user_id,
+                name=user.name,
+                job_number=user.job_number,
+                active=user.active,
+            )
+            for user in self.list_organization_snapshot().users
+        )
 
     def list_attendance_results(
         self,

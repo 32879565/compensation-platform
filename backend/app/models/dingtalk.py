@@ -19,6 +19,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -48,6 +49,26 @@ class DingTalkAttendanceSyncStatus(enum.StrEnum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+
+
+class DingTalkOrgSyncBatchStatus(enum.StrEnum):
+    """Lifecycle of one immutable organization preview."""
+
+    PREVIEWED = "PREVIEWED"
+    APPLIED = "APPLIED"
+    STALE = "STALE"
+
+
+class DingTalkOrgSyncItemKind(enum.StrEnum):
+    STORE = "STORE"
+    REVIEWER = "REVIEWER"
+
+
+class DingTalkOrgSyncItemStatus(enum.StrEnum):
+    READY = "READY"
+    CONFLICT = "CONFLICT"
+    APPLIED = "APPLIED"
+    IGNORED = "IGNORED"
 
 
 class AppealStatus(enum.StrEnum):
@@ -191,6 +212,142 @@ class DingTalkAttendanceSnapshot(Base, TimestampMixin):
     not_signed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     other_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DingTalkOrgSyncBatch(Base, TimestampMixin):
+    """An expiring, auditable preview of DingTalk organization changes."""
+
+    __tablename__ = "dingtalk_org_sync_batch"
+    __table_args__ = (
+        CheckConstraint(
+            "remote_store_count >= 0 AND local_store_count >= 0 "
+            "AND ready_store_count >= 0 AND store_conflict_count >= 0 "
+            "AND ready_reviewer_count >= 0 AND reviewer_conflict_count >= 0",
+            name="ck_dingtalk_org_sync_batch_nonnegative_counts",
+        ),
+        CheckConstraint(
+            "(status = 'APPLIED' AND applied_by_user_id IS NOT NULL AND applied_at IS NOT NULL) "
+            "OR (status <> 'APPLIED' AND applied_by_user_id IS NULL AND applied_at IS NULL)",
+            name="ck_dingtalk_org_sync_batch_applied_audit",
+        ),
+        Index(
+            "ix_dingtalk_org_sync_batch_status_applied_at_id",
+            "status",
+            "applied_at",
+            "id",
+        ),
+    )
+
+    public_id: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        unique=True,
+        index=True,
+        default=lambda: uuid.uuid4().hex,
+    )
+    status: Mapped[DingTalkOrgSyncBatchStatus] = mapped_column(
+        Enum(DingTalkOrgSyncBatchStatus, name="dingtalk_org_sync_batch_status"),
+        nullable=False,
+        default=DingTalkOrgSyncBatchStatus.PREVIEWED,
+        server_default=DingTalkOrgSyncBatchStatus.PREVIEWED.value,
+        index=True,
+    )
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    requested_by_user_id: Mapped[int] = mapped_column(
+        ForeignKey("app_user.id"), nullable=False, index=True
+    )
+    applied_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("app_user.id"), nullable=True, index=True
+    )
+    remote_store_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    local_store_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    ready_store_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    store_conflict_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    ready_reviewer_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    reviewer_conflict_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DingTalkOrgSyncItem(Base, TimestampMixin):
+    """One deterministic store or reviewer proposal within a preview batch."""
+
+    __tablename__ = "dingtalk_org_sync_item"
+    __table_args__ = (
+        CheckConstraint(
+            "remote_department_id IS NULL OR remote_department_id > 0",
+            name="ck_dingtalk_org_sync_item_remote_department_positive",
+        ),
+        UniqueConstraint(
+            "batch_id",
+            "row_key",
+            name="uq_dingtalk_org_sync_item_batch_row_key",
+        ),
+        Index(
+            "ix_dingtalk_org_sync_item_batch_org_unit",
+            "batch_id",
+            "proposed_org_unit_id",
+        ),
+    )
+
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("dingtalk_org_sync_batch.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    row_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    kind: Mapped[DingTalkOrgSyncItemKind] = mapped_column(
+        Enum(DingTalkOrgSyncItemKind, name="dingtalk_org_sync_item_kind"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[DingTalkOrgSyncItemStatus] = mapped_column(
+        Enum(DingTalkOrgSyncItemStatus, name="dingtalk_org_sync_item_status"),
+        nullable=False,
+        default=DingTalkOrgSyncItemStatus.READY,
+        server_default=DingTalkOrgSyncItemStatus.READY.value,
+        index=True,
+    )
+    remote_department_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    remote_department_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    remote_department_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # Provider user ids never persist in the staging table.  The keyed digest
+    # identifies the same user in the freshly re-read apply snapshot without
+    # making the provider identifier recoverable from the database.
+    remote_user_id_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Domain-separated HMAC retained only after apply.  It proves that the
+    # current reviewer still has the exact provider identity HR confirmed,
+    # while the reusable directory blind index above is cleared.
+    applied_identity_proof: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    proposed_org_unit_id: Mapped[int | None] = mapped_column(
+        ForeignKey("org_unit.id"), nullable=True, index=True
+    )
+    proposed_parent_org_unit_id: Mapped[int | None] = mapped_column(
+        ForeignKey("org_unit.id"), nullable=True, index=True
+    )
+    proposed_employee_id: Mapped[int | None] = mapped_column(
+        ForeignKey("employee.id"), nullable=True, index=True
+    )
+    department: Mapped[Department | None] = mapped_column(
+        Enum(Department, name="department"), nullable=True
+    )
+    match_method: Mapped[str] = mapped_column(String(64), nullable=False)
+    conflict_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    baseline_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class CompAppeal(Base, TimestampMixin):
