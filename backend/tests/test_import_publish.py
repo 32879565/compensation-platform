@@ -355,6 +355,55 @@ def test_import_publish_targets_report_store_counts_and_departments(db_session):
     ]
     assert targets[0].departments == (Department.DINING,)
     assert targets[1].departments == (Department.KITCHEN,)
+    assert all(target.locked is False for target in targets)
+
+
+def test_import_publish_targets_restore_the_persisted_locked_store_range(db_session):
+    first_store = OrgUnit(code="TARGET-LOCK-S1", name="锁定目标一店", type=OrgType.STORE)
+    second_store = OrgUnit(code="TARGET-LOCK-S2", name="锁定目标二店", type=OrgType.STORE)
+    db_session.add_all([first_store, second_store])
+    db_session.flush()
+    first_employee = _employee(
+        db_session,
+        first_store,
+        emp_no="TARGET-LOCK-E1",
+        name="一店员工",
+    )
+    second_employee = _employee(
+        db_session,
+        second_store,
+        emp_no="TARGET-LOCK-E2",
+        name="二店员工",
+    )
+    imported = _confirmed_import(
+        db_session,
+        first_store,
+        [
+            _salary_row(
+                emp_no=first_employee.emp_no,
+                name=first_employee.name,
+                store_name=first_store.name,
+                department="厅面",
+                gross="5000",
+                net="4400",
+            ),
+            _salary_row(
+                emp_no=second_employee.emp_no,
+                name=second_employee.name,
+                store_name=second_store.name,
+                department="厨房",
+                gross="5100",
+                net="4500",
+            ),
+        ],
+    )
+
+    publish_import_for_review(db_session, imported, store_ids={first_store.id})
+
+    targets = publish_module.list_import_publish_targets(db_session, imported)
+    assert [(target.store_id, target.locked) for target in targets] == [
+        (first_store.id, True)
+    ]
 
 
 def test_publish_rejects_workbook_department_that_conflicts_with_employee_master(db_session):
@@ -538,6 +587,59 @@ def test_publish_retry_rejects_a_different_store_selection(db_session):
         publish_import_for_review(db_session, imported, store_ids={second_store.id})
 
     assert same.already_published is True
+
+
+def test_publish_retry_rejects_a_missing_department_confirmation(db_session):
+    store = OrgUnit(code="SCOPE-INTEGRITY-S1", name="范围完整门店", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    dining_employee = _employee(
+        db_session,
+        store,
+        emp_no="SCOPE-INTEGRITY-E1",
+        name="厅面员工",
+    )
+    kitchen_employee = _employee(
+        db_session,
+        store,
+        emp_no="SCOPE-INTEGRITY-E2",
+        name="厨房员工",
+    )
+    imported = _confirmed_import(
+        db_session,
+        store,
+        [
+            _salary_row(
+                emp_no=dining_employee.emp_no,
+                name=dining_employee.name,
+                store_name=store.name,
+                department="厅面",
+                gross="5000",
+                net="4400",
+            ),
+            _salary_row(
+                emp_no=kitchen_employee.emp_no,
+                name=kitchen_employee.name,
+                store_name=store.name,
+                department="厨房",
+                gross="5100",
+                net="4500",
+            ),
+        ],
+    )
+    publish_import_for_review(db_session, imported, store_ids={store.id})
+    missing = db_session.scalar(
+        select(BatchConfirmation).where(
+            BatchConfirmation.org_unit_id == store.id,
+            BatchConfirmation.department == Department.KITCHEN,
+        )
+    )
+    assert missing is not None
+    db_session.delete(missing)
+    db_session.flush()
+
+    with pytest.raises(ImportPublishError, match="复核范围不完整"):
+        publish_import_for_review(db_session, imported, store_ids={store.id})
     assert same.payroll_batch_id == first.payroll_batch_id
     results = list(db_session.scalars(select(PayrollResult)).all())
     assert {(row.employee_id, row.org_unit_id) for row in results} == {
