@@ -115,9 +115,9 @@ def _settings(*, root_mappings: str = "") -> Settings:
 
 
 def _expected_root_config_hash(root_mappings: tuple[tuple[int, str], ...]) -> str:
-    payload = json.dumps(
-        sorted(root_mappings), separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    payload = json.dumps(sorted(root_mappings), separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -615,9 +615,7 @@ def test_organization_sync_activates_or_updates_historical_store(
     preview = preview_response.json()
     assert preview["store_items"][0]["action"] == expected_action
     staged_store = db_session.scalars(
-        select(DingTalkOrgSyncItem).where(
-            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE
-        )
+        select(DingTalkOrgSyncItem).where(DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE)
     ).one()
     expected_persistence = {
         "ACTIVATE": (DingTalkOrgSyncAction.ACTIVATE, ("status",)),

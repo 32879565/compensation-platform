@@ -197,8 +197,7 @@ def replace_review_scopes(
         ).all()
     )
     before = [
-        {"org_unit_id": row.org_unit_id, "department": row.department.value}
-        for row in before_rows
+        {"org_unit_id": row.org_unit_id, "department": row.department.value} for row in before_rows
     ]
     session.execute(delete(UserReviewScope).where(UserReviewScope.user_id == user_id))
     rows = [
@@ -336,10 +335,7 @@ def replace_dingtalk_recipient(
     )
     employee_bindings = session.execute(
         select(Employee.id, Employee.dingtalk_user_id_hash)
-        .where(
-            (Employee.dingtalk_user_id_hash.is_not(None))
-            | (Employee.id == user.employee_id)
-        )
+        .where((Employee.dingtalk_user_id_hash.is_not(None)) | (Employee.id == user.employee_id))
         .order_by(Employee.id)
         .with_for_update()
     ).all()
@@ -348,8 +344,10 @@ def replace_dingtalk_recipient(
         for employee_id, employee_hash in employee_bindings
     ):
         raise HTTPException(status_code=409, detail="该钉钉账号已绑定其他员工")
-    if new_hash is not None and user.employee_id is None and any(
-        employee_hash == new_hash for _employee_id, employee_hash in employee_bindings
+    if (
+        new_hash is not None
+        and user.employee_id is None
+        and any(employee_hash == new_hash for _employee_id, employee_hash in employee_bindings)
     ):
         raise HTTPException(
             status_code=409, detail="该钉钉账号已绑定员工，不能用于未关联员工的账号"

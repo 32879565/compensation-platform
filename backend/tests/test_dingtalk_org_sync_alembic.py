@@ -136,8 +136,9 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
             assert item_columns["action"] == "NO"
             assert item_columns["change_fields"] == "NO"
             assert item_columns["proposed_org_type"] == "YES"
-            assert connection.scalar(
-                text("""
+            assert (
+                connection.scalar(
+                    text("""
                     SELECT count(*)
                     FROM pg_enum
                     JOIN pg_type ON pg_type.oid = pg_enum.enumtypid
@@ -146,17 +147,22 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
                       AND pg_type.typname = 'dingtalk_org_sync_item_kind'
                       AND pg_enum.enumlabel = 'REGION'
                     """),
-                {"schema": schema},
-            ) == 1
-            assert connection.scalar(
-                text("""
+                    {"schema": schema},
+                )
+                == 1
+            )
+            assert (
+                connection.scalar(
+                    text("""
                     SELECT count(*)
                     FROM information_schema.tables
                     WHERE table_schema = :schema
                       AND table_name = 'dingtalk_org_sync_notification'
                     """),
-                {"schema": schema},
-            ) == 1
+                    {"schema": schema},
+                )
+                == 1
+            )
 
             assert (
                 connection.scalar(
@@ -185,26 +191,32 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
                 _D19_REVISION
             )
-            assert connection.scalar(
-                text("""
+            assert (
+                connection.scalar(
+                    text("""
                     SELECT count(*)
                     FROM pg_type
                     JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
                     WHERE pg_namespace.nspname = :schema
                       AND pg_type.typname = ANY(:enum_names)
                     """),
-                {"schema": schema, "enum_names": list(_SYNC_ENUM_NAMES)},
-            ) == 0
-            assert connection.scalar(
-                text("""
+                    {"schema": schema, "enum_names": list(_SYNC_ENUM_NAMES)},
+                )
+                == 0
+            )
+            assert (
+                connection.scalar(
+                    text("""
                     SELECT count(*)
                     FROM pg_type
                     JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
                     WHERE pg_namespace.nspname = 'public'
                       AND pg_type.typname = ANY(:enum_names)
                     """),
-                {"enum_names": list(_SYNC_ENUM_NAMES)},
-            ) == len(_SYNC_ENUM_NAMES)
+                    {"enum_names": list(_SYNC_ENUM_NAMES)},
+                )
+                == len(_SYNC_ENUM_NAMES)
+            )
             assert (
                 connection.scalar(
                     text("SELECT dingtalk_user_id_hash FROM employee WHERE id = :id"),

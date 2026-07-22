@@ -28,9 +28,7 @@ _WORK_NOTIFICATION_URL = "https://oapi.dingtalk.com/topapi/message/corpconversat
 _DEPARTMENT_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/department/listsub"
 _DEPARTMENT_USER_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/user/list"
 _USER_DETAIL_URL = "https://oapi.dingtalk.com/topapi/v2/user/get"
-_USER_PARENT_DEPARTMENTS_URL = (
-    "https://oapi.dingtalk.com/topapi/v2/department/listparentbyuser"
-)
+_USER_PARENT_DEPARTMENTS_URL = "https://oapi.dingtalk.com/topapi/v2/department/listparentbyuser"
 _ATTENDANCE_RESULT_URL = "https://oapi.dingtalk.com/attendance/list"
 _LOGIN_USERINFO_URL = "https://oapi.dingtalk.com/topapi/v2/user/getuserinfo"
 _MAX_RESPONSE_BYTES = 64 * 1024
@@ -348,10 +346,9 @@ class DingTalkClient:
                 raise DingTalkClientError("DingTalk returned an invalid organization access")
             paths.append(path)
         parent_department_paths = tuple(sorted(paths))
-        if (
-            len(set(parent_department_paths)) != len(parent_department_paths)
-            or {path[0] for path in parent_department_paths} != set(department_ids)
-        ):
+        if len(set(parent_department_paths)) != len(parent_department_paths) or {
+            path[0] for path in parent_department_paths
+        } != set(department_ids):
             raise DingTalkClientError("DingTalk returned inconsistent organization access")
 
         return DingTalkOrganizationAccess(

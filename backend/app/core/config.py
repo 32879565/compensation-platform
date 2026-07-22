@@ -287,10 +287,7 @@ class Settings(BaseSettings):
         kitchen_titles = {title.casefold() for title in self.dingtalk_kitchen_manager_title_set}
         if dining_titles & kitchen_titles:
             raise ValueError("DingTalk manager title sets must not overlap")
-        if (
-            self.dingtalk_review_session_ip_max_attempts
-            < self.dingtalk_review_session_max_attempts
-        ):
+        if self.dingtalk_review_session_ip_max_attempts < self.dingtalk_review_session_max_attempts:
             raise ValueError("DingTalk session IP attempt limit must cover the per-review limit")
         return self
 

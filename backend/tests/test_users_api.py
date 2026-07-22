@@ -469,11 +469,7 @@ def test_manual_scope_remove_and_readd_cannot_restore_applied_sync_proof(client,
     restored = client.put(
         f"/api/users/{manager.id}/review-scopes",
         headers=headers,
-        json={
-            "scopes": [
-                {"org_unit_id": store.id, "department": Department.DINING.value}
-            ]
-        },
+        json={"scopes": [{"org_unit_id": store.id, "department": Department.DINING.value}]},
     )
     assert restored.status_code == 200, restored.text
     db_session.refresh(reviewer_item)

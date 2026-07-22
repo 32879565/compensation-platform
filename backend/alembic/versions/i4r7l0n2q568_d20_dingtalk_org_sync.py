@@ -27,9 +27,7 @@ depends_on: str | Sequence[str] | None = None
 department_enum = postgresql.ENUM(
     "DINING", "KITCHEN", "OTHER", name="department", create_type=False
 )
-org_type_enum = postgresql.ENUM(
-    "GROUP", "REGION", "STORE", name="org_type", create_type=False
-)
+org_type_enum = postgresql.ENUM("GROUP", "REGION", "STORE", name="org_type", create_type=False)
 dingtalk_delivery_status_enum = postgresql.ENUM(
     "PENDING", "SANDBOXED", "SENT", "FAILED", name="dingtalk_delivery_status", create_type=False
 )

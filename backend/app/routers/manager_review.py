@@ -177,9 +177,7 @@ def _manager_auth_unavailable(session: Session) -> HTTPException:
     )
 
 
-def _manager_session_throttled(
-    session: Session, retry_after_seconds: int | None
-) -> HTTPException:
+def _manager_session_throttled(session: Session, retry_after_seconds: int | None) -> HTTPException:
     try:
         session.commit()
     except SQLAlchemyError:
@@ -530,9 +528,7 @@ def create_manager_session(
     session: Session = Depends(get_session),
 ) -> ManagerSessionOut:
     _no_store(response)
-    source_ip = _SESSION_THROTTLE.canonical_ip(
-        request.client.host if request.client else "unknown"
-    )
+    source_ip = _SESSION_THROTTLE.canonical_ip(request.client.host if request.client else "unknown")
     try:
         decision = _SESSION_THROTTLE.consume(
             session,

@@ -519,16 +519,12 @@ def test_review_authorization_lock_is_a_safe_sqlite_noop():
 
 
 @pytest.mark.parametrize("table_name", ["user_review_scope", "employee", "org_unit"])
-def test_review_authorization_lock_blocks_concurrent_authorization_writers(
-    pg_engine, table_name
-):
+def test_review_authorization_lock_blocks_concurrent_authorization_writers(pg_engine, table_name):
     with Session(pg_engine) as dispatch_session, Session(pg_engine) as writer_session:
         dingtalk_service._lock_review_authorization_tables(dispatch_session)
 
         with pytest.raises(OperationalError):
-            writer_session.execute(
-                text(f"LOCK TABLE {table_name} IN ROW EXCLUSIVE MODE NOWAIT")
-            )
+            writer_session.execute(text(f"LOCK TABLE {table_name} IN ROW EXCLUSIVE MODE NOWAIT"))
         writer_session.rollback()
 
         dispatch_session.rollback()

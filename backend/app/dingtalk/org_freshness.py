@@ -249,11 +249,15 @@ def require_current_organization_reviewer(
     authorization-table locks for the remainder of the salary operation.
     """
 
-    if not access.user.active or manager_department_for_title(
-        access.user.title,
-        dining_titles=dining_manager_titles,
-        kitchen_titles=kitchen_manager_titles,
-    ) != department:
+    if (
+        not access.user.active
+        or manager_department_for_title(
+            access.user.title,
+            dining_titles=dining_manager_titles,
+            kitchen_titles=kitchen_manager_titles,
+        )
+        != department
+    ):
         raise DingTalkOrganizationFreshnessError(
             "The DingTalk manager assignment is no longer current"
         )
@@ -274,9 +278,7 @@ def require_current_organization_reviewer(
         .execution_options(populate_existing=True)
     ).one_or_none()
     store = session.scalars(
-        select(OrgUnit)
-        .where(OrgUnit.id == org_unit_id)
-        .execution_options(populate_existing=True)
+        select(OrgUnit).where(OrgUnit.id == org_unit_id).execution_options(populate_existing=True)
     ).one_or_none()
     if binding is None or store is None:
         raise DingTalkOrganizationFreshnessError(
@@ -312,9 +314,7 @@ def require_current_organization_reviewer(
         ).all()
     )
     if scope_user_ids != {user_id}:
-        raise DingTalkOrganizationFreshnessError(
-            "The local manager scope is no longer current"
-        )
+        raise DingTalkOrganizationFreshnessError("The local manager scope is no longer current")
 
     all_store_department_ids = set(
         session.scalars(
@@ -328,10 +328,7 @@ def require_current_organization_reviewer(
     current_store_ids = {
         store_department_id
         for store_department_id in all_store_department_ids
-        if any(
-            store_department_id in parent_path
-            for parent_path in access.parent_department_paths
-        )
+        if any(store_department_id in parent_path for parent_path in access.parent_department_paths)
     }
     if current_store_ids != {store.dingtalk_dept_id}:
         raise DingTalkOrganizationFreshnessError(
@@ -393,14 +390,10 @@ def require_current_organization_reviewer(
             employee_id=employee.id,
         )
     except ValueError as exc:
-        raise DingTalkOrganizationFreshnessError(
-            "The manager identity proof is invalid"
-        ) from exc
+        raise DingTalkOrganizationFreshnessError("The manager identity proof is invalid") from exc
     if not hmac.compare_digest(
         expected_proof,
         reviewer_item.applied_identity_proof or "",
     ):
-        raise DingTalkOrganizationFreshnessError(
-            "The manager identity proof no longer matches"
-        )
+        raise DingTalkOrganizationFreshnessError("The manager identity proof no longer matches")
     return batch.id

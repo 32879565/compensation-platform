@@ -353,9 +353,7 @@ def test_organization_access_rejects_inconsistent_membership_reads(monkeypatch):
         return _Response(
             {
                 "errcode": 0,
-                "result": {
-                    "parent_list": [{"parent_dept_id_list": [99, 20, 1]}]
-                },
+                "result": {"parent_list": [{"parent_dept_id_list": [99, 20, 1]}]},
             }
         )
 
