@@ -68,32 +68,24 @@ const basePreview: DingTalkOrganizationPreview = {
     {
       id: 100,
       kind: 'REGION',
-      remote_department_id: 8001,
-      remote_department_name: '广州区域',
-      remote_department_path: '集团 / 广州区域',
       action: 'CREATE',
-      change_fields: ['name', 'dingtalk_dept_id'],
-      match_method: 'REMOTE_ONLY',
-      proposed_org_unit_id: null,
-      proposed_org_unit_name: '广州区域',
-      proposed_parent_org_unit_id: 1,
-      proposed_parent_org_unit_name: '集团',
+      change_fields: ['name'],
+      source_path: '集团 / 广州区域',
+      local_target_path: '集团 / 广州区域',
+      explanation: '创建本地组织',
       status: 'READY',
       conflict_code: null,
-    },
+      remote_department_id: 8001,
+      match_method: 'CANARY_MATCH_METHOD',
+    } as DingTalkOrganizationPreview['region_items'][number],
     {
       id: 101,
       kind: 'REGION',
-      remote_department_id: 8002,
-      remote_department_name: '佛山区域',
-      remote_department_path: '集团 / 华南 / 佛山区域',
       action: 'UPDATE',
       change_fields: ['parent_id'],
-      match_method: 'STABLE_DEPARTMENT_ID',
-      proposed_org_unit_id: 2,
-      proposed_org_unit_name: '佛山区域',
-      proposed_parent_org_unit_id: 10,
-      proposed_parent_org_unit_name: '华南大区',
+      source_path: '集团 / 华南 / 佛山区域',
+      local_target_path: '集团 / 华南大区 / 佛山区域',
+      explanation: '更新本地组织',
       status: 'READY',
       conflict_code: null,
     },
@@ -102,16 +94,11 @@ const basePreview: DingTalkOrganizationPreview = {
     {
       id: 110,
       kind: 'STORE',
-      remote_department_id: null,
-      remote_department_name: '旧城店',
-      remote_department_path: '本地 / 旧城店',
       action: 'DEACTIVATE',
       change_fields: [],
-      match_method: 'LOCAL_STORE_NOT_VISIBLE',
-      proposed_org_unit_id: 11,
-      proposed_org_unit_name: '旧城店',
-      proposed_parent_org_unit_id: 2,
-      proposed_parent_org_unit_name: '佛山区域',
+      source_path: '集团 / 佛山区域 / 旧城店',
+      local_target_path: '集团 / 佛山区域 / 旧城店',
+      explanation: '停用本地组织',
       status: 'READY',
       conflict_code: null,
     },
@@ -119,31 +106,24 @@ const basePreview: DingTalkOrganizationPreview = {
   reviewer_items: [
     {
       id: 201,
-      remote_department_id: 9001,
-      remote_department_name: '天河店',
-      remote_department_path: '集团 / 广州区域 / 天河店',
       department: 'DINING',
       action: 'ASSIGN_SCOPE',
-      dingtalk_name: '店长甲',
-      proposed_employee_id: 31,
-      proposed_employee_name: '店长甲（M001）',
-      match_method: 'JOB_NUMBER',
-      current_reviewer_name: null,
+      source_path: '集团 / 广州区域 / 天河店',
+      local_target_path: '集团 / 广州区域 / 天河店',
+      explanation: '分配负责人复核权限',
       status: 'READY',
       conflict_code: null,
-    },
+      dingtalk_name: 'CANARY_钉钉负责人姓名',
+      proposed_employee_name: 'CANARY_本地员工姓名',
+      current_reviewer_name: 'CANARY_当前负责人姓名',
+    } as DingTalkOrganizationPreview['reviewer_items'][number],
     {
       id: 202,
-      remote_department_id: 9001,
-      remote_department_name: '天河店',
-      remote_department_path: '集团 / 广州区域 / 天河店',
       department: 'KITCHEN',
       action: 'REMOVE_SCOPE',
-      dingtalk_name: null,
-      proposed_employee_id: null,
-      proposed_employee_name: null,
-      match_method: 'CLEAR_MISSING_MANAGER',
-      current_reviewer_name: '旧厨房经理',
+      source_path: '集团 / 广州区域 / 天河店',
+      local_target_path: '集团 / 广州区域 / 天河店',
+      explanation: '撤销当前负责人复核权限',
       status: 'READY',
       conflict_code: null,
     },
@@ -268,15 +248,22 @@ describe('OrgTreePage DingTalk organization sync', () => {
     expect(within(regions).getByText('创建新区域')).toBeTruthy()
     expect(within(regions).getByText('更新区域')).toBeTruthy()
     expect(within(regions).getAllByText('上级组织').length).toBeGreaterThan(0)
-    expect(within(regions).getByText('华南大区（ID 10）')).toBeTruthy()
+    expect(within(regions).getByText('集团 / 华南大区 / 佛山区域')).toBeTruthy()
 
     const stores = within(dialog).getByRole('region', { name: '门店变更（1）' })
     expect(within(stores).getByText('停用门店')).toBeTruthy()
-    expect(within(stores).getByText('本地 / 旧城店')).toBeTruthy()
+    expect(within(stores).getAllByText('集团 / 佛山区域 / 旧城店')).toHaveLength(2)
 
     const removals = within(dialog).getByRole('region', { name: '负责人撤销（1）' })
     expect(within(removals).getByText('撤销负责人权限')).toBeTruthy()
-    expect(within(removals).getByText('将撤销旧负责人：旧厨房经理')).toBeTruthy()
+    expect(within(removals).getByText('撤销当前负责人复核权限')).toBeTruthy()
+    expect(within(dialog).queryByText('钉钉完整路径')).toBeNull()
+    expect(within(dialog).queryByText('匹配方式')).toBeNull()
+    expect(within(dialog).queryByText('当前负责人')).toBeNull()
+    expect(within(dialog).queryByText('钉钉负责人')).toBeNull()
+    expect(within(dialog).queryByText('拟匹配本地员工')).toBeNull()
+    expect(dialog.textContent).not.toContain('CANARY_')
+    expect(dialog.textContent).not.toContain('8001')
     expect((within(dialog).getByRole('button', { name: '确认应用变更' }) as HTMLButtonElement).disabled).toBe(false)
   })
 

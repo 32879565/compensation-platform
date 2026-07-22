@@ -19,7 +19,7 @@ from fastapi import (
     Response,
     status,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -39,7 +39,9 @@ from app.dingtalk.client import (
 )
 from app.dingtalk.org_sync import (
     DingTalkOrganizationSyncError,
+    OrganizationNodePreviewItem,
     OrganizationPreview,
+    ReviewerPreviewItem,
     apply_organization_sync,
     get_applied_organization_sync_result,
     get_latest_organization_preview,
@@ -57,8 +59,10 @@ from app.models.dingtalk import (
     DingTalkAttendanceSnapshot,
     DingTalkAttendanceSync,
     DingTalkAttendanceSyncStatus,
+    DingTalkOrgSyncItem,
 )
 from app.models.employee import Employee, EmployeeStatus
+from app.models.org import OrgUnit
 
 router = APIRouter(prefix="/api/dingtalk/sync", tags=["dingtalk"])
 _PREVIEW_ROW_LIMIT = 200
@@ -183,39 +187,35 @@ class DirectoryApplyOut(BaseModel):
 
 
 class OrganizationNodeItemOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: int
     kind: Literal["REGION", "STORE"]
-    remote_department_id: int | None
-    remote_department_name: str
-    remote_department_path: str
     action: Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE", "NO_CHANGE"]
-    change_fields: list[Literal["name", "parent_id", "dingtalk_dept_id"]]
-    match_method: str
-    proposed_org_unit_id: int | None
-    proposed_org_unit_name: str | None
-    proposed_parent_org_unit_id: int | None
-    proposed_parent_org_unit_name: str | None
+    change_fields: list[Literal["name", "parent_id"]]
+    source_path: str
+    local_target_path: str | None
+    explanation: str
     status: Literal["READY", "CONFLICT", "APPLIED", "IGNORED"]
     conflict_code: str | None
 
 
 class OrganizationReviewerItemOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: int
-    remote_department_id: int | None
-    remote_department_name: str
-    remote_department_path: str
     department: Literal["DINING", "KITCHEN"]
     action: Literal["ASSIGN", "REMOVE", "CONFLICT"]
-    match_method: str
-    dingtalk_name: str | None
-    current_reviewer_name: str | None
-    proposed_employee_id: int | None
-    proposed_employee_name: str | None
+    source_path: str
+    local_target_path: str | None
+    explanation: str
     status: Literal["READY", "CONFLICT", "APPLIED", "IGNORED"]
     conflict_code: str | None
 
 
 class OrganizationPreviewOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     batch_id: str
     trigger: Literal["MANUAL", "SCHEDULED"]
     created_at: datetime
@@ -365,8 +365,107 @@ def _directory_preview(
     )
 
 
-def _organization_preview_response(preview: OrganizationPreview) -> OrganizationPreviewOut:
+_NODE_EXPLANATION = {
+    "LINK": "关联现有本地组织",
+    "CREATE": "创建本地组织",
+    "ACTIVATE": "启用本地组织",
+    "UPDATE": "更新本地组织",
+    "DEACTIVATE": "停用本地组织",
+    "NO_CHANGE": "无需变更",
+}
+_REVIEWER_EXPLANATION = {
+    "ASSIGN": "分配负责人复核权限",
+    "REMOVE": "撤销当前负责人复核权限",
+    "CONFLICT": "负责人匹配存在冲突",
+}
+_PUBLIC_ORGANIZATION_CHANGE_FIELDS = frozenset({"name", "parent_id"})
+
+
+def _active_organization_paths(session: Session) -> dict[int, str]:
+    """Build local-only display paths without exposing database identifiers."""
+
+    rows = session.execute(
+        select(OrgUnit.id, OrgUnit.parent_id, OrgUnit.name).where(
+            OrgUnit.is_deleted.is_(False),
+            OrgUnit.status == "ACTIVE",
+        )
+    ).all()
+    nodes = {row.id: (row.parent_id, row.name) for row in rows}
+    paths: dict[int, str] = {}
+
+    def build(org_unit_id: int, ancestors: frozenset[int]) -> str | None:
+        if org_unit_id in paths:
+            return paths[org_unit_id]
+        if org_unit_id in ancestors:
+            return None
+        node = nodes.get(org_unit_id)
+        if node is None:
+            return None
+        parent_id, name = node
+        if parent_id is None:
+            path = name
+        else:
+            parent_path = build(parent_id, ancestors | {org_unit_id})
+            if parent_path is None:
+                return None
+            path = f"{parent_path} / {name}"
+        paths[org_unit_id] = path
+        return path
+
+    for org_unit_id in nodes:
+        build(org_unit_id, frozenset())
+    return paths
+
+
+def _node_local_target_path(
+    item: OrganizationNodePreviewItem,
+    local_paths: dict[int, str],
+) -> str | None:
+    if item.proposed_org_unit_id is not None:
+        return local_paths.get(item.proposed_org_unit_id)
+    if item.action.value != "CREATE" or item.proposed_org_unit_name is None:
+        return None
+    parent_path = (
+        local_paths.get(item.proposed_parent_org_unit_id)
+        if item.proposed_parent_org_unit_id is not None
+        else None
+    )
+    if parent_path is None:
+        return None
+    return f"{parent_path} / {item.proposed_org_unit_name}"
+
+
+def _reviewer_local_target_path(
+    item: ReviewerPreviewItem,
+    local_paths: dict[int, str],
+    proposed_org_unit_ids: dict[int, int | None],
+) -> str | None:
+    proposed_org_unit_id = proposed_org_unit_ids.get(item.id)
+    if proposed_org_unit_id is None:
+        return None
+    return local_paths.get(proposed_org_unit_id)
+
+
+def _organization_preview_response(
+    session: Session,
+    preview: OrganizationPreview,
+) -> OrganizationPreviewOut:
     """Map only the explicitly approved preview fields across the HTTP boundary."""
+
+    local_paths = _active_organization_paths(session)
+    reviewer_ids = [item.id for item in preview.reviewer_items]
+    reviewer_org_unit_ids: dict[int, int | None] = (
+        {
+            item_id: org_unit_id
+            for item_id, org_unit_id in session.execute(
+                select(DingTalkOrgSyncItem.id, DingTalkOrgSyncItem.proposed_org_unit_id).where(
+                    DingTalkOrgSyncItem.id.in_(reviewer_ids)
+                )
+            ).all()
+        }
+        if reviewer_ids
+        else {}
+    )
 
     return OrganizationPreviewOut(
         batch_id=preview.batch_id,
@@ -389,22 +488,21 @@ def _organization_preview_response(preview: OrganizationPreview) -> Organization
             OrganizationNodeItemOut(
                 id=item.id,
                 kind=cast(Literal["REGION", "STORE"], item.kind.value),
-                remote_department_id=item.remote_department_id,
-                remote_department_name=item.remote_department_name,
-                remote_department_path=item.remote_department_path,
                 action=cast(
                     Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE", "NO_CHANGE"],
                     item.action.value,
                 ),
                 change_fields=cast(
-                    list[Literal["name", "parent_id", "dingtalk_dept_id"]],
-                    list(item.change_fields),
+                    list[Literal["name", "parent_id"]],
+                    [
+                        field
+                        for field in item.change_fields
+                        if field in _PUBLIC_ORGANIZATION_CHANGE_FIELDS
+                    ],
                 ),
-                match_method=item.match_method,
-                proposed_org_unit_id=item.proposed_org_unit_id,
-                proposed_org_unit_name=item.proposed_org_unit_name,
-                proposed_parent_org_unit_id=item.proposed_parent_org_unit_id,
-                proposed_parent_org_unit_name=item.proposed_parent_org_unit_name,
+                source_path=item.remote_department_path,
+                local_target_path=_node_local_target_path(item, local_paths),
+                explanation=_NODE_EXPLANATION[item.action.value],
                 status=cast(Literal["READY", "CONFLICT", "APPLIED", "IGNORED"], item.status.value),
                 conflict_code=item.conflict_code,
             )
@@ -414,22 +512,21 @@ def _organization_preview_response(preview: OrganizationPreview) -> Organization
             OrganizationNodeItemOut(
                 id=item.id,
                 kind=cast(Literal["REGION", "STORE"], item.kind.value),
-                remote_department_id=item.remote_department_id,
-                remote_department_name=item.remote_department_name,
-                remote_department_path=item.remote_department_path,
                 action=cast(
                     Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE", "NO_CHANGE"],
                     item.action.value,
                 ),
                 change_fields=cast(
-                    list[Literal["name", "parent_id", "dingtalk_dept_id"]],
-                    list(item.change_fields),
+                    list[Literal["name", "parent_id"]],
+                    [
+                        field
+                        for field in item.change_fields
+                        if field in _PUBLIC_ORGANIZATION_CHANGE_FIELDS
+                    ],
                 ),
-                match_method=item.match_method,
-                proposed_org_unit_id=item.proposed_org_unit_id,
-                proposed_org_unit_name=item.proposed_org_unit_name,
-                proposed_parent_org_unit_id=item.proposed_parent_org_unit_id,
-                proposed_parent_org_unit_name=item.proposed_parent_org_unit_name,
+                source_path=item.remote_department_path,
+                local_target_path=_node_local_target_path(item, local_paths),
+                explanation=_NODE_EXPLANATION[item.action.value],
                 status=cast(Literal["READY", "CONFLICT", "APPLIED", "IGNORED"], item.status.value),
                 conflict_code=item.conflict_code,
             )
@@ -438,16 +535,15 @@ def _organization_preview_response(preview: OrganizationPreview) -> Organization
         reviewer_items=[
             OrganizationReviewerItemOut(
                 id=item.id,
-                remote_department_id=item.remote_department_id,
-                remote_department_name=item.remote_department_name,
-                remote_department_path=item.remote_department_path,
                 department=cast(Literal["DINING", "KITCHEN"], item.department.value),
                 action=cast(Literal["ASSIGN", "REMOVE", "CONFLICT"], item.action),
-                match_method=item.match_method,
-                dingtalk_name=item.dingtalk_name,
-                current_reviewer_name=item.current_reviewer_name,
-                proposed_employee_id=item.proposed_employee_id,
-                proposed_employee_name=item.proposed_employee_name,
+                source_path=item.remote_department_path,
+                local_target_path=_reviewer_local_target_path(
+                    item,
+                    local_paths,
+                    reviewer_org_unit_ids,
+                ),
+                explanation=_REVIEWER_EXPLANATION[item.action],
                 status=cast(Literal["READY", "CONFLICT", "APPLIED", "IGNORED"], item.status.value),
                 conflict_code=item.conflict_code,
             )
@@ -725,7 +821,7 @@ def preview_dingtalk_organization(
         raise _organization_provider_http_error(exc) from None
     except DingTalkOrganizationSyncError as exc:
         raise _organization_sync_http_error(exc) from None
-    return _organization_preview_response(preview)
+    return _organization_preview_response(session, preview)
 
 
 @router.get("/organization/latest", response_model=OrganizationPreviewOut)
@@ -740,7 +836,7 @@ def get_latest_dingtalk_organization(
         raise _organization_sync_http_error(
             DingTalkOrganizationSyncError("ORG_PREVIEW_NOT_FOUND", "No organization preview")
         )
-    return _organization_preview_response(preview)
+    return _organization_preview_response(session, preview)
 
 
 @router.post(

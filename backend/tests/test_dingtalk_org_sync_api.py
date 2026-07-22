@@ -206,6 +206,90 @@ def _seed_store_and_managers(session) -> OrgUnit:
     return store
 
 
+_PUBLIC_NODE_KEYS = {
+    "id",
+    "kind",
+    "action",
+    "change_fields",
+    "source_path",
+    "local_target_path",
+    "explanation",
+    "status",
+    "conflict_code",
+}
+_PUBLIC_REVIEWER_KEYS = {
+    "id",
+    "department",
+    "action",
+    "source_path",
+    "local_target_path",
+    "explanation",
+    "status",
+    "conflict_code",
+}
+_FORBIDDEN_PREVIEW_FIELDS = {
+    "remote_department_id",
+    "remote_department_name",
+    "remote_department_path",
+    "match_method",
+    "proposed_org_unit_id",
+    "proposed_org_unit_name",
+    "proposed_parent_org_unit_id",
+    "proposed_parent_org_unit_name",
+    "dingtalk_name",
+    "current_reviewer_name",
+    "proposed_employee_id",
+    "proposed_employee_name",
+}
+
+
+def _assert_public_preview_contract(response) -> None:
+    body = response.json()
+    for item in (*body["region_items"], *body["store_items"]):
+        assert set(item) == _PUBLIC_NODE_KEYS
+        assert set(item["change_fields"]) <= {"name", "parent_id"}
+    for item in body["reviewer_items"]:
+        assert set(item) == _PUBLIC_REVIEWER_KEYS
+    for field in _FORBIDDEN_PREVIEW_FIELDS:
+        assert f'"{field}"' not in response.text
+
+
+def _public_item_for_staged(preview: dict, staged: DingTalkOrgSyncItem) -> dict:
+    collection = {
+        DingTalkOrgSyncItemKind.REGION: "region_items",
+        DingTalkOrgSyncItemKind.STORE: "store_items",
+        DingTalkOrgSyncItemKind.REVIEWER: "reviewer_items",
+    }[staged.kind]
+    return next(item for item in preview[collection] if item["id"] == staged.id)
+
+
+def _public_item_by_remote_department(
+    session,
+    preview: dict,
+    *,
+    kind: DingTalkOrgSyncItemKind,
+    remote_department_id: int | None,
+    department: Department | None = None,
+) -> dict:
+    batch = session.scalars(
+        select(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.public_id == preview["batch_id"])
+    ).one()
+    statement = select(DingTalkOrgSyncItem).where(
+        DingTalkOrgSyncItem.batch_id == batch.id,
+        DingTalkOrgSyncItem.kind == kind,
+    )
+    if remote_department_id is None:
+        statement = statement.where(DingTalkOrgSyncItem.remote_department_id.is_(None))
+    else:
+        statement = statement.where(
+            DingTalkOrgSyncItem.remote_department_id == remote_department_id
+        )
+    if department is not None:
+        statement = statement.where(DingTalkOrgSyncItem.department == department)
+    staged = session.scalars(statement).one()
+    return _public_item_for_staged(preview, staged)
+
+
 def test_organization_preview_stages_safe_store_and_reviewer_changes_without_applying(
     client, db_session
 ):
@@ -239,10 +323,19 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
     }
     assert {item["action"] for item in body["reviewer_items"]} == {"ASSIGN"}
     assert body["store_items"][0]["action"] == "LINK"
-    assert body["store_items"][0]["match_method"] == "EXACT_RELATIVE_PATH"
+    _assert_public_preview_contract(response)
+    assert set(body["store_items"][0]) == _PUBLIC_NODE_KEYS
+    assert body["store_items"][0]["change_fields"] == []
+    assert body["store_items"][0]["local_target_path"] == "集团 / 天河店"
+    assert body["store_items"][0]["explanation"] == "关联现有本地组织"
+    assert set(body["reviewer_items"][0]) == _PUBLIC_REVIEWER_KEYS
+    assert body["reviewer_items"][0]["local_target_path"] == "集团 / 天河店"
+    assert body["reviewer_items"][0]["explanation"] == "分配负责人复核权限"
     assert "provider-manager" not in response.text
     assert "provider-kitchen" not in response.text
     assert "remote_user_id" not in response.text
+    assert "店长甲" not in response.text
+    assert "厨管乙" not in response.text
 
     db_session.expire_all()
     assert db_session.get(OrgUnit, store.id).dingtalk_dept_id is None
@@ -285,7 +378,13 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
 def test_organization_latest_returns_safe_cached_preview_without_provider_read(client, db_session):
     _seed_store_and_managers(db_session)
     admin = _group_hr(db_session, "org-sync-latest")
-    fake = _FakeOrganizationClient()
+    fake = _FakeOrganizationClient(
+        departments=(
+            DingTalkDepartment(10, 1, "潮发运营中心"),
+            DingTalkDepartment(110, 10, "广州一区"),
+            DingTalkDepartment(101, 110, "天河店"),
+        )
+    )
     from app.main import app
 
     app.dependency_overrides[get_settings] = _settings
@@ -294,6 +393,22 @@ def test_organization_latest_returns_safe_cached_preview_without_provider_read(c
 
     preview = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
     assert preview.status_code == 200, preview.text
+    preview_batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(
+            DingTalkOrgSyncBatch.public_id == preview.json()["batch_id"]
+        )
+    ).one()
+    staged_store = db_session.scalars(
+        select(DingTalkOrgSyncItem)
+        .where(
+            DingTalkOrgSyncItem.batch_id == preview_batch.id,
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+        )
+        .order_by(DingTalkOrgSyncItem.id)
+    ).first()
+    assert staged_store is not None
+    staged_store.change_fields = ["name", "dingtalk_dept_id", "provider_secret"]
+    db_session.commit()
     provider_calls_before_latest = fake.calls
 
     latest = client.get("/api/dingtalk/sync/organization/latest", headers=headers)
@@ -301,14 +416,21 @@ def test_organization_latest_returns_safe_cached_preview_without_provider_read(c
     assert latest.status_code == 200, latest.text
     assert latest.headers["cache-control"] == "no-store"
     body = latest.json()
+    _assert_public_preview_contract(latest)
     assert body["batch_id"] == preview.json()["batch_id"]
     assert body["trigger"] in {"MANUAL", "SCHEDULED"}
-    assert body["region_items"] == []
-    assert body["store_items"][0]["kind"] == "STORE"
-    assert body["store_items"][0]["change_fields"] == ["dingtalk_dept_id"]
+    assert body["region_items"]
+    assert body["store_items"]
+    assert body["reviewer_items"]
+    assert {item["kind"] for item in body["region_items"]} == {"REGION"}
+    assert {item["kind"] for item in body["store_items"]} == {"STORE"}
+    assert _public_item_for_staged(body, staged_store)["change_fields"] == ["name"]
+    assert staged_store.change_fields == ["name", "dingtalk_dept_id", "provider_secret"]
     assert "remote_user_id_hash" not in latest.text
     assert "snapshot_hash" not in latest.text
     assert "local_baseline_hash" not in latest.text
+    assert "店长甲" not in latest.text
+    assert "厨管乙" not in latest.text
     assert fake.calls == provider_calls_before_latest
 
 
@@ -551,12 +673,9 @@ def test_organization_apply_clears_departed_manager_scope_fail_closed(client, db
     assert preview["ready_reviewers"] == 2
     assert preview["reviewer_conflicts"] == 0
     assert preview["warnings"] == 2
-    assert {(item["action"], item["match_method"]) for item in preview["reviewer_items"]} == {
-        ("REMOVE", "REMOVE_MISSING_MANAGER")
-    }
-    assert {item["current_reviewer_name"] for item in preview["reviewer_items"]} == {
-        manager.username for manager in managers
-    }
+    assert {item["action"] for item in preview["reviewer_items"]} == {"REMOVE"}
+    assert {item["explanation"] for item in preview["reviewer_items"]} == {"撤销当前负责人复核权限"}
+    assert all(manager.username not in preview_response.text for manager in managers)
     staged_reviewers = db_session.scalars(
         select(DingTalkOrgSyncItem).where(
             DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER
@@ -566,6 +685,7 @@ def test_organization_apply_clears_departed_manager_scope_fail_closed(client, db
         (item.action, tuple(item.change_fields), item.proposed_org_type)
         for item in staged_reviewers
     } == {(DingTalkOrgSyncAction.REMOVE_SCOPE, ("reviewer_scope",), None)}
+    assert {item.match_method for item in staged_reviewers} == {"REMOVE_MISSING_MANAGER"}
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -836,13 +956,25 @@ def test_organization_sync_conflicts_when_two_departments_target_same_local_stor
 
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
-    conflicting_stores = [
-        item for item in preview["store_items"] if item["remote_department_id"] in {101, 102}
-    ]
+    stores_by_remote_id = {
+        remote_id: _public_item_by_remote_department(
+            db_session,
+            preview,
+            kind=DingTalkOrgSyncItemKind.STORE,
+            remote_department_id=remote_id,
+        )
+        for remote_id in (101, 102)
+    }
+    conflicting_stores = list(stores_by_remote_id.values())
     assert len(conflicting_stores) == 2
     assert {item["action"] for item in conflicting_stores} == {"CREATE", "UPDATE"}
-    assert {item["proposed_org_unit_id"] for item in conflicting_stores} == {store.id, None}
-    stores_by_remote_id = {item["remote_department_id"]: item for item in conflicting_stores}
+    staged_stores = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.remote_department_id.in_((101, 102)),
+        )
+    ).all()
+    assert {item.proposed_org_unit_id for item in staged_stores} == {store.id, None}
     assert stores_by_remote_id[101]["status"] == "READY"
     assert stores_by_remote_id[101]["conflict_code"] is None
     assert stores_by_remote_id[102]["status"] == "CONFLICT"
@@ -889,8 +1021,11 @@ def test_organization_apply_rejects_same_name_store_created_after_create_preview
 
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
-    create_item = next(
-        item for item in preview["store_items"] if item["remote_department_id"] == 102
+    create_item = _public_item_by_remote_department(
+        db_session,
+        preview,
+        kind=DingTalkOrgSyncItemKind.STORE,
+        remote_department_id=102,
     )
     assert create_item["action"] == "CREATE"
     assert create_item["status"] == "READY"
@@ -984,8 +1119,8 @@ def test_organization_sync_creates_remote_only_store_and_assigns_both_reviewers(
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
     create_item = next(item for item in preview["store_items"] if item["action"] == "CREATE")
-    assert create_item["remote_department_name"] == "珠江新城店"
-    assert create_item["proposed_parent_org_unit_id"] == group_id
+    assert create_item["source_path"] == "珠江新城店"
+    assert create_item["local_target_path"] == "集团 / 珠江新城店"
     assert preview["reviewer_conflicts"] == 0
     staged_create = db_session.scalars(
         select(DingTalkOrgSyncItem).where(
@@ -996,6 +1131,7 @@ def test_organization_sync_creates_remote_only_store_and_assigns_both_reviewers(
     assert staged_create.action == DingTalkOrgSyncAction.CREATE
     assert staged_create.change_fields == []
     assert staged_create.proposed_org_type == OrgType.STORE
+    assert staged_create.proposed_parent_org_unit_id == group_id
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -1116,14 +1252,10 @@ def test_organization_sync_surfaces_local_only_store_and_clears_both_scopes(clie
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
     coverage = next(item for item in preview["store_items"] if item["action"] == "DEACTIVATE")
-    assert coverage["remote_department_id"] is None
-    assert coverage["proposed_org_unit_id"] == hidden_store.id
-    assert coverage["match_method"] == "MISSING_IN_DINGTALK"
-    clears = [
-        item
-        for item in preview["reviewer_items"]
-        if item["match_method"] == "CLEAR_UNCOVERED_STORE"
-    ]
+    assert coverage["source_path"] == "越秀店"
+    assert coverage["local_target_path"] == "集团 / 越秀店"
+    assert coverage["explanation"] == "停用本地组织"
+    clears = [item for item in preview["reviewer_items"] if item["action"] == "REMOVE"]
     assert len(clears) == 2
     assert {item["action"] for item in clears} == {"REMOVE"}
     assert preview["reviewer_conflicts"] == 0
@@ -1136,6 +1268,10 @@ def test_organization_sync_surfaces_local_only_store_and_clears_both_scopes(clie
             DingTalkOrgSyncItem.proposed_org_unit_id == hidden_store.id,
         )
     ).all()
+    assert {item.match_method for item in staged_hidden_items} == {
+        "MISSING_IN_DINGTALK",
+        "CLEAR_UNCOVERED_STORE",
+    }
     assert {
         (item.kind, item.action, tuple(item.change_fields), item.proposed_org_type)
         for item in staged_hidden_items
@@ -1231,7 +1367,7 @@ def test_organization_deactivation_is_child_first_from_locked_local_graph(client
         item for item in preview["region_items"] if item["action"] == "DEACTIVATE"
     ]
     assert len(local_region_items) == len(regions)
-    assert len({len(item["remote_department_path"]) for item in local_region_items}) < len(regions)
+    assert len({len(item["source_path"]) for item in local_region_items}) < len(regions)
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply", headers=headers
@@ -1288,7 +1424,6 @@ def test_reviewer_sync_never_uses_unique_name(client, db_session):
     preview = preview_response.json()
     weak = next(item for item in preview["reviewer_items"] if item["department"] == "DINING")
     assert weak["action"] == "CONFLICT"
-    assert weak["match_method"] == "JOB_NUMBER"
     assert weak["conflict_code"] == "ORG_EMPLOYEE_MATCH_FAILED"
     assert "weak-provider-manager" not in preview_response.text
     staged_weak = db_session.scalars(
@@ -1300,6 +1435,7 @@ def test_reviewer_sync_never_uses_unique_name(client, db_session):
     assert staged_weak.action == DingTalkOrgSyncAction.NO_CHANGE
     assert staged_weak.change_fields == []
     assert staged_weak.proposed_org_type is None
+    assert staged_weak.match_method == "JOB_NUMBER"
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -1330,7 +1466,13 @@ def test_reviewer_sync_uses_unique_exact_job_number(client, db_session):
     item = next(row for row in response.json()["reviewer_items"] if row["department"] == "DINING")
     assert item["status"] == "READY"
     assert item["action"] == "ASSIGN"
-    assert item["match_method"] == "JOB_NUMBER"
+    staged = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
+            DingTalkOrgSyncItem.department == Department.DINING,
+        )
+    ).one()
+    assert staged.match_method == "JOB_NUMBER"
 
 
 def test_reviewer_sync_does_not_overwrite_another_provider_binding(client, db_session):
@@ -1356,8 +1498,14 @@ def test_reviewer_sync_does_not_overwrite_another_provider_binding(client, db_se
     item = next(row for row in preview["reviewer_items"] if row["department"] == "DINING")
     assert item["status"] == "CONFLICT"
     assert item["action"] == "CONFLICT"
-    assert item["match_method"] == "JOB_NUMBER"
     assert item["conflict_code"] == "ORG_IDENTITY_CONFLICT"
+    staged = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
+            DingTalkOrgSyncItem.department == Department.DINING,
+        )
+    ).one()
+    assert staged.match_method == "JOB_NUMBER"
 
     apply_response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -1579,7 +1727,20 @@ def test_applied_reviewer_proof_allows_stable_match_after_job_number_changes(cli
 
     first = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
     assert first.status_code == 200, first.text
-    assert {item["match_method"] for item in first.json()["reviewer_items"]} == {"JOB_NUMBER"}
+    first_batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(
+            DingTalkOrgSyncBatch.public_id == first.json()["batch_id"]
+        )
+    ).one()
+    assert {
+        item.match_method
+        for item in db_session.scalars(
+            select(DingTalkOrgSyncItem).where(
+                DingTalkOrgSyncItem.batch_id == first_batch.id,
+                DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
+            )
+        ).all()
+    } == {"JOB_NUMBER"}
     applied = client.post(
         f"/api/dingtalk/sync/organization/{first.json()['batch_id']}/apply",
         headers=headers,
@@ -1630,7 +1791,20 @@ def test_applied_reviewer_proof_allows_stable_match_after_job_number_changes(cli
 
     second = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
     assert second.status_code == 200, second.text
-    assert {item["match_method"] for item in second.json()["reviewer_items"]} == {"STABLE_ID"}
+    second_batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(
+            DingTalkOrgSyncBatch.public_id == second.json()["batch_id"]
+        )
+    ).one()
+    assert {
+        item.match_method
+        for item in db_session.scalars(
+            select(DingTalkOrgSyncItem).where(
+                DingTalkOrgSyncItem.batch_id == second_batch.id,
+                DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
+            )
+        ).all()
+    } == {"STABLE_ID"}
 
     tampered_item.applied_identity_proof = None
     db_session.commit()
@@ -1856,25 +2030,34 @@ def test_organization_preview_stages_region_create_and_authority_deactivate(clie
         "kind": "REGION",
         "action": "CREATE",
         "change_fields": [],
-        "remote_department_id": 110,
-        "remote_department_name": "广州一区",
-        "remote_department_path": "广州一区",
-        "match_method": "NO_LOCAL_PATH_MATCH",
-        "proposed_org_unit_id": None,
-        "proposed_org_unit_name": "广州一区",
-        "proposed_parent_org_unit_id": anchor.id,
-        "proposed_parent_org_unit_name": anchor.name,
+        "source_path": "广州一区",
+        "local_target_path": "集团 / 广州一区",
+        "explanation": "创建本地组织",
         "status": "READY",
         "conflict_code": None,
     }
+    batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.public_id == body["batch_id"])
+    ).one()
+    old_store_item = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.batch_id == batch.id,
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.proposed_org_unit_id == old_store.id,
+        )
+    ).one()
+    assert _public_item_for_staged(body, old_store_item)["action"] == "DEACTIVATE"
+    assert old_store_item.match_method == "MISSING_IN_DINGTALK"
     assert (
-        next(item for item in body["store_items"] if item["proposed_org_unit_id"] == old_store.id)[
-            "action"
-        ]
-        == "DEACTIVATE"
+        db_session.scalars(
+            select(DingTalkOrgSyncItem).where(
+                DingTalkOrgSyncItem.batch_id == batch.id,
+                DingTalkOrgSyncItem.proposed_org_unit_id == outside_store.id,
+            )
+        ).all()
+        == []
     )
     assert body["store_conflicts"] == 0
-    assert all(item["proposed_org_unit_id"] != outside_store.id for item in body["store_items"])
 
 
 def _seed_atomic_region_apply(db_session) -> tuple[OrgUnit, DingTalkOrganizationSnapshot]:
@@ -2420,12 +2603,26 @@ def test_organization_preview_matches_same_name_stores_by_full_relative_path(cli
     )
 
     assert response.status_code == 200, response.text
-    store_items = {item["remote_department_id"]: item for item in response.json()["store_items"]}
-    assert store_items[210]["proposed_org_unit_id"] == east_store.id
-    assert store_items[220]["proposed_org_unit_id"] == west_store.id
-    assert {store_items[210]["match_method"], store_items[220]["match_method"]} == {
-        "EXACT_RELATIVE_PATH"
+    preview = response.json()
+    store_items = {
+        remote_id: _public_item_by_remote_department(
+            db_session,
+            preview,
+            kind=DingTalkOrgSyncItemKind.STORE,
+            remote_department_id=remote_id,
+        )
+        for remote_id in (210, 220)
     }
+    assert store_items[210]["local_target_path"] == "集团 / 东区 / 中心店"
+    assert store_items[220]["local_target_path"] == "集团 / 西区 / 中心店"
+    staged = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.remote_department_id.in_((210, 220)),
+        )
+    ).all()
+    assert {item.proposed_org_unit_id for item in staged} == {east_store.id, west_store.id}
+    assert {item.match_method for item in staged} == {"EXACT_RELATIVE_PATH"}
 
 
 def test_organization_preview_conflicts_on_ambiguous_local_relative_path(client, db_session):
@@ -2455,8 +2652,11 @@ def test_organization_preview_conflicts_on_ambiguous_local_relative_path(client,
     )
 
     assert response.status_code == 200, response.text
-    remote_store = next(
-        item for item in response.json()["store_items"] if item["remote_department_id"] == 210
+    remote_store = _public_item_by_remote_department(
+        db_session,
+        response.json(),
+        kind=DingTalkOrgSyncItemKind.STORE,
+        remote_department_id=210,
     )
     assert remote_store["status"] == "CONFLICT"
     assert remote_store["conflict_code"] == "ORG_PATH_AMBIGUOUS"
@@ -2497,12 +2697,15 @@ def test_organization_preview_update_lists_exact_name_and_parent_fields(client, 
     )
 
     assert response.status_code == 200, response.text
-    item = next(
-        item for item in response.json()["store_items"] if item["remote_department_id"] == 210
+    item = _public_item_by_remote_department(
+        db_session,
+        response.json(),
+        kind=DingTalkOrgSyncItemKind.STORE,
+        remote_department_id=210,
     )
     assert item["action"] == "UPDATE"
     assert item["change_fields"] == ["name", "parent_id"]
-    assert item["proposed_parent_org_unit_id"] == west.id
+    assert item["local_target_path"] == "集团 / 东区 / 旧门店"
     staged = db_session.scalars(
         select(DingTalkOrgSyncItem).where(
             DingTalkOrgSyncItem.remote_department_id == 210,
@@ -2511,6 +2714,7 @@ def test_organization_preview_update_lists_exact_name_and_parent_fields(client, 
     ).one()
     assert staged.action == DingTalkOrgSyncAction.UPDATE
     assert staged.match_method == "STABLE_DEPARTMENT_ID"
+    assert staged.proposed_parent_org_unit_id == west.id
     assert "|" not in staged.match_method
 
 
@@ -2691,12 +2895,21 @@ def test_bound_local_path_cannot_be_rebound_when_remote_department_id_changes(cl
     preview_response = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
 
     assert preview_response.status_code == 200, preview_response.text
-    item = next(
-        row for row in preview_response.json()["store_items"] if row["remote_department_id"] == 101
+    item = _public_item_by_remote_department(
+        db_session,
+        preview_response.json(),
+        kind=DingTalkOrgSyncItemKind.STORE,
+        remote_department_id=101,
     )
     assert item["status"] == "CONFLICT"
     assert item["conflict_code"] == "ORG_PATH_AMBIGUOUS"
-    assert item["proposed_org_unit_id"] is None
+    staged = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.remote_department_id == 101,
+        )
+    ).one()
+    assert staged.proposed_org_unit_id is None
 
     apply_response = client.post(
         f"/api/dingtalk/sync/organization/{preview_response.json()['batch_id']}/apply",
@@ -2734,10 +2947,26 @@ def test_shared_anchor_supports_two_roots_without_cross_path_matches(client, db_
     )
 
     assert response.status_code == 200, response.text
-    stores = {row["remote_department_id"]: row for row in response.json()["store_items"]}
-    assert stores[101]["proposed_org_unit_id"] == east.id
-    assert stores[201]["proposed_org_unit_id"] == west.id
+    preview = response.json()
+    stores = {
+        remote_id: _public_item_by_remote_department(
+            db_session,
+            preview,
+            kind=DingTalkOrgSyncItemKind.STORE,
+            remote_department_id=remote_id,
+        )
+        for remote_id in (101, 201)
+    }
+    assert stores[101]["local_target_path"] == "集团 / 东店"
+    assert stores[201]["local_target_path"] == "集团 / 西店"
     assert {stores[101]["status"], stores[201]["status"]} == {"READY"}
+    staged = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.remote_department_id.in_((101, 201)),
+        )
+    ).all()
+    assert {item.proposed_org_unit_id for item in staged} == {east.id, west.id}
 
 
 def test_organization_apply_creates_same_name_store_under_distinct_root_path(client, db_session):
@@ -2818,13 +3047,30 @@ def test_organization_apply_creates_same_name_store_under_distinct_root_path(cli
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
     assert preview["region_items"] == []
-    stores_by_remote_id = {item["remote_department_id"]: item for item in preview["store_items"]}
+    stores_by_remote_id = {
+        remote_id: _public_item_by_remote_department(
+            db_session,
+            preview,
+            kind=DingTalkOrgSyncItemKind.STORE,
+            remote_department_id=remote_id,
+        )
+        for remote_id in (101, 201)
+    }
     assert stores_by_remote_id[101]["action"] == "LINK"
-    assert stores_by_remote_id[101]["proposed_org_unit_id"] == existing_store.id
+    assert stores_by_remote_id[101]["local_target_path"] == "East Group / Shared店"
     assert stores_by_remote_id[201]["action"] == "CREATE"
     assert stores_by_remote_id[201]["status"] == "READY"
-    assert stores_by_remote_id[201]["proposed_org_unit_id"] is None
-    assert stores_by_remote_id[201]["proposed_parent_org_unit_id"] == west_anchor.id
+    assert stores_by_remote_id[201]["local_target_path"] == "West Group / Shared店"
+    staged_stores = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.remote_department_id.in_((101, 201)),
+        )
+    ).all()
+    staged_by_remote_id = {item.remote_department_id: item for item in staged_stores}
+    assert staged_by_remote_id[101].proposed_org_unit_id == existing_store.id
+    assert staged_by_remote_id[201].proposed_org_unit_id is None
+    assert staged_by_remote_id[201].proposed_parent_org_unit_id == west_anchor.id
     assert preview["reviewer_conflicts"] == 0
 
     apply_response = client.post(
@@ -2885,8 +3131,15 @@ def test_shared_anchor_conflicts_when_two_roots_target_the_same_local_path(clien
     )
 
     assert response.status_code == 200, response.text
+    preview = response.json()
     stores = [
-        row for row in response.json()["store_items"] if row["remote_department_id"] is not None
+        _public_item_by_remote_department(
+            db_session,
+            preview,
+            kind=DingTalkOrgSyncItemKind.STORE,
+            remote_department_id=remote_id,
+        )
+        for remote_id in (101, 201)
     ]
     assert len(stores) == 2
     assert {row["status"] for row in stores} == {"CONFLICT"}
@@ -2934,9 +3187,21 @@ def test_normalized_equivalent_name_does_not_stage_false_update(client, db_sessi
     )
 
     assert response.status_code == 200, response.text
-    item = next(row for row in response.json()["store_items"] if row["remote_department_id"])
+    item = _public_item_by_remote_department(
+        db_session,
+        response.json(),
+        kind=DingTalkOrgSyncItemKind.STORE,
+        remote_department_id=101,
+    )
     assert item["action"] == "LINK"
-    assert item["change_fields"] == ["dingtalk_dept_id"]
+    assert item["change_fields"] == []
+    staged = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.remote_department_id == 101,
+        )
+    ).one()
+    assert staged.change_fields == ["dingtalk_dept_id"]
 
 
 def test_remote_relative_path_over_storage_limit_fails_closed(client, db_session):

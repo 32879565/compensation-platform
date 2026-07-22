@@ -58,7 +58,6 @@ const ORGANIZATION_ACTION_COLOR: Record<DingTalkOrganizationAction, string> = {
 const ORGANIZATION_CHANGE_FIELD_LABEL: Record<DingTalkOrganizationChangeField, string> = {
   name: '名称',
   parent_id: '上级组织',
-  dingtalk_dept_id: '钉钉部门 ID',
 }
 
 const STATUS_LABEL: Record<DingTalkOrganizationSyncItemStatus, string> = {
@@ -128,15 +127,6 @@ function statusTag(status: DingTalkOrganizationSyncItemStatus) {
   return <Tag color={STATUS_COLOR[status]}>{STATUS_LABEL[status]}</Tag>
 }
 
-function remoteDepartmentLabel(name: string, departmentId: number | null): string {
-  return departmentId === null ? `${name}（钉钉中未找到）` : `${name}（${departmentId}）`
-}
-
-function localTargetLabel(name: string | null, id: number | null): string {
-  if (!name) return '—'
-  return id === null ? name : `${name}（ID ${id}）`
-}
-
 function changeFieldsLabel(changeFields: DingTalkOrganizationChangeField[]): string {
   return changeFields.length === 0
     ? '—'
@@ -146,7 +136,6 @@ function changeFieldsLabel(changeFields: DingTalkOrganizationChangeField[]): str
 function organizationColumns(
   kind: DingTalkOrganizationNodeKind,
 ): ColumnsType<DingTalkOrganizationNodeItem> {
-  const organizationLabel = kind === 'REGION' ? '区域' : '门店'
   return [
     {
       title: '动作',
@@ -156,24 +145,13 @@ function organizationColumns(
         </Tag>
       ),
     },
+    { title: '来源路径', dataIndex: 'source_path' },
     {
-      title: `钉钉${organizationLabel}`,
-      render: (_value, item) =>
-        remoteDepartmentLabel(item.remote_department_name, item.remote_department_id),
+      title: '本地目标',
+      render: (_value, item) => item.local_target_path ?? '—',
     },
-    { title: '钉钉完整路径', dataIndex: 'remote_department_path' },
-    { title: '匹配方式', dataIndex: 'match_method' },
     { title: '变更字段', render: (_value, item) => changeFieldsLabel(item.change_fields) },
-    {
-      title: `本地${organizationLabel}`,
-      render: (_value, item) =>
-        localTargetLabel(item.proposed_org_unit_name, item.proposed_org_unit_id),
-    },
-    {
-      title: '上级组织',
-      render: (_value, item) =>
-        localTargetLabel(item.proposed_parent_org_unit_name, item.proposed_parent_org_unit_id),
-    },
+    { title: '变更说明', dataIndex: 'explanation' },
     { title: '状态', render: (_value, item) => statusTag(item.status) },
     { title: '冲突代码', render: (_value, item) => item.conflict_code ?? '—' },
   ]
@@ -188,31 +166,13 @@ const reviewerColumns: ColumnsType<DingTalkOrganizationReviewerItem> = [
       </Tag>
     ),
   },
+  { title: '来源路径', dataIndex: 'source_path' },
   {
-    title: '钉钉门店',
-    render: (_value, item) =>
-      remoteDepartmentLabel(item.remote_department_name, item.remote_department_id),
+    title: '本地目标',
+    render: (_value, item) => item.local_target_path ?? '—',
   },
   { title: '部门', render: (_value, item) => DEPARTMENT_LABEL[item.department] },
-  { title: '当前负责人', render: (_value, item) => item.current_reviewer_name ?? '—' },
-  { title: '钉钉负责人', render: (_value, item) => item.dingtalk_name ?? '—' },
-  {
-    title: '拟匹配本地员工',
-    render: (_value, item) =>
-      localTargetLabel(item.proposed_employee_name, item.proposed_employee_id),
-  },
-  { title: '匹配方式', dataIndex: 'match_method' },
-  {
-    title: '变更说明',
-    render: (_value, item) =>
-      item.action === 'REMOVE_SCOPE' ? (
-        <Typography.Text type="warning">
-          将撤销旧负责人：{item.current_reviewer_name ?? '未知'}
-        </Typography.Text>
-      ) : (
-        '—'
-      ),
-  },
+  { title: '变更说明', dataIndex: 'explanation' },
   { title: '状态', render: (_value, item) => statusTag(item.status) },
   { title: '冲突代码', render: (_value, item) => item.conflict_code ?? '—' },
 ]

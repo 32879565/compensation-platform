@@ -243,11 +243,14 @@ describe('DingTalk and compensation appeal API client', () => {
         {
           id: 100,
           kind: 'REGION',
+          source_path: '集团 / 广州区域',
+          local_target_path: '集团 / 广州区域',
+          explanation: '创建本地组织',
           remote_department_id: 8001,
           remote_department_name: '广州区域',
           remote_department_path: '集团 / 广州区域',
           action: 'CREATE',
-          change_fields: ['name', 'dingtalk_dept_id'],
+          change_fields: ['name', 'dingtalk_dept_id', 'provider_secret'],
           match_method: 'REMOTE_ONLY',
           proposed_org_unit_id: null,
           proposed_org_unit_name: '广州区域',
@@ -263,6 +266,9 @@ describe('DingTalk and compensation appeal API client', () => {
         {
           id: 101,
           kind: 'STORE',
+          source_path: '集团 / 广州区域 / 旧城店',
+          local_target_path: '集团 / 广州区域 / 旧城店',
+          explanation: '停用本地组织',
           remote_department_id: null,
           remote_department_name: '旧城店',
           remote_department_path: '本地 / 旧城店',
@@ -281,6 +287,9 @@ describe('DingTalk and compensation appeal API client', () => {
       reviewer_items: [
         {
           id: 201,
+          source_path: '集团 / 潮发运营中心 / 天河店',
+          local_target_path: '集团 / 广州区域 / 天河店',
+          explanation: '撤销当前负责人复核权限',
           remote_department_id: null,
           remote_department_name: '天河店',
           remote_department_path: '集团 / 潮发运营中心 / 天河店',
@@ -334,47 +343,32 @@ describe('DingTalk and compensation appeal API client', () => {
     expect(staged.region_items[0]).toEqual({
       id: 100,
       kind: 'REGION',
-      remote_department_id: 8001,
-      remote_department_name: '广州区域',
-      remote_department_path: '集团 / 广州区域',
       action: 'CREATE',
-      change_fields: ['name', 'dingtalk_dept_id'],
-      match_method: 'REMOTE_ONLY',
-      proposed_org_unit_id: null,
-      proposed_org_unit_name: '广州区域',
-      proposed_parent_org_unit_id: 1,
-      proposed_parent_org_unit_name: '集团',
+      change_fields: ['name'],
+      source_path: '集团 / 广州区域',
+      local_target_path: '集团 / 广州区域',
+      explanation: '创建本地组织',
       status: 'READY',
       conflict_code: null,
     })
     expect(staged.store_items[0]).toEqual({
       id: 101,
       kind: 'STORE',
-      remote_department_id: null,
-      remote_department_name: '旧城店',
-      remote_department_path: '本地 / 旧城店',
       action: 'DEACTIVATE',
       change_fields: [],
-      match_method: 'LOCAL_STORE_NOT_VISIBLE',
-      proposed_org_unit_id: 11,
-      proposed_org_unit_name: '旧城店',
-      proposed_parent_org_unit_id: 1,
-      proposed_parent_org_unit_name: '广州区域',
+      source_path: '集团 / 广州区域 / 旧城店',
+      local_target_path: '集团 / 广州区域 / 旧城店',
+      explanation: '停用本地组织',
       status: 'READY',
       conflict_code: null,
     })
     expect(staged.reviewer_items[0]).toEqual({
       id: 201,
-      remote_department_id: null,
-      remote_department_name: '天河店',
-      remote_department_path: '集团 / 潮发运营中心 / 天河店',
       department: 'DINING',
       action: 'REMOVE_SCOPE',
-      dingtalk_name: null,
-      proposed_employee_id: null,
-      proposed_employee_name: null,
-      match_method: 'CLEAR_MISSING_MANAGER',
-      current_reviewer_name: '旧店长',
+      source_path: '集团 / 潮发运营中心 / 天河店',
+      local_target_path: '集团 / 广州区域 / 天河店',
+      explanation: '撤销当前负责人复核权限',
       status: 'READY',
       conflict_code: null,
     })
@@ -413,6 +407,9 @@ describe('DingTalk and compensation appeal API client', () => {
       reviewer_items: [
         {
           id: 1,
+          source_path: '集团 / 天河店',
+          local_target_path: '集团 / 广州区域 / 天河店',
+          explanation: '分配负责人复核权限',
           remote_department_id: 9,
           remote_department_name: '天河店',
           remote_department_path: '集团 / 天河店',
@@ -430,6 +427,9 @@ describe('DingTalk and compensation appeal API client', () => {
         },
         {
           id: 2,
+          source_path: '集团 / 天河店',
+          local_target_path: '集团 / 广州区域 / 天河店',
+          explanation: '负责人匹配存在冲突',
           remote_department_id: 9,
           remote_department_name: '天河店',
           remote_department_path: '集团 / 天河店',
@@ -459,5 +459,15 @@ describe('DingTalk and compensation appeal API client', () => {
     expect(latest).not.toHaveProperty('snapshot_hash')
     expect(latest.reviewer_items[0]).not.toHaveProperty('remote_user_id_hash')
     expect(latest.reviewer_items[0]).not.toHaveProperty('provider_extra')
+    expect(latest.reviewer_items[0]).toEqual({
+      id: 1,
+      department: 'DINING',
+      action: 'ASSIGN_SCOPE',
+      source_path: '集团 / 天河店',
+      local_target_path: '集团 / 广州区域 / 天河店',
+      explanation: '分配负责人复核权限',
+      status: 'READY',
+      conflict_code: null,
+    })
   })
 })

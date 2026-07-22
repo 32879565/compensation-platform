@@ -104,6 +104,9 @@ test.describe('compensation workflows', () => {
       remote_department_id: 91001,
       remote_department_name: 'E2E Mock 新区域',
       remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域',
+      source_path: 'E2E Mock 集团 / E2E Mock 新区域',
+      local_target_path: 'E2E Mock 集团 / E2E Mock 新区域',
+      explanation: '创建本地组织',
       action: 'CREATE',
       change_fields: ['name', 'dingtalk_dept_id'],
       match_method: 'E2E_MOCK_REMOTE_ONLY',
@@ -120,6 +123,9 @@ test.describe('compensation workflows', () => {
       remote_department_id: 91002,
       remote_department_name: 'E2E Mock 新门店',
       remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      source_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      local_target_path: null,
+      explanation: '创建本地组织',
       action: 'CREATE',
       change_fields: ['name', 'parent_id', 'dingtalk_dept_id'],
       match_method: 'E2E_MOCK_REMOTE_ONLY',
@@ -135,6 +141,9 @@ test.describe('compensation workflows', () => {
       remote_department_id: 91002,
       remote_department_name: 'E2E Mock 新门店',
       remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      source_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      local_target_path: null,
+      explanation: '分配负责人复核权限',
       department: 'DINING',
       action: 'ASSIGN',
       dingtalk_name: 'E2E Mock 厅面负责人',
@@ -150,6 +159,9 @@ test.describe('compensation workflows', () => {
       remote_department_id: 91002,
       remote_department_name: 'E2E Mock 新门店',
       remote_department_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      source_path: 'E2E Mock 集团 / E2E Mock 新区域 / E2E Mock 新门店',
+      local_target_path: 'E2E Mock 集团 / E2E Mock 既有区域',
+      explanation: '撤销当前负责人复核权限',
       department: 'KITCHEN',
       action: 'REMOVE',
       dingtalk_name: null,
@@ -165,6 +177,9 @@ test.describe('compensation workflows', () => {
       remote_department_id: 91003,
       remote_department_name: 'E2E Mock 冲突门店',
       remote_department_path: 'E2E Mock 集团 / E2E Mock 冲突门店',
+      source_path: 'E2E Mock 集团 / E2E Mock 冲突门店',
+      local_target_path: null,
+      explanation: '负责人匹配存在冲突',
       department: 'DINING',
       action: 'CONFLICT',
       dingtalk_name: 'E2E Mock 冲突负责人',
@@ -340,6 +355,16 @@ test.describe('compensation workflows', () => {
     await expect(scheduledDialog.getByRole('region', { name: '负责人冲突（1）' })).toContainText(
       'ORG_MANAGER_AMBIGUOUS',
     )
+    await expect(scheduledDialog.getByText('钉钉完整路径')).toHaveCount(0)
+    await expect(scheduledDialog.getByText('匹配方式')).toHaveCount(0)
+    await expect(scheduledDialog.getByText('当前负责人')).toHaveCount(0)
+    await expect(scheduledDialog.getByText('钉钉负责人')).toHaveCount(0)
+    await expect(scheduledDialog.getByText('拟匹配本地员工')).toHaveCount(0)
+    await expect(scheduledDialog).not.toContainText('E2E Mock 厅面负责人')
+    await expect(scheduledDialog).not.toContainText('E2E Mock 厅面员工')
+    await expect(scheduledDialog).not.toContainText('E2E Mock 旧厨房负责人')
+    await expect(scheduledDialog).not.toContainText('E2E_MOCK_JOB_NUMBER')
+    await expect(scheduledDialog).not.toContainText('91002')
     await expect(
       scheduledDialog.getByRole('button', { name: '确认应用变更', exact: true }),
     ).toBeDisabled()

@@ -89,37 +89,27 @@ export type DingTalkOrganizationAction =
   | 'ASSIGN_SCOPE'
   | 'REMOVE_SCOPE'
   | 'NO_CHANGE'
-export type DingTalkOrganizationChangeField = 'name' | 'parent_id' | 'dingtalk_dept_id'
+export type DingTalkOrganizationChangeField = 'name' | 'parent_id'
 
 export interface DingTalkOrganizationNodeItem {
   id: number
   kind: DingTalkOrganizationNodeKind
-  remote_department_id: number | null
-  remote_department_name: string
-  remote_department_path: string
   action: DingTalkOrganizationAction
   change_fields: DingTalkOrganizationChangeField[]
-  match_method: string
-  proposed_org_unit_id: number | null
-  proposed_org_unit_name: string | null
-  proposed_parent_org_unit_id: number | null
-  proposed_parent_org_unit_name: string | null
+  source_path: string
+  local_target_path: string | null
+  explanation: string
   status: DingTalkOrganizationSyncItemStatus
   conflict_code: string | null
 }
 
 export interface DingTalkOrganizationReviewerItem {
   id: number
-  remote_department_id: number | null
-  remote_department_name: string
-  remote_department_path: string
   department: DingTalkReviewerDepartment
   action: DingTalkOrganizationAction
-  dingtalk_name: string | null
-  proposed_employee_id: number | null
-  proposed_employee_name: string | null
-  match_method: string
-  current_reviewer_name: string | null
+  source_path: string
+  local_target_path: string | null
+  explanation: string
   status: DingTalkOrganizationSyncItemStatus
   conflict_code: string | null
 }
@@ -146,16 +136,29 @@ export interface DingTalkOrganizationPreview {
   reviewer_items: DingTalkOrganizationReviewerItem[]
 }
 
-interface DingTalkOrganizationNodeItemResponse
-  extends Omit<DingTalkOrganizationNodeItem, 'action'> {
+interface DingTalkOrganizationNodeItemResponse {
+  id: number
+  kind: DingTalkOrganizationNodeKind
   action: 'LINK' | 'CREATE' | 'ACTIVATE' | 'UPDATE' | 'DEACTIVATE' | 'NO_CHANGE'
+  change_fields: unknown
+  source_path: string
+  local_target_path: string | null
+  explanation: string
+  status: DingTalkOrganizationSyncItemStatus
+  conflict_code: string | null
 }
 
 type DingTalkOrganizationReviewerActionResponse = 'ASSIGN' | 'REMOVE' | 'CONFLICT'
 
-interface DingTalkOrganizationReviewerItemResponse
-  extends Omit<DingTalkOrganizationReviewerItem, 'action'> {
+interface DingTalkOrganizationReviewerItemResponse {
+  id: number
+  department: DingTalkReviewerDepartment
   action: DingTalkOrganizationReviewerActionResponse
+  source_path: string
+  local_target_path: string | null
+  explanation: string
+  status: DingTalkOrganizationSyncItemStatus
+  conflict_code: string | null
 }
 
 interface DingTalkOrganizationPreviewResponse
@@ -285,16 +288,16 @@ function toOrganizationNodeItem(
   return {
     id: item.id,
     kind: item.kind,
-    remote_department_id: item.remote_department_id,
-    remote_department_name: item.remote_department_name,
-    remote_department_path: item.remote_department_path,
     action: item.action,
-    change_fields: item.change_fields.map((field) => field),
-    match_method: item.match_method,
-    proposed_org_unit_id: item.proposed_org_unit_id,
-    proposed_org_unit_name: item.proposed_org_unit_name,
-    proposed_parent_org_unit_id: item.proposed_parent_org_unit_id,
-    proposed_parent_org_unit_name: item.proposed_parent_org_unit_name,
+    change_fields: Array.isArray(item.change_fields)
+      ? item.change_fields.filter(
+          (field): field is DingTalkOrganizationChangeField =>
+            field === 'name' || field === 'parent_id',
+        )
+      : [],
+    source_path: item.source_path,
+    local_target_path: item.local_target_path,
+    explanation: item.explanation,
     status: item.status,
     conflict_code: item.conflict_code,
   }
@@ -305,9 +308,6 @@ function toOrganizationReviewerItem(
 ): DingTalkOrganizationReviewerItem {
   return {
     id: item.id,
-    remote_department_id: item.remote_department_id,
-    remote_department_name: item.remote_department_name,
-    remote_department_path: item.remote_department_path,
     department: item.department,
     action:
       item.action === 'ASSIGN'
@@ -315,11 +315,9 @@ function toOrganizationReviewerItem(
         : item.action === 'REMOVE'
           ? 'REMOVE_SCOPE'
           : 'NO_CHANGE',
-    dingtalk_name: item.dingtalk_name,
-    proposed_employee_id: item.proposed_employee_id,
-    proposed_employee_name: item.proposed_employee_name,
-    match_method: item.match_method,
-    current_reviewer_name: item.current_reviewer_name,
+    source_path: item.source_path,
+    local_target_path: item.local_target_path,
+    explanation: item.explanation,
     status: item.status,
     conflict_code: item.conflict_code,
   }
