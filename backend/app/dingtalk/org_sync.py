@@ -186,6 +186,12 @@ class _ReviewerDraft:
 
 
 @dataclass(frozen=True)
+class _ReviewerIdentityIndex:
+    stable_by_hash: dict[str, tuple[Employee, ...]]
+    active_by_emp_no: dict[str, tuple[Employee, ...]]
+
+
+@dataclass(frozen=True)
 class _AuthorityIndex:
     anchors_by_root: dict[int, OrgUnit]
     roots_by_org_id: dict[int, frozenset[int]]
@@ -1065,18 +1071,34 @@ def _nearest_remote_store_by_department(
     return nearest
 
 
+def _index_reviewer_identities(
+    employees: tuple[Employee, ...],
+) -> _ReviewerIdentityIndex:
+    """Index all strict reviewer identity keys in one employee pass."""
+
+    stable_by_hash: dict[str, list[Employee]] = defaultdict(list)
+    active_by_emp_no: dict[str, list[Employee]] = defaultdict(list)
+    for employee in employees:
+        if employee.dingtalk_user_id_hash:
+            stable_by_hash[employee.dingtalk_user_id_hash].append(employee)
+        if employee.status == EmployeeStatus.ACTIVE and not employee.is_deleted:
+            active_by_emp_no[employee.emp_no.strip()].append(employee)
+    return _ReviewerIdentityIndex(
+        stable_by_hash={key: tuple(values) for key, values in stable_by_hash.items()},
+        active_by_emp_no={key: tuple(values) for key, values in active_by_emp_no.items()},
+    )
+
+
 def _match_reviewer_identity(
     remote_user: DingTalkOrganizationUser,
     *,
-    employees: tuple[Employee, ...],
+    identity_index: _ReviewerIdentityIndex,
     encryption_key: str,
 ) -> tuple[Employee | None, str, str | None]:
     """Resolve a reviewer only by an established binding or exact employee number."""
 
     provider_hash = blind_index_dingtalk_user_id(remote_user.user_id, key=encryption_key)
-    stable_matches = [
-        employee for employee in employees if employee.dingtalk_user_id_hash == provider_hash
-    ]
+    stable_matches = identity_index.stable_by_hash.get(provider_hash, ())
     if len(stable_matches) == 1:
         stable_employee = stable_matches[0]
         if stable_employee.status == EmployeeStatus.ACTIVE and not stable_employee.is_deleted:
@@ -1088,15 +1110,12 @@ def _match_reviewer_identity(
     job_number = (remote_user.job_number or "").strip()
     if not job_number:
         return None, "JOB_NUMBER", "ORG_EMPLOYEE_MATCH_FAILED"
-    job_number_matches = [
-        employee
-        for employee in employees
-        if employee.status == EmployeeStatus.ACTIVE
-        and not employee.is_deleted
-        and employee.emp_no.strip() == job_number
-    ]
+    job_number_matches = identity_index.active_by_emp_no.get(job_number, ())
     if len(job_number_matches) == 1:
-        return job_number_matches[0], "JOB_NUMBER", None
+        employee = job_number_matches[0]
+        if employee.dingtalk_user_id_hash not in (None, provider_hash):
+            return None, "JOB_NUMBER", "ORG_IDENTITY_CONFLICT"
+        return employee, "JOB_NUMBER", None
     return (
         None,
         "JOB_NUMBER",
@@ -1121,16 +1140,15 @@ def _plan_organization_reviewers(
         role_codes_by_user,
         scope_users_by_pair,
     ) = _state_indexes(state)
-    employees = tuple(state.employees)
+    identity_index = _index_reviewer_identities(state.employees)
     active_remote_users = tuple(user for user in snapshot.users if user.active)
     account_ids_by_hash: dict[str, list[int]] = defaultdict(list)
     employee_ids_by_hash: dict[str, list[int]] = defaultdict(list)
     for account in state.users:
         if account.dingtalk_user_id_hash:
             account_ids_by_hash[account.dingtalk_user_id_hash].append(account.id)
-    for employee in state.employees:
-        if employee.dingtalk_user_id_hash:
-            employee_ids_by_hash[employee.dingtalk_user_id_hash].append(employee.id)
+    for provider_hash, employees in identity_index.stable_by_hash.items():
+        employee_ids_by_hash[provider_hash].extend(employee.id for employee in employees)
 
     remote_store_ids = frozenset(node_plan.store_row_by_remote_id)
     nearest_store = _nearest_remote_store_by_department(snapshot, remote_store_ids)
@@ -1264,7 +1282,7 @@ def _plan_organization_reviewers(
                 selected_remote = candidates[0]
                 selected_employee, method, reviewer_conflict_code = _match_reviewer_identity(
                     selected_remote,
-                    employees=employees,
+                    identity_index=identity_index,
                     encryption_key=encryption_key,
                 )
                 if reviewer_conflict_code is not None:

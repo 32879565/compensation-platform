@@ -1058,6 +1058,44 @@ def test_reviewer_sync_uses_unique_exact_job_number(client, db_session):
     assert item["match_method"] == "JOB_NUMBER"
 
 
+def test_reviewer_sync_does_not_overwrite_another_provider_binding(client, db_session):
+    store = _seed_store_and_managers(db_session)
+    employee = db_session.scalars(select(Employee).where(Employee.emp_no == "M001")).one()
+    original_hash = blind_index_dingtalk_user_id(
+        "provider-original-manager", key=_settings().encryption_key
+    )
+    employee.dingtalk_user_id_hash = original_hash
+    db_session.commit()
+    admin = _group_hr(db_session, "org-sync-preserve-provider-owner")
+    fake = _FakeOrganizationClient()
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+    headers = _token(client, admin.username)
+
+    preview_response = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
+
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    item = next(row for row in preview["reviewer_items"] if row["department"] == "DINING")
+    assert item["status"] == "CONFLICT"
+    assert item["action"] == "CONFLICT"
+    assert item["match_method"] == "JOB_NUMBER"
+    assert item["conflict_code"] == "ORG_IDENTITY_CONFLICT"
+
+    apply_response = client.post(
+        f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
+        headers=headers,
+    )
+
+    assert apply_response.status_code == 409
+    db_session.expire_all()
+    assert db_session.get(Employee, employee.id).dingtalk_user_id_hash == original_hash
+    assert db_session.get(OrgUnit, store.id).dingtalk_dept_id is None
+    assert db_session.scalars(select(UserReviewScope)).all() == []
+
+
 def test_reviewer_sync_conflicts_when_store_has_multiple_title_candidates(client, db_session):
     _seed_store_and_managers(db_session)
     admin = _group_hr(db_session, "org-sync-ambiguous-manager")
@@ -1144,7 +1182,7 @@ def test_reviewer_identity_conflicts_on_duplicate_stable_or_job_number(
 ):
     employee, method, conflict_code = org_sync._match_reviewer_identity(
         remote_user,
-        employees=employees,
+        identity_index=org_sync._index_reviewer_identities(employees),
         encryption_key=_settings().encryption_key,
     )
 
@@ -1173,13 +1211,52 @@ def test_reviewer_identity_rejects_inactive_or_deleted_stable_binding(status, is
 
     matched_employee, method, conflict_code = org_sync._match_reviewer_identity(
         remote_user,
-        employees=(employee,),
+        identity_index=org_sync._index_reviewer_identities((employee,)),
         encryption_key=_settings().encryption_key,
     )
 
     assert matched_employee is None
     assert method == "STABLE_ID"
     assert conflict_code == "ORG_EMPLOYEE_MATCH_FAILED"
+
+
+def test_reviewer_identity_indexes_employees_once_for_multiple_managers():
+    class CountingEmployees(tuple):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    employees = CountingEmployees(
+        Employee(
+            emp_no=f"M{index:03d}",
+            name=f"manager {index}",
+            status=EmployeeStatus.ACTIVE,
+            is_deleted=False,
+        )
+        for index in range(1, 11)
+    )
+
+    identity_index = org_sync._index_reviewer_identities(cast(tuple[Employee, ...], employees))
+    for index in range(1, 11):
+        employee, method, conflict_code = org_sync._match_reviewer_identity(
+            DingTalkOrganizationUser(
+                f"provider-{index}",
+                f"manager {index}",
+                f"M{index:03d}",
+                "店长",
+                True,
+                (),
+            ),
+            identity_index=identity_index,
+            encryption_key=_settings().encryption_key,
+        )
+        assert employee is employees[index - 1]
+        assert method == "JOB_NUMBER"
+        assert conflict_code is None
+
+    assert employees.iterations == 1
 
 
 def test_organization_sync_conflicts_same_manager_covering_multiple_stores(client, db_session):
@@ -2067,7 +2144,16 @@ def test_reviewer_planner_scans_users_and_store_rows_once(db_session, monkeypatc
     def fail_identity_match(*_args, **_kwargs):
         raise AssertionError("non-manager users must not enter reviewer identity matching")
 
+    identity_index_calls = 0
+    index_reviewer_identities = org_sync._index_reviewer_identities
+
+    def count_identity_index_builds(employees):
+        nonlocal identity_index_calls
+        identity_index_calls += 1
+        return index_reviewer_identities(employees)
+
     monkeypatch.setattr(org_sync, "_match_reviewer_identity", fail_identity_match)
+    monkeypatch.setattr(org_sync, "_index_reviewer_identities", count_identity_index_builds)
     org_sync._plan_organization_reviewers(
         state,
         snapshot,
@@ -2078,6 +2164,7 @@ def test_reviewer_planner_scans_users_and_store_rows_once(db_session, monkeypatc
     )
 
     assert sum(user.department_id_reads for user in users) == len(users)
+    assert identity_index_calls == 1
     assert counted_rows.iterations == 1
     assert counted_store_map.reads == len(stores)
 
