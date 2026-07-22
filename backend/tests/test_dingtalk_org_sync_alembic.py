@@ -351,3 +351,199 @@ def test_d20_identity_conflict_rolls_back_schema_and_data(pg_engine) -> None:
             connection.execute(text("SET search_path TO public"))
             connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
             connection.commit()
+
+
+@pytest.mark.parametrize("identity_state", ["mismatched", "hash_only"])
+def test_d20_downgrade_refuses_unrecoverable_app_user_identity(
+    pg_engine,
+    identity_state: str,
+) -> None:
+    schema = f"d20_downgrade_identity_{identity_state}_{uuid4().hex}"
+    provider_user_id = f"provider-{identity_state}"
+    ciphertext = encrypt_pii(provider_user_id) if identity_state == "mismatched" else None
+    stored_digest = "f" * 64
+    with pg_engine.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.commit()
+        try:
+            connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
+            config = _config_with_connection(connection)
+            command.upgrade(config, "head")
+            user_id = connection.scalar(
+                text("""
+                    INSERT INTO app_user (
+                        username, password_hash, dingtalk_user_id,
+                        dingtalk_user_id_hash
+                    )
+                    VALUES (
+                        :username, 'not-a-real-login', :ciphertext, :stored_digest
+                    )
+                    RETURNING id
+                    """),
+                {
+                    "username": f"d20-downgrade-{identity_state}",
+                    "ciphertext": ciphertext,
+                    "stored_digest": stored_digest,
+                },
+            )
+            connection.commit()
+
+            with pytest.raises(RuntimeError, match="restore a pre-D20 backup"):
+                command.downgrade(config, _D19_REVISION)
+
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "i4r7l0n2q568"
+            )
+            retained_identity = connection.execute(
+                text("""
+                    SELECT dingtalk_user_id, dingtalk_user_id_hash
+                    FROM app_user
+                    WHERE id = :user_id
+                    """),
+                {"user_id": user_id},
+            ).one()
+            assert retained_identity == (ciphertext, stored_digest)
+            assert (
+                connection.scalar(
+                    text("SELECT to_regclass(:table_name)"),
+                    {"table_name": f"{schema}.dingtalk_org_sync_batch"},
+                )
+                is not None
+            )
+        finally:
+            connection.rollback()
+            connection.execute(text("SET search_path TO public"))
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            connection.commit()
+
+
+def test_d20_downgrade_allows_ciphertext_without_d20_hash(pg_engine) -> None:
+    schema = f"d20_downgrade_ciphertext_only_{uuid4().hex}"
+    ciphertext = encrypt_pii("provider-ciphertext-only")
+    with pg_engine.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.commit()
+        try:
+            connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
+            config = _config_with_connection(connection)
+            command.upgrade(config, "head")
+            user_id = connection.scalar(
+                text("""
+                    INSERT INTO app_user (
+                        username, password_hash, dingtalk_user_id,
+                        dingtalk_user_id_hash
+                    )
+                    VALUES (
+                        'd20-downgrade-ciphertext-only', 'not-a-real-login',
+                        :ciphertext, NULL
+                    )
+                    RETURNING id
+                    """),
+                {"ciphertext": ciphertext},
+            )
+            connection.commit()
+
+            command.downgrade(config, _D19_REVISION)
+
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                _D19_REVISION
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT dingtalk_user_id FROM app_user WHERE id = :user_id"),
+                    {"user_id": user_id},
+                )
+                == ciphertext
+            )
+        finally:
+            connection.rollback()
+            connection.execute(text("SET search_path TO public"))
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            connection.commit()
+
+
+@pytest.mark.parametrize("d20_data_kind", ["sync_batch", "org_binding"])
+def test_d20_downgrade_refuses_d20_only_rows_without_mutating_them(
+    pg_engine,
+    d20_data_kind: str,
+) -> None:
+    schema = f"d20_downgrade_data_{d20_data_kind}_{uuid4().hex}"
+    with pg_engine.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.commit()
+        try:
+            connection.execute(text(f'SET search_path TO "{schema}", public'))
+            connection.commit()
+            config = _config_with_connection(connection)
+            command.upgrade(config, "head")
+
+            if d20_data_kind == "sync_batch":
+                public_id = uuid4().hex
+                connection.execute(
+                    text("""
+                        INSERT INTO dingtalk_org_sync_batch (
+                            public_id, snapshot_hash, root_config_hash,
+                            local_baseline_hash, expires_at
+                        )
+                        VALUES (
+                            :public_id, :snapshot_hash, :root_config_hash,
+                            :local_baseline_hash, now() + interval '1 hour'
+                        )
+                        """),
+                    {
+                        "public_id": public_id,
+                        "snapshot_hash": "a" * 64,
+                        "root_config_hash": "b" * 64,
+                        "local_baseline_hash": "c" * 64,
+                    },
+                )
+            else:
+                public_id = None
+                org_id = _store(connection, "D20-DOWNGRADE-BINDING")
+                connection.execute(
+                    text("""
+                        UPDATE org_unit
+                        SET dingtalk_dept_id = 998877
+                        WHERE id = :org_id
+                        """),
+                    {"org_id": org_id},
+                )
+            connection.commit()
+
+            with pytest.raises(RuntimeError, match="restore a pre-D20 backup"):
+                command.downgrade(config, _D19_REVISION)
+
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "i4r7l0n2q568"
+            )
+            if d20_data_kind == "sync_batch":
+                assert (
+                    connection.scalar(
+                        text("""
+                            SELECT count(*)
+                            FROM dingtalk_org_sync_batch
+                            WHERE public_id = :public_id
+                            """),
+                        {"public_id": public_id},
+                    )
+                    == 1
+                )
+            else:
+                assert (
+                    connection.scalar(
+                        text("""
+                            SELECT dingtalk_dept_id
+                            FROM org_unit
+                            WHERE id = :org_id
+                            """),
+                        {"org_id": org_id},
+                    )
+                    == 998877
+                )
+        finally:
+            connection.rollback()
+            connection.execute(text("SET search_path TO public"))
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            connection.commit()

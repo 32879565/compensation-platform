@@ -111,6 +111,66 @@ def _blind_index_dingtalk_user_id_v1(value: str, *, key: str) -> str:
     return hmac.new(derived_key, normalized.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+_LOSSY_DOWNGRADE_MESSAGE = (
+    "D20 downgrade refused because D20-only DingTalk data cannot be preserved; "
+    "restore a pre-D20 backup instead."
+)
+
+
+def _reject_lossy_downgrade() -> None:
+    """Refuse D20 rollback when D19 cannot represent the stored data."""
+
+    bind = op.get_bind()
+    bind.execute(sa.text("""
+            LOCK TABLE app_user, dingtalk_org_sync_batch, dingtalk_org_sync_item,
+                       dingtalk_org_sync_notification, org_unit
+            IN ACCESS EXCLUSIVE MODE
+            """))
+    has_d20_only_rows = bind.scalar(sa.text("""
+            SELECT
+                EXISTS (SELECT 1 FROM dingtalk_org_sync_batch)
+                OR EXISTS (SELECT 1 FROM dingtalk_org_sync_item)
+                OR EXISTS (SELECT 1 FROM dingtalk_org_sync_notification)
+                OR EXISTS (
+                    SELECT 1
+                    FROM org_unit
+                    WHERE dingtalk_dept_id IS NOT NULL
+                )
+            """))
+    if has_d20_only_rows:
+        raise RuntimeError(_LOSSY_DOWNGRADE_MESSAGE)
+
+    rows = bind.execute(sa.text("""
+            SELECT app_user.id, app_user.dingtalk_user_id,
+                   app_user.dingtalk_user_id_hash
+            FROM app_user
+            WHERE app_user.dingtalk_user_id_hash IS NOT NULL
+            ORDER BY app_user.id
+            """)).mappings().all()
+    if not rows:
+        return
+
+    try:
+        encryption_key = get_settings().encryption_key
+    except Exception:
+        raise RuntimeError(_LOSSY_DOWNGRADE_MESSAGE) from None
+    for row in rows:
+        ciphertext = row["dingtalk_user_id"]
+        stored_digest = row["dingtalk_user_id_hash"]
+        if not isinstance(ciphertext, str) or not isinstance(stored_digest, str):
+            raise RuntimeError(_LOSSY_DOWNGRADE_MESSAGE)
+        try:
+            provider_user_id = _decrypt_legacy_pii_v1(ciphertext, key=encryption_key)
+            recomputed_digest = _blind_index_dingtalk_user_id_v1(
+                provider_user_id,
+                key=encryption_key,
+            )
+        except Exception:
+            raise RuntimeError(_LOSSY_DOWNGRADE_MESSAGE) from None
+        if not hmac.compare_digest(recomputed_digest, stored_digest):
+            raise RuntimeError(_LOSSY_DOWNGRADE_MESSAGE)
+
+
 def _timestamp_columns() -> list[sa.Column]:
     return [
         sa.Column(
@@ -511,6 +571,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _reject_lossy_downgrade()
+
     for column in ("status", "recipient_user_id", "batch_id"):
         op.drop_index(
             f"ix_dingtalk_org_sync_notification_{column}",

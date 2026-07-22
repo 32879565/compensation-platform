@@ -16,10 +16,15 @@ class _Connection:
         duplicate_scope_count: int,
         legacy_rows: list[dict[str, object]] | None = None,
         employee_rows: list[dict[str, object]] | None = None,
+        *,
+        lossy_downgrade_data_exists: bool = False,
+        downgrade_user_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self.duplicate_scope_count = duplicate_scope_count
         self.legacy_rows = legacy_rows or []
         self.employee_rows = employee_rows or []
+        self.lossy_downgrade_data_exists = lossy_downgrade_data_exists
+        self.downgrade_user_rows = downgrade_user_rows or []
         self.statements: list[str] = []
         self.dropped_schema_items: list[str] = []
         self.dialect = postgresql.dialect()
@@ -29,16 +34,27 @@ class _Connection:
         self.statements.append(rendered)
         if "current_schema" in rendered:
             return "d20_test_schema"
-        return self.duplicate_scope_count
+        if "duplicate_scope" in rendered:
+            return self.duplicate_scope_count
+        if "dingtalk_org_sync_batch" in rendered and "dingtalk_dept_id" in rendered:
+            return int(self.lossy_downgrade_data_exists)
+        raise AssertionError(f"Unexpected scalar statement: {rendered}")
 
     def execute(self, statement: object, _params: object = None):
         rendered = str(statement)
         self.statements.append(rendered)
-        selected_rows = (
-            self.employee_rows
-            if "SELECT id, dingtalk_user_id_hash" in rendered
-            else self.legacy_rows
-        )
+        if rendered.lstrip().startswith("LOCK TABLE"):
+            selected_rows: list[dict[str, object]] = []
+        elif "SELECT app_user.id, app_user.dingtalk_user_id," in rendered:
+            selected_rows = self.downgrade_user_rows
+        elif "SELECT id, dingtalk_user_id_hash" in rendered:
+            selected_rows = self.employee_rows
+        elif "SELECT app_user.id, app_user.employee_id" in rendered:
+            selected_rows = self.legacy_rows
+        elif rendered.lstrip().startswith("UPDATE"):
+            selected_rows = []
+        else:
+            raise AssertionError(f"Unexpected execute statement: {rendered}")
 
         class _Rows:
             def mappings(self):
@@ -59,8 +75,17 @@ class _Op:
         duplicate_scope_count: int,
         legacy_rows: list[dict[str, object]] | None = None,
         employee_rows: list[dict[str, object]] | None = None,
+        *,
+        lossy_downgrade_data_exists: bool = False,
+        downgrade_user_rows: list[dict[str, object]] | None = None,
     ) -> None:
-        self.connection = _Connection(duplicate_scope_count, legacy_rows, employee_rows)
+        self.connection = _Connection(
+            duplicate_scope_count,
+            legacy_rows,
+            employee_rows,
+            lossy_downgrade_data_exists=lossy_downgrade_data_exists,
+            downgrade_user_rows=downgrade_user_rows,
+        )
         self.actions: list[tuple[str, object]] = []
 
     def get_bind(self) -> _Connection:
@@ -233,6 +258,8 @@ def test_downgrade_removes_sync_schema_in_dependency_order(monkeypatch) -> None:
 
     migration.downgrade()
 
+    assert op.connection.statements[0].lstrip().startswith("LOCK TABLE app_user")
+
     dropped_tables = [args[0] for name, (args, _kwargs) in op.actions if name == "drop_table"]
     assert dropped_tables == [
         "dingtalk_org_sync_notification",
@@ -264,6 +291,121 @@ def test_downgrade_removes_sync_schema_in_dependency_order(monkeypatch) -> None:
         "dingtalk_org_sync_action",
         "dingtalk_org_sync_trigger",
     }
+
+
+def test_downgrade_rejects_d20_only_rows_before_any_ddl(monkeypatch) -> None:
+    migration = _migration()
+    op = _Op(duplicate_scope_count=0, lossy_downgrade_data_exists=True)
+    monkeypatch.setattr(migration, "op", op)
+
+    with pytest.raises(RuntimeError, match="restore a pre-D20 backup"):
+        migration.downgrade()
+
+    assert op.connection.statements[0].lstrip().startswith("LOCK TABLE app_user")
+    assert "dingtalk_org_sync_item" in op.connection.statements[1]
+    assert "dingtalk_org_sync_notification" in op.connection.statements[1]
+    assert op.actions == []
+
+
+def test_downgrade_accepts_recomputable_legacy_user_hash(monkeypatch) -> None:
+    migration = _migration()
+    key = "migration-test-key"
+    provider_user_id = "legacy-provider-user"
+    digest = migration._blind_index_dingtalk_user_id_v1(provider_user_id, key=key)
+    op = _Op(
+        duplicate_scope_count=0,
+        downgrade_user_rows=[
+            {
+                "id": 7,
+                "dingtalk_user_id": "ciphertext",
+                "dingtalk_user_id_hash": digest,
+            }
+        ],
+    )
+    monkeypatch.setattr(migration, "op", op)
+    monkeypatch.setattr(
+        migration,
+        "_decrypt_legacy_pii_v1",
+        lambda _value, *, key: provider_user_id,
+    )
+    monkeypatch.setattr(
+        migration,
+        "get_settings",
+        lambda: type("_Settings", (), {"encryption_key": key})(),
+    )
+
+    migration.downgrade()
+
+    assert any(name == "drop_column" for name, _payload in op.actions)
+    user_query = next(
+        statement
+        for statement in op.connection.statements
+        if "SELECT app_user.id, app_user.dingtalk_user_id," in statement
+    )
+    assert "dingtalk_user_id_hash IS NOT NULL" in user_query
+
+
+@pytest.mark.parametrize(
+    ("row", "decrypt_raises"),
+    [
+        (
+            {
+                "id": 7,
+                "dingtalk_user_id": "ciphertext",
+                "dingtalk_user_id_hash": "f" * 64,
+            },
+            False,
+        ),
+        (
+            {
+                "id": 8,
+                "dingtalk_user_id": None,
+                "dingtalk_user_id_hash": "a" * 64,
+            },
+            False,
+        ),
+        (
+            {
+                "id": 9,
+                "dingtalk_user_id": "invalid-ciphertext",
+                "dingtalk_user_id_hash": "b" * 64,
+            },
+            True,
+        ),
+    ],
+)
+def test_downgrade_rejects_unrecoverable_user_hash_before_ddl(
+    monkeypatch,
+    row: dict[str, object],
+    decrypt_raises: bool,
+) -> None:
+    migration = _migration()
+    op = _Op(duplicate_scope_count=0, downgrade_user_rows=[row])
+    monkeypatch.setattr(migration, "op", op)
+    monkeypatch.setattr(
+        migration,
+        "get_settings",
+        lambda: type("_Settings", (), {"encryption_key": "migration-test-key"})(),
+    )
+
+    if decrypt_raises:
+
+        def reject_ciphertext(_value: str, *, key: str) -> str:
+            raise ValueError("test-only invalid ciphertext")
+
+        monkeypatch.setattr(migration, "_decrypt_legacy_pii_v1", reject_ciphertext)
+    else:
+        monkeypatch.setattr(
+            migration,
+            "_decrypt_legacy_pii_v1",
+            lambda _value, *, key: "different-provider-user",
+        )
+
+    with pytest.raises(RuntimeError, match="restore a pre-D20 backup") as exc_info:
+        migration.downgrade()
+
+    assert str(row["id"]) not in str(exc_info.value)
+    assert op.actions == []
 
 
 def test_backfill_rejects_duplicate_legacy_reviewer_bindings(monkeypatch) -> None:
