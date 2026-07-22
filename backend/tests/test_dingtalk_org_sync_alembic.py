@@ -93,6 +93,61 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
 
             command.upgrade(config, "head")
 
+            batch_columns = dict(
+                connection.execute(
+                    text("""
+                        SELECT column_name, is_nullable
+                        FROM information_schema.columns
+                        WHERE table_schema = :schema
+                          AND table_name = 'dingtalk_org_sync_batch'
+                        """),
+                    {"schema": schema},
+                ).all()
+            )
+            assert batch_columns["requested_by_user_id"] == "YES"
+            assert batch_columns["trigger"] == "NO"
+            assert batch_columns["root_config_hash"] == "NO"
+            assert batch_columns["last_checked_at"] == "YES"
+            assert {
+                "remote_region_count",
+                "local_region_count",
+                "ready_region_count",
+                "region_conflict_count",
+                "warning_count",
+            } <= batch_columns.keys()
+            item_columns = dict(
+                connection.execute(
+                    text("""
+                        SELECT column_name, is_nullable
+                        FROM information_schema.columns
+                        WHERE table_schema = :schema
+                          AND table_name = 'dingtalk_org_sync_item'
+                        """),
+                    {"schema": schema},
+                ).all()
+            )
+            assert item_columns["action"] == "NO"
+            assert item_columns["change_fields"] == "NO"
+            assert item_columns["proposed_org_type"] == "YES"
+            assert connection.scalar(
+                text("""
+                    SELECT count(*)
+                    FROM pg_enum
+                    JOIN pg_type ON pg_type.oid = pg_enum.enumtypid
+                    WHERE pg_type.typname = 'dingtalk_org_sync_item_kind'
+                      AND pg_enum.enumlabel = 'REGION'
+                    """),
+            ) == 1
+            assert connection.scalar(
+                text("""
+                    SELECT count(*)
+                    FROM information_schema.tables
+                    WHERE table_schema = :schema
+                      AND table_name = 'dingtalk_org_sync_notification'
+                    """),
+                {"schema": schema},
+            ) == 1
+
             assert (
                 connection.scalar(
                     text("SELECT dingtalk_user_id_hash FROM app_user WHERE id = :id"),

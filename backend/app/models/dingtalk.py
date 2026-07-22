@@ -23,11 +23,14 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TimestampMixin
 from app.models.employee import Department
+from app.models.org import OrgType
 
 
 class DingTalkDeliveryKind(enum.StrEnum):
@@ -59,7 +62,24 @@ class DingTalkOrgSyncBatchStatus(enum.StrEnum):
     STALE = "STALE"
 
 
+class DingTalkOrgSyncTrigger(enum.StrEnum):
+    MANUAL = "MANUAL"
+    SCHEDULED = "SCHEDULED"
+
+
+class DingTalkOrgSyncAction(enum.StrEnum):
+    LINK = "LINK"
+    CREATE = "CREATE"
+    UPDATE = "UPDATE"
+    ACTIVATE = "ACTIVATE"
+    DEACTIVATE = "DEACTIVATE"
+    ASSIGN_SCOPE = "ASSIGN_SCOPE"
+    REMOVE_SCOPE = "REMOVE_SCOPE"
+    NO_CHANGE = "NO_CHANGE"
+
+
 class DingTalkOrgSyncItemKind(enum.StrEnum):
+    REGION = "REGION"
     STORE = "STORE"
     REVIEWER = "REVIEWER"
 
@@ -222,7 +242,10 @@ class DingTalkOrgSyncBatch(Base, TimestampMixin):
         CheckConstraint(
             "remote_store_count >= 0 AND local_store_count >= 0 "
             "AND ready_store_count >= 0 AND store_conflict_count >= 0 "
-            "AND ready_reviewer_count >= 0 AND reviewer_conflict_count >= 0",
+            "AND ready_reviewer_count >= 0 AND reviewer_conflict_count >= 0 "
+            "AND remote_region_count >= 0 AND local_region_count >= 0 "
+            "AND ready_region_count >= 0 AND region_conflict_count >= 0 "
+            "AND warning_count >= 0",
             name="ck_dingtalk_org_sync_batch_nonnegative_counts",
         ),
         CheckConstraint(
@@ -253,11 +276,18 @@ class DingTalkOrgSyncBatch(Base, TimestampMixin):
         index=True,
     )
     snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    root_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger: Mapped[DingTalkOrgSyncTrigger] = mapped_column(
+        Enum(DingTalkOrgSyncTrigger, name="dingtalk_org_sync_trigger"),
+        nullable=False,
+        default=DingTalkOrgSyncTrigger.MANUAL,
+        server_default=DingTalkOrgSyncTrigger.MANUAL.value,
+    )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
-    requested_by_user_id: Mapped[int] = mapped_column(
-        ForeignKey("app_user.id"), nullable=False, index=True
+    requested_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("app_user.id"), nullable=True, index=True
     )
     applied_by_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("app_user.id"), nullable=True, index=True
@@ -279,6 +309,24 @@ class DingTalkOrgSyncBatch(Base, TimestampMixin):
     )
     reviewer_conflict_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
+    )
+    remote_region_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    local_region_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    ready_region_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    region_conflict_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    warning_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -322,6 +370,9 @@ class DingTalkOrgSyncItem(Base, TimestampMixin):
         server_default=DingTalkOrgSyncItemStatus.READY.value,
         index=True,
     )
+    action: Mapped[DingTalkOrgSyncAction] = mapped_column(
+        Enum(DingTalkOrgSyncAction, name="dingtalk_org_sync_action"), nullable=False
+    )
     remote_department_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     remote_department_name: Mapped[str] = mapped_column(String(128), nullable=False)
     remote_department_path: Mapped[str] = mapped_column(String(1024), nullable=False)
@@ -342,12 +393,48 @@ class DingTalkOrgSyncItem(Base, TimestampMixin):
     proposed_employee_id: Mapped[int | None] = mapped_column(
         ForeignKey("employee.id"), nullable=True, index=True
     )
+    proposed_org_type: Mapped[OrgType | None] = mapped_column(
+        Enum(OrgType, name="org_type"), nullable=True
+    )
     department: Mapped[Department | None] = mapped_column(
         Enum(Department, name="department"), nullable=True
     )
     match_method: Mapped[str] = mapped_column(String(64), nullable=False)
     conflict_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    change_fields: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
     baseline_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class DingTalkOrgSyncNotification(Base, TimestampMixin):
+    """One idempotent scheduled-sync notification delivery outcome."""
+
+    __tablename__ = "dingtalk_org_sync_notification"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_dingtalk_org_sync_notification_key"),
+    )
+
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("dingtalk_org_sync_batch.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    recipient_user_id: Mapped[int] = mapped_column(
+        ForeignKey("app_user.id"), nullable=False, index=True
+    )
+    status: Mapped[DingTalkDeliveryStatus] = mapped_column(
+        Enum(DingTalkDeliveryStatus, name="dingtalk_delivery_status"),
+        nullable=False,
+        default=DingTalkDeliveryStatus.PENDING,
+        index=True,
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_task_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
 
 
 class CompAppeal(Base, TimestampMixin):

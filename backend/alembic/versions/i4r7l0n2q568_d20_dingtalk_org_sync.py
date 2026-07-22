@@ -27,6 +27,36 @@ depends_on: str | Sequence[str] | None = None
 department_enum = postgresql.ENUM(
     "DINING", "KITCHEN", "OTHER", name="department", create_type=False
 )
+org_type_enum = postgresql.ENUM(
+    "GROUP", "REGION", "STORE", name="org_type", create_type=False
+)
+dingtalk_delivery_status_enum = postgresql.ENUM(
+    "PENDING", "SANDBOXED", "SENT", "FAILED", name="dingtalk_delivery_status", create_type=False
+)
+dingtalk_org_sync_batch_status_enum = postgresql.ENUM(
+    "PREVIEWED", "APPLIED", "STALE", name="dingtalk_org_sync_batch_status", create_type=False
+)
+dingtalk_org_sync_trigger_enum = postgresql.ENUM(
+    "MANUAL", "SCHEDULED", name="dingtalk_org_sync_trigger", create_type=False
+)
+dingtalk_org_sync_item_kind_enum = postgresql.ENUM(
+    "REGION", "STORE", "REVIEWER", name="dingtalk_org_sync_item_kind", create_type=False
+)
+dingtalk_org_sync_action_enum = postgresql.ENUM(
+    "LINK",
+    "CREATE",
+    "UPDATE",
+    "ACTIVATE",
+    "DEACTIVATE",
+    "ASSIGN_SCOPE",
+    "REMOVE_SCOPE",
+    "NO_CHANGE",
+    name="dingtalk_org_sync_action",
+    create_type=False,
+)
+dingtalk_org_sync_item_status_enum = postgresql.ENUM(
+    "READY", "CONFLICT", "APPLIED", "IGNORED", name="dingtalk_org_sync_item_status", create_type=False
+)
 
 
 def _decrypt_legacy_pii_v1(token: str, *, key: str) -> str:
@@ -179,6 +209,16 @@ def _backfill_dingtalk_user_hashes() -> None:
 def upgrade() -> None:
     _reject_ambiguous_reviewer_scopes()
 
+    bind = op.get_bind()
+    for enum_type in (
+        dingtalk_org_sync_batch_status_enum,
+        dingtalk_org_sync_trigger_enum,
+        dingtalk_org_sync_item_kind_enum,
+        dingtalk_org_sync_action_enum,
+        dingtalk_org_sync_item_status_enum,
+    ):
+        enum_type.create(bind, checkfirst=True)
+
     op.add_column("org_unit", sa.Column("dingtalk_dept_id", sa.BigInteger(), nullable=True))
     op.create_check_constraint(
         "ck_org_unit_dingtalk_dept_id_positive",
@@ -213,22 +253,24 @@ def upgrade() -> None:
         sa.Column("public_id", sa.String(length=32), nullable=False),
         sa.Column(
             "status",
-            sa.Enum(
-                "PREVIEWED",
-                "APPLIED",
-                "STALE",
-                name="dingtalk_org_sync_batch_status",
-            ),
+            dingtalk_org_sync_batch_status_enum,
             server_default="PREVIEWED",
             nullable=False,
         ),
         sa.Column("snapshot_hash", sa.String(length=64), nullable=False),
+        sa.Column("root_config_hash", sa.String(length=64), nullable=False),
+        sa.Column(
+            "trigger",
+            dingtalk_org_sync_trigger_enum,
+            nullable=False,
+            server_default="MANUAL",
+        ),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column(
             "requested_by_user_id",
             sa.BigInteger(),
             sa.ForeignKey("app_user.id"),
-            nullable=False,
+            nullable=True,
         ),
         sa.Column(
             "applied_by_user_id",
@@ -242,12 +284,21 @@ def upgrade() -> None:
         sa.Column("store_conflict_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("ready_reviewer_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("reviewer_conflict_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("remote_region_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("local_region_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("ready_region_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("region_conflict_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("warning_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("last_checked_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("applied_at", sa.DateTime(timezone=True), nullable=True),
         *_timestamp_columns(),
         sa.CheckConstraint(
             "remote_store_count >= 0 AND local_store_count >= 0 "
             "AND ready_store_count >= 0 AND store_conflict_count >= 0 "
-            "AND ready_reviewer_count >= 0 AND reviewer_conflict_count >= 0",
+            "AND ready_reviewer_count >= 0 AND reviewer_conflict_count >= 0 "
+            "AND remote_region_count >= 0 AND local_region_count >= 0 "
+            "AND ready_region_count >= 0 AND region_conflict_count >= 0 "
+            "AND warning_count >= 0",
             name="ck_dingtalk_org_sync_batch_nonnegative_counts",
         ),
         sa.CheckConstraint(
@@ -286,21 +337,16 @@ def upgrade() -> None:
         sa.Column("row_key", sa.String(length=160), nullable=False),
         sa.Column(
             "kind",
-            sa.Enum("STORE", "REVIEWER", name="dingtalk_org_sync_item_kind"),
+            dingtalk_org_sync_item_kind_enum,
             nullable=False,
         ),
         sa.Column(
             "status",
-            sa.Enum(
-                "READY",
-                "CONFLICT",
-                "APPLIED",
-                "IGNORED",
-                name="dingtalk_org_sync_item_status",
-            ),
+            dingtalk_org_sync_item_status_enum,
             server_default="READY",
             nullable=False,
         ),
+        sa.Column("action", dingtalk_org_sync_action_enum, nullable=False),
         sa.Column("remote_department_id", sa.BigInteger(), nullable=True),
         sa.Column("remote_department_name", sa.String(length=128), nullable=False),
         sa.Column("remote_department_path", sa.String(length=1024), nullable=False),
@@ -324,9 +370,16 @@ def upgrade() -> None:
             sa.ForeignKey("employee.id"),
             nullable=True,
         ),
+        sa.Column("proposed_org_type", org_type_enum, nullable=True),
         sa.Column("department", department_enum, nullable=True),
         sa.Column("match_method", sa.String(length=64), nullable=False),
         sa.Column("conflict_code", sa.String(length=64), nullable=True),
+        sa.Column(
+            "change_fields",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+            server_default=sa.text("'[]'::jsonb"),
+        ),
         sa.Column("baseline_fingerprint", sa.String(length=64), nullable=False),
         *_timestamp_columns(),
         sa.CheckConstraint(
@@ -358,6 +411,44 @@ def upgrade() -> None:
         ["batch_id", "proposed_org_unit_id"],
     )
 
+    op.create_table(
+        "dingtalk_org_sync_notification",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "batch_id",
+            sa.BigInteger(),
+            sa.ForeignKey("dingtalk_org_sync_batch.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "recipient_user_id",
+            sa.BigInteger(),
+            sa.ForeignKey("app_user.id"),
+            nullable=False,
+        ),
+        sa.Column(
+            "status",
+            dingtalk_delivery_status_enum,
+            nullable=False,
+        ),
+        sa.Column("error_code", sa.String(length=64), nullable=True),
+        sa.Column("attempt_count", sa.Integer(), nullable=False),
+        sa.Column("dispatched_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("provider_task_id", sa.BigInteger(), nullable=True),
+        sa.Column("idempotency_key", sa.String(length=160), nullable=False),
+        *_timestamp_columns(),
+        sa.UniqueConstraint(
+            "idempotency_key",
+            name="uq_dingtalk_org_sync_notification_key",
+        ),
+    )
+    for column in ("batch_id", "recipient_user_id", "status"):
+        op.create_index(
+            f"ix_dingtalk_org_sync_notification_{column}",
+            "dingtalk_org_sync_notification",
+            [column],
+        )
+
     op.execute(sa.text("""
             INSERT INTO permission (code, name)
             VALUES ('dingtalk_org:sync', '同步钉钉门店与负责人')
@@ -375,6 +466,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    for column in ("status", "recipient_user_id", "batch_id"):
+        op.drop_index(
+            f"ix_dingtalk_org_sync_notification_{column}",
+            table_name="dingtalk_org_sync_notification",
+        )
+    op.drop_table("dingtalk_org_sync_notification")
+
     op.drop_index(
         "ix_dingtalk_org_sync_item_batch_org_unit",
         table_name="dingtalk_org_sync_item",
@@ -434,7 +532,9 @@ def downgrade() -> None:
     bind = op.get_bind()
     for enum_name in (
         "dingtalk_org_sync_item_status",
+        "dingtalk_org_sync_action",
         "dingtalk_org_sync_item_kind",
+        "dingtalk_org_sync_trigger",
         "dingtalk_org_sync_batch_status",
     ):
         sa.Enum(name=enum_name).drop(bind, checkfirst=True)

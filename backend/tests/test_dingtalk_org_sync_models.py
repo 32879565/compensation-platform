@@ -8,11 +8,14 @@ import app.models as models
 from app.auth.permissions import PERMISSION_CATALOG, ROLE_DEFINITIONS, Perm
 from app.models.auth import User, UserReviewScope
 from app.models.dingtalk import (
+    DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncBatchStatus,
     DingTalkOrgSyncItem,
     DingTalkOrgSyncItemKind,
     DingTalkOrgSyncItemStatus,
+    DingTalkOrgSyncNotification,
+    DingTalkOrgSyncTrigger,
 )
 from app.models.org import OrgUnit
 
@@ -69,7 +72,7 @@ def test_org_sync_batch_records_preview_lifecycle_and_aggregate_counts() -> None
     assert isinstance(table.c.snapshot_hash.type, String)
     assert table.c.snapshot_hash.type.length == 64
     assert isinstance(table.c.expires_at.type, DateTime)
-    assert table.c.requested_by_user_id.nullable is False
+    assert table.c.requested_by_user_id.nullable is True
     assert table.c.applied_by_user_id.nullable is True
     assert table.c.applied_at.nullable is True
     for column_name in (
@@ -79,6 +82,11 @@ def test_org_sync_batch_records_preview_lifecycle_and_aggregate_counts() -> None
         "store_conflict_count",
         "ready_reviewer_count",
         "reviewer_conflict_count",
+        "remote_region_count",
+        "local_region_count",
+        "ready_region_count",
+        "region_conflict_count",
+        "warning_count",
     ):
         column = table.c[column_name]
         assert isinstance(column.type, Integer)
@@ -96,7 +104,7 @@ def test_org_sync_batch_records_preview_lifecycle_and_aggregate_counts() -> None
 def test_org_sync_item_keeps_remote_identity_encrypted_and_rows_idempotent() -> None:
     table = DingTalkOrgSyncItem.__table__
 
-    assert {kind.value for kind in DingTalkOrgSyncItemKind} == {"STORE", "REVIEWER"}
+    assert {kind.value for kind in DingTalkOrgSyncItemKind} == {"REGION", "STORE", "REVIEWER"}
     assert {status.value for status in DingTalkOrgSyncItemStatus} == {
         "READY",
         "CONFLICT",
@@ -128,12 +136,46 @@ def test_org_sync_item_keeps_remote_identity_encrypted_and_rows_idempotent() -> 
     )
 
 
+def test_org_sync_models_cover_regions_actions_and_scheduled_notifications() -> None:
+    assert {action.value for action in DingTalkOrgSyncAction} == {
+        "LINK",
+        "CREATE",
+        "UPDATE",
+        "ACTIVATE",
+        "DEACTIVATE",
+        "ASSIGN_SCOPE",
+        "REMOVE_SCOPE",
+        "NO_CHANGE",
+    }
+    assert {trigger.value for trigger in DingTalkOrgSyncTrigger} == {"MANUAL", "SCHEDULED"}
+
+    batch = DingTalkOrgSyncBatch.__table__
+    assert batch.c.trigger.nullable is False
+    assert batch.c.root_config_hash.type.length == 64
+    assert batch.c.root_config_hash.nullable is False
+    assert batch.c.last_checked_at.nullable is True
+
+    item = DingTalkOrgSyncItem.__table__
+    assert item.c.action.nullable is False
+    assert item.c.change_fields.nullable is False
+    assert item.c.proposed_org_type.nullable is True
+
+    notification = DingTalkOrgSyncNotification.__table__
+    assert notification.c.batch_id.nullable is False
+    assert notification.c.recipient_user_id.nullable is False
+    assert notification.c.idempotency_key.type.length == 160
+    assert ("idempotency_key",) in _unique_column_sets(notification)
+
+
 def test_org_sync_models_are_available_from_the_central_model_registry() -> None:
     assert models.DingTalkOrgSyncBatch is DingTalkOrgSyncBatch
     assert models.DingTalkOrgSyncItem is DingTalkOrgSyncItem
     assert models.DingTalkOrgSyncBatchStatus is DingTalkOrgSyncBatchStatus
     assert models.DingTalkOrgSyncItemKind is DingTalkOrgSyncItemKind
     assert models.DingTalkOrgSyncItemStatus is DingTalkOrgSyncItemStatus
+    assert models.DingTalkOrgSyncAction is DingTalkOrgSyncAction
+    assert models.DingTalkOrgSyncNotification is DingTalkOrgSyncNotification
+    assert models.DingTalkOrgSyncTrigger is DingTalkOrgSyncTrigger
 
 
 def test_direct_org_sync_permission_is_limited_to_hr_and_super_admin() -> None:

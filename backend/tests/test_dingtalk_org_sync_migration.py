@@ -6,7 +6,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
-from sqlalchemy import BigInteger, String
+from sqlalchemy import BigInteger, Integer, String, UniqueConstraint
 from sqlalchemy.dialects import postgresql
 
 
@@ -141,6 +141,7 @@ def test_upgrade_adds_direct_sync_schema_and_hr_permissions(monkeypatch) -> None
     assert set(created_tables) == {
         "dingtalk_org_sync_batch",
         "dingtalk_org_sync_item",
+        "dingtalk_org_sync_notification",
     }
     batch_columns = {
         column.name: column
@@ -154,14 +155,41 @@ def test_upgrade_adds_direct_sync_schema_and_hr_permissions(monkeypatch) -> None
     }
     assert batch_columns["public_id"].type.length == 32
     assert batch_columns["snapshot_hash"].type.length == 64
-    assert batch_columns["requested_by_user_id"].nullable is False
+    assert batch_columns["requested_by_user_id"].nullable is True
     assert batch_columns["applied_by_user_id"].nullable is True
+    assert batch_columns["trigger"].nullable is False
+    assert batch_columns["root_config_hash"].type.length == 64
+    assert batch_columns["last_checked_at"].nullable is True
+    for column_name in (
+        "remote_region_count",
+        "local_region_count",
+        "ready_region_count",
+        "region_conflict_count",
+        "warning_count",
+    ):
+        assert isinstance(batch_columns[column_name].type, Integer)
+        assert batch_columns[column_name].nullable is False
     assert item_columns["remote_user_id_hash"].type.length == 64
     assert item_columns["applied_identity_proof"].type.length == 64
     assert item_columns["applied_identity_proof"].nullable is True
     assert item_columns["remote_department_id"].nullable is True
     assert item_columns["proposed_parent_org_unit_id"].nullable is True
     assert item_columns["baseline_fingerprint"].nullable is False
+    assert item_columns["action"].nullable is False
+    assert item_columns["change_fields"].nullable is False
+    assert item_columns["proposed_org_type"].nullable is True
+    notification_columns = {
+        column.name: column
+        for column in created_tables["dingtalk_org_sync_notification"]
+        if hasattr(column, "name")
+    }
+    assert notification_columns["idempotency_key"].type.length == 160
+    notification_constraints = {
+        constraint.name
+        for constraint in created_tables["dingtalk_org_sync_notification"]
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert "uq_dingtalk_org_sync_notification_key" in notification_constraints
 
     executed_sql = "\n".join(
         str(args[0]) for name, (args, _kwargs) in op.actions if name == "execute"
@@ -179,7 +207,11 @@ def test_downgrade_removes_sync_schema_in_dependency_order(monkeypatch) -> None:
     migration.downgrade()
 
     dropped_tables = [args[0] for name, (args, _kwargs) in op.actions if name == "drop_table"]
-    assert dropped_tables == ["dingtalk_org_sync_item", "dingtalk_org_sync_batch"]
+    assert dropped_tables == [
+        "dingtalk_org_sync_notification",
+        "dingtalk_org_sync_item",
+        "dingtalk_org_sync_batch",
+    ]
     dropped_columns = {
         (args[0], args[1]) for name, (args, _kwargs) in op.actions if name == "drop_column"
     }
@@ -200,6 +232,8 @@ def test_downgrade_removes_sync_schema_in_dependency_order(monkeypatch) -> None:
         "dingtalk_org_sync_item_status",
         "dingtalk_org_sync_item_kind",
         "dingtalk_org_sync_batch_status",
+        "dingtalk_org_sync_action",
+        "dingtalk_org_sync_trigger",
     }
 
 
