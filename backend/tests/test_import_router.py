@@ -361,7 +361,11 @@ def test_publish_stages_scoped_review_delivery_and_audits_counts_only(monkeypatc
     assert response.selected_stores == 2
     assert response.selected_scopes == 3
     assert response.sandbox is True
-    publish_call.assert_called_once_with(session, imported)
+    publish_call.assert_called_once_with(
+        session,
+        imported,
+        store_ids=frozenset({11, 12}),
+    )
     stage_call.assert_called_once_with(
         session,
         batch_id=31,
