@@ -140,6 +140,36 @@ class OrganizationApplyResult:
     already_applied: bool
 
 
+def get_latest_organization_preview(session: Session) -> OrganizationPreview | None:
+    """Return the newest persisted organization preview without contacting DingTalk."""
+
+    batch = session.scalars(
+        select(DingTalkOrgSyncBatch)
+        .where(
+            DingTalkOrgSyncBatch.status.in_(
+                (
+                    DingTalkOrgSyncBatchStatus.PREVIEWED,
+                    DingTalkOrgSyncBatchStatus.APPLIED,
+                    DingTalkOrgSyncBatchStatus.STALE,
+                )
+            )
+        )
+        .order_by(DingTalkOrgSyncBatch.created_at.desc(), DingTalkOrgSyncBatch.id.desc())
+        .limit(1)
+    ).one_or_none()
+    if batch is None:
+        return None
+
+    items = _load_preview_items(session, batch.id)
+    state = _load_local_state(session)
+    return _organization_preview_result(
+        batch,
+        items,
+        state=state,
+        reviewer_metadata=_stored_reviewer_metadata(state, items),
+    )
+
+
 def get_applied_organization_sync_result(
     session: Session,
     public_id: str,
@@ -510,7 +540,9 @@ def _optional_get[T](mapping: dict[int, T], key: int | None) -> T | None:
     return mapping.get(key) if key is not None else None
 
 
-def _state_indexes(state: _LocalState) -> tuple[
+def _state_indexes(
+    state: _LocalState,
+) -> tuple[
     dict[int, OrgUnit],
     dict[int, Employee],
     dict[int, list[User]],
@@ -1459,6 +1491,28 @@ def _staged_reviewer_metadata(
     presentation fields from those inputs without entering either planner.
     """
 
+    remote_names_by_hash: dict[str, list[str]] = defaultdict(list)
+    for remote_user in snapshot.users:
+        if remote_user.active:
+            remote_names_by_hash[
+                blind_index_dingtalk_user_id(remote_user.user_id, key=encryption_key)
+            ].append(remote_user.name)
+
+    return _stored_reviewer_metadata(state, items, remote_names_by_hash=remote_names_by_hash)
+
+
+def _stored_reviewer_metadata(
+    state: _LocalState,
+    items: list[DingTalkOrgSyncItem],
+    *,
+    remote_names_by_hash: dict[str, list[str]] | None = None,
+) -> dict[str, _ReviewerDraft]:
+    """Build safe reviewer display fields from persisted state only.
+
+    Provider names are available only when a caller supplies a just-read snapshot.
+    Latest-status reads intentionally omit them rather than touching the provider.
+    """
+
     (
         _org_units_by_id,
         employees_by_id,
@@ -1467,13 +1521,6 @@ def _staged_reviewer_metadata(
         _role_codes_by_user,
         scope_users_by_pair,
     ) = _state_indexes(state)
-    remote_names_by_hash: dict[str, list[str]] = defaultdict(list)
-    for remote_user in snapshot.users:
-        if remote_user.active:
-            remote_names_by_hash[
-                blind_index_dingtalk_user_id(remote_user.user_id, key=encryption_key)
-            ].append(remote_user.name)
-
     metadata: dict[str, _ReviewerDraft] = {}
     for item in items:
         if item.kind != DingTalkOrgSyncItemKind.REVIEWER:
@@ -1486,7 +1533,7 @@ def _staged_reviewer_metadata(
         )
         remote_names = (
             remote_names_by_hash.get(item.remote_user_id_hash, [])
-            if item.remote_user_id_hash is not None
+            if remote_names_by_hash is not None and item.remote_user_id_hash is not None
             else []
         )
         metadata[item.row_key] = _ReviewerDraft(

@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 
 import app.dingtalk.org_sync as org_sync
 from app.auth.bootstrap import seed_rbac
+from app.auth.permissions import Perm
 from app.core.config import Settings, get_settings
 from app.core.security import hash_password
 from app.dingtalk.client import (
@@ -22,7 +23,16 @@ from app.dingtalk.client import (
 from app.dingtalk.org_sync import preview_organization_sync
 from app.dingtalk.read_sync import blind_index_dingtalk_user_id
 from app.models.audit import AuditLog
-from app.models.auth import RefreshToken, Role, User, UserReviewScope, UserRole
+from app.models.auth import (
+    Permission,
+    RefreshToken,
+    Role,
+    RolePermission,
+    User,
+    UserOrgScope,
+    UserReviewScope,
+    UserRole,
+)
 from app.models.dingtalk import (
     DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
@@ -270,6 +280,96 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
     assert "店长甲" not in staged_values
     assert "厨管乙" not in staged_values
     assert fake.calls == 1
+
+
+def test_organization_latest_returns_safe_cached_preview_without_provider_read(client, db_session):
+    _seed_store_and_managers(db_session)
+    admin = _group_hr(db_session, "org-sync-latest")
+    fake = _FakeOrganizationClient()
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+    headers = _token(client, admin.username)
+
+    preview = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
+    assert preview.status_code == 200, preview.text
+    provider_calls_before_latest = fake.calls
+
+    latest = client.get("/api/dingtalk/sync/organization/latest", headers=headers)
+
+    assert latest.status_code == 200, latest.text
+    assert latest.headers["cache-control"] == "no-store"
+    body = latest.json()
+    assert body["batch_id"] == preview.json()["batch_id"]
+    assert body["trigger"] in {"MANUAL", "SCHEDULED"}
+    assert body["region_items"] == []
+    assert body["store_items"][0]["kind"] == "STORE"
+    assert body["store_items"][0]["change_fields"] == ["dingtalk_dept_id"]
+    assert "remote_user_id_hash" not in latest.text
+    assert "snapshot_hash" not in latest.text
+    assert "local_baseline_hash" not in latest.text
+    assert fake.calls == provider_calls_before_latest
+
+
+def test_organization_latest_returns_not_found_without_a_preview(client, db_session):
+    admin = _group_hr(db_session, "org-sync-latest-empty")
+    fake = _FakeOrganizationClient()
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    latest = client.get(
+        "/api/dingtalk/sync/organization/latest",
+        headers=_token(client, admin.username),
+    )
+
+    assert latest.status_code == 404
+    assert fake.calls == 0
+
+
+def test_organization_latest_rejects_scoped_hr(client, db_session):
+    store = _seed_store_and_managers(db_session)
+    seed_rbac(db_session)
+    scoped_hr = User(
+        username="org-sync-latest-scoped",
+        password_hash=hash_password("StrongPass123!"),
+    )
+    scoped_role = Role(code="SCOPED_ORG_SYNC_HR", name="Scoped organization sync HR")
+    db_session.add_all([scoped_hr, scoped_role])
+    db_session.flush()
+    permissions = list(
+        db_session.scalars(
+            select(Permission).where(
+                Permission.code.in_((Perm.NOTIFICATION_MANAGE, Perm.DINGTALK_ORG_SYNC))
+            )
+        ).all()
+    )
+    db_session.add_all(
+        [
+            UserRole(user_id=scoped_hr.id, role_id=scoped_role.id),
+            UserOrgScope(user_id=scoped_hr.id, org_unit_id=store.id),
+            *[
+                RolePermission(role_id=scoped_role.id, permission_id=permission.id)
+                for permission in permissions
+            ],
+        ]
+    )
+    db_session.commit()
+    fake = _FakeOrganizationClient()
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    latest = client.get(
+        "/api/dingtalk/sync/organization/latest",
+        headers=_token(client, scoped_hr.username),
+    )
+
+    assert latest.status_code == 403
+    assert fake.calls == 0
 
 
 def test_organization_preview_persists_the_configured_root_mapping_hash(client, db_session):
@@ -539,6 +639,7 @@ def test_organization_apply_links_store_and_replaces_reviewer_scopes_idempotentl
 
     assert response.status_code == 200, response.text
     assert response.json() == {
+        "applied_regions": 0,
         "applied_stores": 1,
         "applied_reviewers": 2,
         "unresolved": 0,
@@ -616,6 +717,7 @@ def test_organization_apply_links_store_and_replaces_reviewer_scopes_idempotentl
     )
     assert repeated.status_code == 200, repeated.text
     assert repeated.json() == {
+        "applied_regions": 0,
         "applied_stores": 1,
         "applied_reviewers": 2,
         "unresolved": 0,
@@ -2121,9 +2223,7 @@ def test_organization_atomic_apply_stales_locked_baseline_mismatch(client, db_se
     )
 
     assert response.status_code == 409
-    assert (
-        response.json()["detail"] == "Organization data changed during confirmation; preview again"
-    )
+    assert response.json()["detail"] == "组织同步状态冲突，请重新预览"
     db_session.expire_all()
     assert db_session.get(DingTalkOrgSyncBatch, batch.id).status == DingTalkOrgSyncBatchStatus.STALE
     assert (
@@ -2570,6 +2670,7 @@ def test_organization_apply_creates_same_name_store_under_distinct_root_path(cli
 
     assert apply_response.status_code == 200, apply_response.text
     assert apply_response.json() == {
+        "applied_regions": 0,
         "applied_stores": 2,
         "applied_reviewers": 4,
         "unresolved": 0,

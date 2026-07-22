@@ -42,6 +42,7 @@ from app.dingtalk.org_sync import (
     OrganizationPreview,
     apply_organization_sync,
     get_applied_organization_sync_result,
+    get_latest_organization_preview,
     preview_organization_sync,
     take_organization_sync_lock,
 )
@@ -64,6 +65,20 @@ _PREVIEW_ROW_LIMIT = 200
 _logger = get_logger("app.dingtalk_sync")
 AttendanceRefreshRunner = Callable[[str, tuple[int, str]], None]
 _ORGANIZATION_READ_LOCK = threading.Lock()
+_ORG_SYNC_HTTP_STATUS = {
+    "BATCH_NOT_FOUND": 404,
+    "ORG_PREVIEW_NOT_FOUND": 404,
+    "ORG_PROVIDER_UNAVAILABLE": 502,
+    "ORG_ROOT_CONFIG_INVALID": 409,
+    "ORG_ROOT_NOT_FOUND": 409,
+}
+_ORG_SYNC_HTTP_DETAIL = {
+    "BATCH_NOT_FOUND": "未找到组织同步预览",
+    "ORG_PREVIEW_NOT_FOUND": "未找到组织同步预览",
+    "ORG_PROVIDER_UNAVAILABLE": "钉钉组织服务暂不可用",
+    "ORG_ROOT_CONFIG_INVALID": "钉钉组织同步根配置无效",
+    "ORG_ROOT_NOT_FOUND": "钉钉组织同步根节点不存在",
+}
 
 
 def _read_organization_snapshot(
@@ -173,14 +188,14 @@ class OrganizationNodeItemOut(BaseModel):
     remote_department_id: int | None
     remote_department_name: str
     remote_department_path: str
-    action: Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE"]
-    change_fields: list[str]
+    action: Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE", "NO_CHANGE"]
+    change_fields: list[Literal["name", "parent_id", "dingtalk_dept_id"]]
     match_method: str
     proposed_org_unit_id: int | None
     proposed_org_unit_name: str | None
     proposed_parent_org_unit_id: int | None
     proposed_parent_org_unit_name: str | None
-    status: Literal["READY", "CONFLICT"]
+    status: Literal["READY", "CONFLICT", "APPLIED", "IGNORED"]
     conflict_code: str | None
 
 
@@ -196,7 +211,7 @@ class OrganizationReviewerItemOut(BaseModel):
     current_reviewer_name: str | None
     proposed_employee_id: int | None
     proposed_employee_name: str | None
-    status: Literal["READY", "CONFLICT"]
+    status: Literal["READY", "CONFLICT", "APPLIED", "IGNORED"]
     conflict_code: str | None
 
 
@@ -223,6 +238,7 @@ class OrganizationPreviewOut(BaseModel):
 
 
 class OrganizationApplyOut(BaseModel):
+    applied_regions: int
     applied_stores: int
     applied_reviewers: int
     unresolved: int
@@ -377,16 +393,19 @@ def _organization_preview_response(preview: OrganizationPreview) -> Organization
                 remote_department_name=item.remote_department_name,
                 remote_department_path=item.remote_department_path,
                 action=cast(
-                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE"],
+                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE", "NO_CHANGE"],
                     item.action.value,
                 ),
-                change_fields=list(item.change_fields),
+                change_fields=cast(
+                    list[Literal["name", "parent_id", "dingtalk_dept_id"]],
+                    list(item.change_fields),
+                ),
                 match_method=item.match_method,
                 proposed_org_unit_id=item.proposed_org_unit_id,
                 proposed_org_unit_name=item.proposed_org_unit_name,
                 proposed_parent_org_unit_id=item.proposed_parent_org_unit_id,
                 proposed_parent_org_unit_name=item.proposed_parent_org_unit_name,
-                status=cast(Literal["READY", "CONFLICT"], item.status.value),
+                status=cast(Literal["READY", "CONFLICT", "APPLIED", "IGNORED"], item.status.value),
                 conflict_code=item.conflict_code,
             )
             for item in preview.region_items
@@ -399,16 +418,19 @@ def _organization_preview_response(preview: OrganizationPreview) -> Organization
                 remote_department_name=item.remote_department_name,
                 remote_department_path=item.remote_department_path,
                 action=cast(
-                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE"],
+                    Literal["LINK", "CREATE", "ACTIVATE", "UPDATE", "DEACTIVATE", "NO_CHANGE"],
                     item.action.value,
                 ),
-                change_fields=list(item.change_fields),
+                change_fields=cast(
+                    list[Literal["name", "parent_id", "dingtalk_dept_id"]],
+                    list(item.change_fields),
+                ),
                 match_method=item.match_method,
                 proposed_org_unit_id=item.proposed_org_unit_id,
                 proposed_org_unit_name=item.proposed_org_unit_name,
                 proposed_parent_org_unit_id=item.proposed_parent_org_unit_id,
                 proposed_parent_org_unit_name=item.proposed_parent_org_unit_name,
-                status=cast(Literal["READY", "CONFLICT"], item.status.value),
+                status=cast(Literal["READY", "CONFLICT", "APPLIED", "IGNORED"], item.status.value),
                 conflict_code=item.conflict_code,
             )
             for item in preview.store_items
@@ -426,11 +448,34 @@ def _organization_preview_response(preview: OrganizationPreview) -> Organization
                 current_reviewer_name=item.current_reviewer_name,
                 proposed_employee_id=item.proposed_employee_id,
                 proposed_employee_name=item.proposed_employee_name,
-                status=cast(Literal["READY", "CONFLICT"], item.status.value),
+                status=cast(Literal["READY", "CONFLICT", "APPLIED", "IGNORED"], item.status.value),
                 conflict_code=item.conflict_code,
             )
             for item in preview.reviewer_items
         ],
+    )
+
+
+def _organization_sync_http_error(exc: DingTalkOrganizationSyncError) -> HTTPException:
+    _logger.warning(
+        "DingTalk organization sync failed",
+        extra={"context": {"code": exc.code, "error_type": type(exc).__name__}},
+    )
+    return HTTPException(
+        status_code=_ORG_SYNC_HTTP_STATUS.get(exc.code, 409),
+        detail=_ORG_SYNC_HTTP_DETAIL.get(exc.code, "组织同步状态冲突，请重新预览"),
+    )
+
+
+def _organization_provider_http_error(exc: DingTalkClientError) -> HTTPException:
+    code = "ORG_PROVIDER_UNAVAILABLE"
+    _logger.warning(
+        "DingTalk organization provider read failed",
+        extra={"context": {"code": code, "error_type": type(exc).__name__}},
+    )
+    return HTTPException(
+        status_code=_ORG_SYNC_HTTP_STATUS[code],
+        detail=_ORG_SYNC_HTTP_DETAIL[code],
     )
 
 
@@ -676,17 +721,24 @@ def preview_dingtalk_organization(
             kitchen_manager_titles=settings.dingtalk_kitchen_manager_title_set,
         )
     except DingTalkClientError as exc:
-        _logger.warning(
-            "DingTalk organization read failed",
-            extra={"context": {"error_type": type(exc).__name__}},
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to read the DingTalk organization",
-        ) from None
+        raise _organization_provider_http_error(exc) from None
     except DingTalkOrganizationSyncError as exc:
-        http_status = 409 if exc.code.startswith("ORG_") else 502
-        raise HTTPException(status_code=http_status, detail=str(exc)) from None
+        raise _organization_sync_http_error(exc) from None
+    return _organization_preview_response(preview)
+
+
+@router.get("/organization/latest", response_model=OrganizationPreviewOut)
+def get_latest_dingtalk_organization(
+    response: Response,
+    _principal: Principal = Depends(_require_organization_sync_manager),
+    session: Session = Depends(get_session),
+) -> OrganizationPreviewOut:
+    response.headers["Cache-Control"] = "no-store"
+    preview = get_latest_organization_preview(session)
+    if preview is None:
+        raise _organization_sync_http_error(
+            DingTalkOrganizationSyncError("ORG_PREVIEW_NOT_FOUND", "No organization preview")
+        )
     return _organization_preview_response(preview)
 
 
@@ -708,6 +760,7 @@ def apply_dingtalk_organization(
         if result is not None:
             session.rollback()
             return OrganizationApplyOut(
+                applied_regions=result.applied_regions,
                 applied_stores=result.applied_stores,
                 applied_reviewers=result.applied_reviewers,
                 unresolved=result.unresolved,
@@ -733,18 +786,11 @@ def apply_dingtalk_organization(
             root_mappings=settings.dingtalk_org_root_mapping_pairs,
         )
     except DingTalkClientError as exc:
-        _logger.warning(
-            "DingTalk organization confirmation read failed",
-            extra={"context": {"error_type": type(exc).__name__}},
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to read the DingTalk organization",
-        ) from None
+        raise _organization_provider_http_error(exc) from None
     except DingTalkOrganizationSyncError as exc:
-        http_status = 404 if exc.code == "BATCH_NOT_FOUND" else 409
-        raise HTTPException(status_code=http_status, detail=str(exc)) from None
+        raise _organization_sync_http_error(exc) from None
     return OrganizationApplyOut(
+        applied_regions=result.applied_regions,
         applied_stores=result.applied_stores,
         applied_reviewers=result.applied_reviewers,
         unresolved=result.unresolved,
