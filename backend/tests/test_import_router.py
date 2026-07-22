@@ -7,7 +7,6 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException, UploadFile
 
 from app.core.config import DingTalkMode
-from app.dingtalk.service import DeliveryStageSummary
 from app.importing.excel import ReadResult, WorkbookLimitError
 from app.importing.publish import ImportPublishSummary
 from app.importing.store_aliases import STORE_ALIASES
@@ -322,11 +321,12 @@ def test_publish_stages_scoped_review_delivery_and_audits_counts_only(monkeypatc
         scopes=4,
         already_published=False,
     )
-    delivery_summary = DeliveryStageSummary(
+    delivery_summary = SimpleNamespace(
         routed=3,
         configuration_failures=1,
         existing=0,
         pending_delivery_ids=(),
+        scopes=3,
     )
     publish_call = Mock(return_value=publish_summary)
     stage_call = Mock(return_value=delivery_summary)
@@ -343,6 +343,7 @@ def test_publish_stages_scoped_review_delivery_and_audits_counts_only(monkeypatc
 
     response = imports_router.publish_batch_for_review(
         batch_id=17,
+        selection=SimpleNamespace(store_ids=[11, 12]),
         background_tasks=BackgroundTasks(),
         principal=principal,
         settings=settings,
@@ -357,13 +358,40 @@ def test_publish_stages_scoped_review_delivery_and_audits_counts_only(monkeypatc
     assert response.routed == 3
     assert response.configuration_failures == 1
     assert response.existing == 0
+    assert response.selected_stores == 2
+    assert response.selected_scopes == 3
     assert response.sandbox is True
     publish_call.assert_called_once_with(session, imported)
-    stage_call.assert_called_once_with(session, batch_id=31, settings=settings)
+    stage_call.assert_called_once_with(
+        session,
+        batch_id=31,
+        settings=settings,
+        org_unit_ids=frozenset({11, 12}),
+    )
     assert [call["action"] for call in audit_calls] == [
         "import.publish",
         "dingtalk.review.stage",
     ]
     assert "员工" not in str(audit_calls)
     assert "工资" not in str(audit_calls)
+    assert audit_calls[0]["detail"]["selected_store_ids"] == [11, 12]
+    assert audit_calls[1]["detail"]["selected_stores"] == 2
+    assert audit_calls[1]["detail"]["selected_scopes"] == 3
     session.commit.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "store_ids",
+    [
+        pytest.param([], id="empty"),
+        pytest.param([11, 11], id="duplicate"),
+        pytest.param([0], id="zero"),
+        pytest.param([-1], id="negative"),
+        pytest.param(["11"], id="numeric-string"),
+        pytest.param([True], id="boolean"),
+        pytest.param(list(range(1, 502)), id="too-many"),
+    ],
+)
+def test_publish_selection_schema_rejects_invalid_store_lists(store_ids):
+    with pytest.raises(ValueError):
+        imports_router.PublishSelection(store_ids=store_ids)

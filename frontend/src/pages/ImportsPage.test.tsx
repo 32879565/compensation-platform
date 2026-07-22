@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const importsApi = vi.hoisted(() => ({
   confirmSalaryImport: vi.fn(),
+  fetchSalaryImportPublishTargets: vi.fn(),
   fetchSalaryImportRows: vi.fn(),
   publishSalaryImport: vi.fn(),
   uploadSalaryImport: vi.fn(),
@@ -24,6 +25,27 @@ vi.mock('../auth/AuthContext', () => ({
 }))
 
 import ImportsPage from './ImportsPage'
+
+const publishTargets = [
+  {
+    store_id: 101,
+    store_name: '一店',
+    employee_count: 1,
+    departments: ['DINING'],
+  },
+  {
+    store_id: 202,
+    store_name: '二店',
+    employee_count: 1,
+    departments: ['KITCHEN'],
+  },
+  {
+    store_id: 303,
+    store_name: '三店',
+    employee_count: 1,
+    departments: ['DINING', 'KITCHEN'],
+  },
+]
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -50,6 +72,7 @@ describe('ImportsPage salary workbook workflow', () => {
     auth.permissions = ['import:run', 'payroll:run', 'payroll:read']
     auth.globalPermissions = ['import:run', 'payroll:run', 'payroll:read']
     importsApi.confirmSalaryImport.mockResolvedValue({ written: 2 })
+    importsApi.fetchSalaryImportPublishTargets.mockResolvedValue(publishTargets)
     importsApi.publishSalaryImport.mockResolvedValue({
       import_batch_id: 8,
       payroll_batch_id: 19,
@@ -148,13 +171,13 @@ describe('ImportsPage salary workbook workflow', () => {
     ).toBe(true)
   })
 
-  it('confirms a clean batch, pushes it to reviewers, and links to payroll', async () => {
+  it('loads unselected stores after confirmation and locks the checked stores after publishing', async () => {
     importsApi.uploadSalaryImport.mockResolvedValue({
       id: 8,
       filename: '七月薪资.xlsx',
       period: '2026-07',
       status: 'PARSED',
-      total_rows: 2,
+      total_rows: 3,
       error_rows: 0,
     })
     importsApi.fetchSalaryImportRows.mockResolvedValue([
@@ -178,22 +201,75 @@ describe('ImportsPage salary workbook workflow', () => {
         errors: [],
         status: 'OK',
       },
+      {
+        row_index: 2,
+        period: '2026-07',
+        emp_no: 'E003',
+        name: '陈晓',
+        store_name: '三店',
+        parsed_fields: { 应发工资: '5000.00' },
+        errors: [],
+        status: 'OK',
+      },
     ])
+    importsApi.confirmSalaryImport.mockResolvedValue({ written: 3 })
+    importsApi.fetchSalaryImportPublishTargets.mockResolvedValueOnce(publishTargets)
+    importsApi.publishSalaryImport.mockResolvedValueOnce({
+      import_batch_id: 8,
+      payroll_batch_id: 19,
+      batch_version: 3,
+      employees: 2,
+      scopes: 2,
+      routed: 2,
+      configuration_failures: 0,
+      existing: 0,
+      sandbox: true,
+    })
     renderPage()
 
     await uploadWorkbook()
     expect(await screen.findByText('5200.00')).toBeTruthy()
+    expect(importsApi.fetchSalaryImportPublishTargets).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '确认写入薪资记录' }))
 
     await waitFor(() => expect(importsApi.confirmSalaryImport).toHaveBeenCalledWith(8))
-    expect(await screen.findByText('已确认写入 2 条薪资记录')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: '推送给店长和厨房经理' }))
+    expect(await screen.findByText('已确认写入 3 条薪资记录')).toBeTruthy()
+    await waitFor(() => expect(importsApi.fetchSalaryImportPublishTargets).toHaveBeenCalledWith(8))
 
-    await waitFor(() => expect(importsApi.publishSalaryImport).toHaveBeenCalledWith(8))
+    const firstStore = await screen.findByRole('checkbox', { name: /一店/ })
+    const secondStore = screen.getByRole('checkbox', { name: /二店/ })
+    const thirdStore = screen.getByRole('checkbox', { name: /三店/ })
+    expect((firstStore as HTMLInputElement).checked).toBe(false)
+    expect((secondStore as HTMLInputElement).checked).toBe(false)
+    expect((thirdStore as HTMLInputElement).checked).toBe(false)
+
+    const publish = screen.getByRole('button', { name: '推送给店长和厨房经理' })
+    expect((publish as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(publish)
+    expect(importsApi.publishSalaryImport).not.toHaveBeenCalled()
+
+    fireEvent.click(firstStore)
+    fireEvent.click(secondStore)
+    expect((publish as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(publish)
+
+    expect(importsApi.publishSalaryImport).not.toHaveBeenCalled()
+    expect(await screen.findByText('确认推送薪资复核？')).toBeTruthy()
+    expect(screen.getByText(/一店、二店/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '确认推送' }))
+
+    await waitFor(() =>
+      expect(importsApi.publishSalaryImport).toHaveBeenNthCalledWith(1, 8, [101, 202]),
+    )
     expect(await screen.findByText('复核任务已生成（沙箱模式未实际发送）')).toBeTruthy()
     expect(screen.getByText(/薪资批次 #19.*版本 3.*员工 2 人.*复核范围 2 个/)).toBeTruthy()
     expect(screen.getByText(/通知 2 人.*配置失败 0 人.*沙箱模式/)).toBeTruthy()
     expect(screen.getByRole('link', { name: '查看薪资批次' }).getAttribute('href')).toBe('/payroll')
+    expect(importsApi.fetchSalaryImportPublishTargets).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('checkbox', { name: /一店/ })).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: /二店/ })).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: /三店/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: '推送给店长和厨房经理' })).toBeNull()
   })
 
   it('keeps an idempotent retry action when reviewer notification configuration fails', async () => {
@@ -217,6 +293,7 @@ describe('ImportsPage salary workbook workflow', () => {
         status: 'OK',
       },
     ])
+    importsApi.fetchSalaryImportPublishTargets.mockResolvedValue([publishTargets[0]])
     importsApi.publishSalaryImport
       .mockResolvedValueOnce({
         import_batch_id: 8,
@@ -258,18 +335,23 @@ describe('ImportsPage salary workbook workflow', () => {
 
     await uploadWorkbook()
     fireEvent.click(await screen.findByRole('button', { name: '确认写入薪资记录' }))
+    fireEvent.click(await screen.findByRole('checkbox', { name: /一店/ }))
     fireEvent.click(await screen.findByRole('button', { name: '推送给店长和厨房经理' }))
 
     expect(await screen.findByText('复核任务已生成，部分通知配置失败')).toBeTruthy()
+    expect(importsApi.publishSalaryImport).toHaveBeenNthCalledWith(1, 8, [101])
+    expect(screen.queryByRole('checkbox', { name: /一店/ })).toBeNull()
     fireEvent.click(await screen.findByRole('button', { name: '修复配置后重试推送' }))
 
     await waitFor(() => expect(importsApi.publishSalaryImport).toHaveBeenCalledTimes(2))
+    expect(importsApi.publishSalaryImport).toHaveBeenNthCalledWith(2, 8, [101])
     expect(await screen.findByText('复核任务已生成，部分通知配置失败')).toBeTruthy()
     const retry = screen.getByRole('button', { name: '修复配置后重试推送' })
     expect(retry).toBeTruthy()
     fireEvent.click(retry)
 
     await waitFor(() => expect(importsApi.publishSalaryImport).toHaveBeenCalledTimes(3))
+    expect(importsApi.publishSalaryImport).toHaveBeenNthCalledWith(3, 8, [101])
     expect(await screen.findByText('该导入批次此前已发布，本次未重复创建薪资批次')).toBeTruthy()
     expect(screen.queryByRole('button', { name: '修复配置后重试推送' })).toBeNull()
   })

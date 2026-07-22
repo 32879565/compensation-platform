@@ -6,6 +6,7 @@ vi.mock('./client', () => ({ api: client }))
 
 import {
   confirmSalaryImport,
+  fetchSalaryImportPublishTargets,
   fetchSalaryImportRows,
   publishSalaryImport,
   uploadSalaryImport,
@@ -39,8 +40,23 @@ describe('salary import API', () => {
     expect((body as FormData).get('file')).toBe(file)
   })
 
-  it('reads staging rows, confirms them, and publishes the confirmed batch', async () => {
-    client.get.mockResolvedValueOnce({ data: [] })
+  it('reads staging rows and publish targets, then publishes only the selected stores', async () => {
+    client.get.mockResolvedValueOnce({ data: [] }).mockResolvedValueOnce({
+      data: [
+        {
+          store_id: 11,
+          store_name: '一店',
+          employee_count: 1,
+          departments: ['DINING'],
+        },
+        {
+          store_id: 22,
+          store_name: '二店',
+          employee_count: 1,
+          departments: ['KITCHEN'],
+        },
+      ],
+    })
     client.post.mockResolvedValueOnce({ data: { written: 2 } }).mockResolvedValueOnce({
       data: {
         import_batch_id: 8,
@@ -57,10 +73,14 @@ describe('salary import API', () => {
 
     await fetchSalaryImportRows(8)
     await confirmSalaryImport(8)
-    await publishSalaryImport(8)
+    await fetchSalaryImportPublishTargets(8)
+    await publishSalaryImport(8, [11, 22])
 
-    expect(client.get).toHaveBeenCalledWith('/api/imports/8')
+    expect(client.get).toHaveBeenNthCalledWith(1, '/api/imports/8')
+    expect(client.get).toHaveBeenNthCalledWith(2, '/api/imports/8/publish-targets')
     expect(client.post).toHaveBeenNthCalledWith(1, '/api/imports/8/confirm')
-    expect(client.post).toHaveBeenNthCalledWith(2, '/api/imports/8/publish')
+    expect(client.post).toHaveBeenNthCalledWith(2, '/api/imports/8/publish', {
+      store_ids: [11, 22],
+    })
   })
 })
