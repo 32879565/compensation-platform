@@ -13,6 +13,7 @@ import {
   fetchDingTalkAttendanceSnapshot,
   fetchDingTalkIntegration,
   fetchDingTalkMode,
+  fetchLatestDingTalkOrganization,
   applyDingTalkEmployeeMatches,
   previewDingTalkAttendance,
   previewDingTalkEmployees,
@@ -221,6 +222,9 @@ describe('DingTalk and compensation appeal API client', () => {
   it('previews and applies a staged DingTalk organization sync without sending item data back', async () => {
     const preview = {
       batch_id: '3fe80f532f184247b477694427bad0ce',
+      trigger: 'MANUAL',
+      created_at: '2026-07-22T02:00:00Z',
+      last_checked_at: '2026-07-22T02:01:00Z',
       expires_at: '2026-07-22T04:00:00Z',
       remote_regions: 2,
       local_regions: 1,
@@ -232,6 +236,9 @@ describe('DingTalk and compensation appeal API client', () => {
       store_conflicts: 0,
       ready_reviewers: 2,
       reviewer_conflicts: 1,
+      warnings: 2,
+      baseline_fingerprint: 'must-not-reach-query-consumers',
+      snapshot_hash: 'must-not-reach-query-consumers',
       region_items: [
         {
           id: 100,
@@ -249,6 +256,7 @@ describe('DingTalk and compensation appeal API client', () => {
           status: 'READY',
           conflict_code: null,
           provider_department_secret: 'must-not-reach-query-consumers',
+          baseline_fingerprint: 'must-not-reach-query-consumers',
         },
       ],
       store_items: [
@@ -287,14 +295,17 @@ describe('DingTalk and compensation appeal API client', () => {
           conflict_code: null,
           provider_userid: 'must-not-reach-query-consumers',
           remote_user_id: 'must-not-reach-query-consumers-either',
+          remote_user_id_hash: 'must-not-reach-query-consumers',
         },
       ],
     }
     const applied = {
+      applied_regions: 1,
       applied_stores: 1,
       applied_reviewers: 2,
       unresolved: 2,
       already_applied: false,
+      provider_receipt: 'must-not-reach-query-consumers',
     }
     client.post.mockResolvedValueOnce({ data: preview }).mockResolvedValueOnce({ data: applied })
 
@@ -308,8 +319,12 @@ describe('DingTalk and compensation appeal API client', () => {
     )
     expect(staged.reviewer_items[0]).not.toHaveProperty('provider_userid')
     expect(staged.reviewer_items[0]).not.toHaveProperty('remote_user_id')
+    expect(staged.reviewer_items[0]).not.toHaveProperty('remote_user_id_hash')
     expect(staged.region_items[0]).not.toHaveProperty('provider_department_secret')
+    expect(staged.region_items[0]).not.toHaveProperty('baseline_fingerprint')
     expect(staged.store_items[0]).not.toHaveProperty('provider_department_secret')
+    expect(staged).not.toHaveProperty('baseline_fingerprint')
+    expect(staged).not.toHaveProperty('snapshot_hash')
     expect(staged).toMatchObject({
       remote_regions: 2,
       local_regions: 1,
@@ -354,7 +369,7 @@ describe('DingTalk and compensation appeal API client', () => {
       remote_department_name: '天河店',
       remote_department_path: '集团 / 潮发运营中心 / 天河店',
       department: 'DINING',
-      action: 'REMOVE',
+      action: 'REMOVE_SCOPE',
       dingtalk_name: null,
       proposed_employee_id: null,
       proposed_employee_name: null,
@@ -363,53 +378,86 @@ describe('DingTalk and compensation appeal API client', () => {
       status: 'READY',
       conflict_code: null,
     })
-    expect(result).toEqual(applied)
+    expect(result).toEqual({
+      applied_regions: 1,
+      applied_stores: 1,
+      applied_reviewers: 2,
+      unresolved: 2,
+      already_applied: false,
+    })
+    expect(result).not.toHaveProperty('provider_receipt')
   })
 
-  it('normalizes legacy organization previews into the current safe shape', async () => {
-    client.post.mockResolvedValueOnce({
-      data: {
-        batch_id: 'legacy-organization-preview',
-        expires_at: '2026-07-22T04:00:00Z',
-        remote_stores: 1,
-        local_stores: 1,
-        ready_stores: 1,
-        store_conflicts: 0,
-        ready_reviewers: 0,
-        reviewer_conflicts: 0,
-        store_items: [
-          {
-            id: 101,
-            remote_department_id: null,
-            remote_department_name: 'Closed store',
-            remote_department_path: 'Local / Closed store',
-            action: 'MISSING_IN_DINGTALK',
-            match_method: 'LOCAL_STORE_NOT_VISIBLE',
-            proposed_org_unit_id: 11,
-            proposed_org_unit_name: 'Closed store',
-            proposed_parent_org_unit_id: 1,
-            proposed_parent_org_unit_name: 'Region',
-            status: 'READY',
-            conflict_code: null,
-          },
-        ],
-        reviewer_items: [],
-      },
-    })
-
-    const staged = await previewDingTalkOrganization()
-
-    expect(staged).toMatchObject({
-      remote_regions: 0,
-      local_regions: 0,
+  it('fetches the latest preview with explicit projection and reviewer action normalization', async () => {
+    const latestWire = {
+      batch_id: '3fe80f532f184247b477694427bad0ce',
+      trigger: 'SCHEDULED',
+      created_at: '2026-07-22T02:00:00Z',
+      last_checked_at: '2026-07-22T02:01:00Z',
+      expires_at: '2026-07-22T04:00:00Z',
+      remote_regions: 1,
+      local_regions: 1,
       ready_regions: 0,
       region_conflicts: 0,
+      remote_stores: 1,
+      local_stores: 1,
+      ready_stores: 0,
+      store_conflicts: 0,
+      ready_reviewers: 1,
+      reviewer_conflicts: 1,
+      warnings: 0,
+      baseline_fingerprint: 'secret',
+      snapshot_hash: 'secret',
       region_items: [],
-    })
-    expect(staged.store_items[0]).toMatchObject({
-      kind: 'STORE',
-      action: 'DEACTIVATE',
-      change_fields: [],
-    })
+      store_items: [],
+      reviewer_items: [
+        {
+          id: 1,
+          remote_department_id: 9,
+          remote_department_name: '天河店',
+          remote_department_path: '集团 / 天河店',
+          department: 'DINING',
+          action: 'ASSIGN',
+          match_method: 'JOB_NUMBER',
+          dingtalk_name: '店长甲',
+          current_reviewer_name: null,
+          proposed_employee_id: 31,
+          proposed_employee_name: '店长甲',
+          status: 'READY',
+          conflict_code: null,
+          remote_user_id_hash: 'secret',
+          provider_extra: 'secret',
+        },
+        {
+          id: 2,
+          remote_department_id: 9,
+          remote_department_name: '天河店',
+          remote_department_path: '集团 / 天河店',
+          department: 'KITCHEN',
+          action: 'CONFLICT',
+          match_method: 'NONE',
+          dingtalk_name: '厨师长乙',
+          current_reviewer_name: null,
+          proposed_employee_id: null,
+          proposed_employee_name: null,
+          status: 'CONFLICT',
+          conflict_code: 'EMPLOYEE_NOT_FOUND',
+          provider_extra: 'secret',
+        },
+      ],
+    }
+    client.get.mockResolvedValueOnce({ data: latestWire })
+
+    const latest = await fetchLatestDingTalkOrganization()
+
+    expect(client.get).toHaveBeenCalledWith('/api/dingtalk/sync/organization/latest')
+    expect(latest.reviewer_items.map((item) => [item.action, item.status])).toEqual([
+      ['ASSIGN_SCOPE', 'READY'],
+      ['NO_CHANGE', 'CONFLICT'],
+    ])
+    expect(latest).not.toHaveProperty('baseline_fingerprint')
+    expect(latest).not.toHaveProperty('snapshot_hash')
+    expect(latest.reviewer_items[0]).not.toHaveProperty('remote_user_id_hash')
+    expect(latest.reviewer_items[0]).not.toHaveProperty('provider_extra')
   })
 })

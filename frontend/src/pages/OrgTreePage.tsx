@@ -1,8 +1,9 @@
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
   Button,
   Card,
+  Descriptions,
   Modal,
   Space,
   Spin,
@@ -14,17 +15,17 @@ import {
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import type { DataNode } from 'antd/es/tree'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import {
   applyDingTalkOrganization,
+  fetchLatestDingTalkOrganization,
   previewDingTalkOrganization,
-  type DingTalkOrganizationNodeAction,
+  type DingTalkOrganizationAction,
   type DingTalkOrganizationChangeField,
   type DingTalkOrganizationNodeItem,
   type DingTalkOrganizationNodeKind,
   type DingTalkOrganizationPreview,
-  type DingTalkOrganizationReviewerAction,
   type DingTalkOrganizationReviewerItem,
   type DingTalkOrganizationSyncItemStatus,
 } from '../api/dingtalk'
@@ -43,32 +44,15 @@ const DEPARTMENT_LABEL: Record<DingTalkOrganizationReviewerItem['department'], s
   KITCHEN: '厨房',
 }
 
-const ORGANIZATION_ACTION_LABEL: Record<
-  DingTalkOrganizationNodeKind,
-  Record<DingTalkOrganizationNodeAction, string>
-> = {
-  REGION: {
-    LINK: '关联已有区域',
-    CREATE: '创建新区域',
-    ACTIVATE: '启用区域',
-    UPDATE: '更新区域',
-    DEACTIVATE: '停用区域',
-  },
-  STORE: {
-    LINK: '关联已有门店',
-    CREATE: '创建新门店',
-    ACTIVATE: '启用门店',
-    UPDATE: '更新门店',
-    DEACTIVATE: '停用门店',
-  },
-}
-
-const ORGANIZATION_ACTION_COLOR: Record<DingTalkOrganizationNodeAction, string> = {
+const ORGANIZATION_ACTION_COLOR: Record<DingTalkOrganizationAction, string> = {
   LINK: 'blue',
   CREATE: 'green',
   ACTIVATE: 'cyan',
   UPDATE: 'geekblue',
   DEACTIVATE: 'orange',
+  ASSIGN_SCOPE: 'blue',
+  REMOVE_SCOPE: 'orange',
+  NO_CHANGE: 'default',
 }
 
 const ORGANIZATION_CHANGE_FIELD_LABEL: Record<DingTalkOrganizationChangeField, string> = {
@@ -77,10 +61,42 @@ const ORGANIZATION_CHANGE_FIELD_LABEL: Record<DingTalkOrganizationChangeField, s
   dingtalk_dept_id: '钉钉部门 ID',
 }
 
-const REVIEWER_ACTION_LABEL: Record<DingTalkOrganizationReviewerAction, string> = {
-  ASSIGN: '分配',
-  REMOVE: '撤销',
+const STATUS_LABEL: Record<DingTalkOrganizationSyncItemStatus, string> = {
+  READY: '待应用',
   CONFLICT: '冲突',
+  APPLIED: '已应用',
+  IGNORED: '已忽略',
+}
+
+const STATUS_COLOR: Record<DingTalkOrganizationSyncItemStatus, string> = {
+  READY: 'blue',
+  CONFLICT: 'red',
+  APPLIED: 'green',
+  IGNORED: 'default',
+}
+
+function organizationActionLabel(
+  action: DingTalkOrganizationAction,
+  kind?: DingTalkOrganizationNodeKind,
+): string {
+  switch (action) {
+    case 'LINK':
+      return kind === 'REGION' ? '关联已有区域' : '关联已有门店'
+    case 'CREATE':
+      return kind === 'REGION' ? '创建新区域' : '创建新门店'
+    case 'ACTIVATE':
+      return kind === 'REGION' ? '启用区域' : '启用门店'
+    case 'UPDATE':
+      return kind === 'REGION' ? '更新区域' : '更新门店'
+    case 'DEACTIVATE':
+      return kind === 'REGION' ? '停用区域' : '停用门店'
+    case 'ASSIGN_SCOPE':
+      return '分配负责人权限'
+    case 'REMOVE_SCOPE':
+      return '撤销负责人权限'
+    case 'NO_CHANGE':
+      return '无变更'
+  }
 }
 
 function toTreeData(nodes: OrgTreeNode[]): DataNode[] {
@@ -99,8 +115,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '钉钉组织同步失败，请稍后重试。'
 }
 
+function isHttp404(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'response' in error &&
+    (error as { response?: { status?: number } }).response?.status === 404
+  )
+}
+
 function statusTag(status: DingTalkOrganizationSyncItemStatus) {
-  return status === 'READY' ? <Tag color="blue">待应用</Tag> : <Tag color="orange">冲突</Tag>
+  return <Tag color={STATUS_COLOR[status]}>{STATUS_LABEL[status]}</Tag>
 }
 
 function remoteDepartmentLabel(name: string, departmentId: number | null): string {
@@ -127,7 +152,7 @@ function organizationColumns(
       title: '动作',
       render: (_value, item) => (
         <Tag color={ORGANIZATION_ACTION_COLOR[item.action]}>
-          {ORGANIZATION_ACTION_LABEL[kind][item.action]}
+          {organizationActionLabel(item.action, kind)}
         </Tag>
       ),
     },
@@ -158,10 +183,8 @@ const reviewerColumns: ColumnsType<DingTalkOrganizationReviewerItem> = [
   {
     title: '动作',
     render: (_value, item) => (
-      <Tag
-        color={item.action === 'REMOVE' ? 'orange' : item.action === 'CONFLICT' ? 'red' : 'blue'}
-      >
-        {REVIEWER_ACTION_LABEL[item.action]}
+      <Tag color={ORGANIZATION_ACTION_COLOR[item.action]}>
+        {organizationActionLabel(item.action)}
       </Tag>
     ),
   },
@@ -182,7 +205,7 @@ const reviewerColumns: ColumnsType<DingTalkOrganizationReviewerItem> = [
   {
     title: '变更说明',
     render: (_value, item) =>
-      item.action === 'REMOVE' ? (
+      item.action === 'REMOVE_SCOPE' ? (
         <Typography.Text type="warning">
           将撤销旧负责人：{item.current_reviewer_name ?? '未知'}
         </Typography.Text>
@@ -193,6 +216,23 @@ const reviewerColumns: ColumnsType<DingTalkOrganizationReviewerItem> = [
   { title: '状态', render: (_value, item) => statusTag(item.status) },
   { title: '冲突代码', render: (_value, item) => item.conflict_code ?? '—' },
 ]
+
+function totalReadyItems(preview: DingTalkOrganizationPreview): number {
+  return preview.ready_regions + preview.ready_stores + preview.ready_reviewers
+}
+
+function totalConflicts(preview: DingTalkOrganizationPreview): number {
+  return preview.region_conflicts + preview.store_conflicts + preview.reviewer_conflicts
+}
+
+function isExpired(preview: DingTalkOrganizationPreview, now: number): boolean {
+  const expiry = Date.parse(preview.expires_at)
+  return !Number.isFinite(expiry) || expiry <= now
+}
+
+function canApply(preview: DingTalkOrganizationPreview, now: number): boolean {
+  return totalReadyItems(preview) > 0 && totalConflicts(preview) === 0 && !isExpired(preview, now)
+}
 
 interface OrganizationChangesSectionProps {
   kind: DingTalkOrganizationNodeKind
@@ -233,37 +273,21 @@ function OrganizationChangesSection({ kind, items }: OrganizationChangesSectionP
   )
 }
 
-function totalReadyItems(preview: DingTalkOrganizationPreview): number {
-  return preview.ready_stores + preview.ready_reviewers
-}
-
-function totalConflicts(preview: DingTalkOrganizationPreview): number {
-  return preview.region_conflicts + preview.store_conflicts + preview.reviewer_conflicts
-}
-
-function hasBlockedRegionChanges(preview: DingTalkOrganizationPreview): boolean {
-  return (
-    preview.ready_regions > 0 ||
-    preview.region_conflicts > 0 ||
-    preview.region_items.length > 0
-  )
-}
-
 interface ReviewerChangesSectionProps {
-  action: DingTalkOrganizationReviewerAction
+  title: string
   items: DingTalkOrganizationReviewerItem[]
+  removal?: boolean
 }
 
-function ReviewerChangesSection({ action, items }: ReviewerChangesSectionProps) {
-  const title = `负责人${REVIEWER_ACTION_LABEL[action]}（${items.length}）`
-
+function ReviewerChangesSection({ title, items, removal = false }: ReviewerChangesSectionProps) {
+  const accessibleTitle = `${title}（${items.length}）`
   return (
-    <section aria-label={title}>
+    <section aria-label={accessibleTitle}>
       <Space direction="vertical" size="small" style={{ width: '100%' }}>
         <Typography.Title level={4} style={{ margin: 0 }}>
-          {title}
+          {accessibleTitle}
         </Typography.Title>
-        {action === 'REMOVE' && items.length > 0 ? (
+        {removal && items.length > 0 ? (
           <Alert
             type="warning"
             showIcon
@@ -276,7 +300,7 @@ function ReviewerChangesSection({ action, items }: ReviewerChangesSectionProps) 
           size="small"
           columns={reviewerColumns}
           dataSource={items}
-          locale={{ emptyText: `无负责人${REVIEWER_ACTION_LABEL[action]}项` }}
+          locale={{ emptyText: `无${title}` }}
           pagination={{ pageSize: 5, hideOnSinglePage: true }}
           scroll={{ x: 1500 }}
         />
@@ -287,49 +311,98 @@ function ReviewerChangesSection({ action, items }: ReviewerChangesSectionProps) 
 
 export default function OrgTreePage() {
   const { user, hasGlobalPermission } = useAuth()
+  const queryClient = useQueryClient()
   const queryScope = user?.username ?? 'anonymous'
+  const latestQueryKey = ['dingtalkOrganizationLatest', queryScope] as const
   const canSyncDingTalkOrganization =
     hasGlobalPermission(Perm.DINGTALK_ORG_SYNC) && hasGlobalPermission(Perm.NOTIFICATION_MANAGE)
   const [syncPreview, setSyncPreview] = useState<DingTalkOrganizationPreview | null>(null)
   const [syncError, setSyncError] = useState<string | null>(null)
+  const [postApplyWarning, setPostApplyWarning] = useState<string | null>(null)
+  const [expiryClock, setExpiryClock] = useState(() => Date.now())
+  const applySubmittedRef = useRef(false)
+
   const orgTreeQuery = useQuery({
     queryKey: ['orgTree', queryScope],
     queryFn: fetchOrgTree,
   })
+  const latestQuery = useQuery({
+    queryKey: latestQueryKey,
+    queryFn: async () => {
+      try {
+        return await fetchLatestDingTalkOrganization()
+      } catch (error) {
+        if (isHttp404(error)) return null
+        throw error
+      }
+    },
+    enabled: canSyncDingTalkOrganization,
+    retry: false,
+  })
 
   const previewMutation = useMutation({
-    mutationFn: () => previewDingTalkOrganization(),
+    mutationFn: previewDingTalkOrganization,
+    retry: false,
     onSuccess: (preview) => {
+      applySubmittedRef.current = false
       setSyncError(null)
+      setExpiryClock(Date.now())
       setSyncPreview(preview)
+      queryClient.setQueryData(latestQueryKey, preview)
     },
     onError: (error) => setSyncError(errorMessage(error)),
   })
   const applyMutation = useMutation({
     mutationFn: (batchId: string) => applyDingTalkOrganization(batchId),
+    retry: false,
     onSuccess: async (result) => {
       setSyncError(null)
-      const refreshedTree = await orgTreeQuery.refetch()
       setSyncPreview(null)
+      const [, refreshedTree] = await Promise.all([latestQuery.refetch(), orgTreeQuery.refetch()])
       if (refreshedTree.isError) {
-        const refreshError =
-          '钉钉组织变更已应用，但组织架构刷新失败。请刷新页面后核对最新门店和负责人。'
-        setSyncError(refreshError)
-        message.warning(refreshError)
+        const refreshWarning =
+          '应用已成功，但组织架构刷新失败。请刷新页面后核对最新区域、门店和负责人。'
+        setPostApplyWarning(refreshWarning)
+        message.warning(refreshWarning)
         return
       }
+      setPostApplyWarning(null)
       message.success(
         result.already_applied
           ? '该批次此前已应用，组织架构已刷新。'
-          : `已同步 ${result.applied_stores} 项门店变更、${result.applied_reviewers} 项负责人变更；${result.unresolved} 项冲突仍待处理。`,
+          : `已同步 ${result.applied_regions} 项区域变更、${result.applied_stores} 项门店变更、${result.applied_reviewers} 项负责人变更；${result.unresolved} 项冲突仍待处理。`,
       )
     },
-    onError: (error) => setSyncError(errorMessage(error)),
+    onError: (error) => {
+      applySubmittedRef.current = false
+      setSyncError(errorMessage(error))
+    },
   })
 
-  function openSyncPreview(): void {
+  useEffect(() => {
+    if (!syncPreview) return
+    const now = Date.now()
+    setExpiryClock(now)
+    const expiresAt = Date.parse(syncPreview.expires_at)
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) return
+    const timer = window.setTimeout(
+      () => setExpiryClock(Date.now()),
+      Math.min(expiresAt - now, 2_147_483_647),
+    )
+    return () => window.clearTimeout(timer)
+  }, [syncPreview])
+
+  function refreshPreview(): void {
     setSyncError(null)
     previewMutation.mutate()
+  }
+
+  function viewLatestPreview(): void {
+    if (!latestQuery.data) return
+    applySubmittedRef.current = false
+    setSyncError(null)
+    setExpiryClock(Date.now())
+    setSyncPreview(latestQuery.data)
   }
 
   function closeSyncPreview(): void {
@@ -339,46 +412,96 @@ export default function OrgTreePage() {
   }
 
   function applyPreview(): void {
+    const preview = syncPreview
     if (
-      !syncPreview ||
-      hasBlockedRegionChanges(syncPreview) ||
-      totalConflicts(syncPreview) > 0 ||
-      totalReadyItems(syncPreview) === 0
+      !preview ||
+      applySubmittedRef.current ||
+      applyMutation.isPending ||
+      !canApply(preview, Date.now())
     ) {
       return
     }
-    applyMutation.mutate(syncPreview.batch_id)
+    applySubmittedRef.current = true
+    applyMutation.mutate(preview.batch_id)
   }
 
   if (orgTreeQuery.isLoading) return <Spin />
 
-  const hasApplicableItems = syncPreview !== null && totalReadyItems(syncPreview) > 0
-  const canApplyPreview =
-    syncPreview !== null &&
-    hasApplicableItems &&
-    !hasBlockedRegionChanges(syncPreview) &&
-    totalConflicts(syncPreview) === 0
+  const canApplyPreview = syncPreview !== null && canApply(syncPreview, expiryClock)
   const reviewerAssignments =
-    syncPreview?.reviewer_items.filter((item) => item.action === 'ASSIGN') ?? []
+    syncPreview?.reviewer_items.filter(
+      (item) => item.status !== 'CONFLICT' && item.action === 'ASSIGN_SCOPE',
+    ) ?? []
   const reviewerRemovals =
-    syncPreview?.reviewer_items.filter((item) => item.action === 'REMOVE') ?? []
+    syncPreview?.reviewer_items.filter(
+      (item) => item.status !== 'CONFLICT' && item.action === 'REMOVE_SCOPE',
+    ) ?? []
   const reviewerConflicts =
-    syncPreview?.reviewer_items.filter((item) => item.action === 'CONFLICT') ?? []
+    syncPreview?.reviewer_items.filter((item) => item.status === 'CONFLICT') ?? []
 
   return (
     <>
-      <Card
-        title="组织架构"
-        extra={
-          canSyncDingTalkOrganization ? (
-            <Button loading={previewMutation.isPending} onClick={openSyncPreview}>
-              同步钉钉门店与负责人
-            </Button>
-          ) : null
-        }
-      >
-        {syncError && !syncPreview ? (
-          <Alert type="error" showIcon message={syncError} style={{ marginBottom: 16 }} />
+      <Card title="组织架构">
+        {canSyncDingTalkOrganization ? (
+          <section
+            role="region"
+            aria-label="钉钉组织同步状态"
+            style={{ marginBottom: 20, padding: 16, background: '#fafafa', borderRadius: 8 }}
+          >
+            <Space direction="vertical" size="small" style={{ width: '100%' }}>
+              <Typography.Title level={4} style={{ margin: 0 }}>
+                组织同步检查单
+              </Typography.Title>
+              {latestQuery.isLoading ? <Spin size="small" /> : null}
+              {latestQuery.isError ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  message="历史预览读取失败"
+                  description={errorMessage(latestQuery.error)}
+                />
+              ) : null}
+              {!latestQuery.isLoading && !latestQuery.isError && !latestQuery.data ? (
+                <Typography.Text type="secondary">暂无历史预览</Typography.Text>
+              ) : null}
+              {latestQuery.data ? (
+                <Descriptions size="small" column={{ xs: 1, sm: 2, md: 3 }}>
+                  <Descriptions.Item label="来源">
+                    {latestQuery.data.trigger === 'SCHEDULED' ? '定时检查' : '手动检查'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="最近检查">
+                    {new Date(latestQuery.data.last_checked_at).toLocaleString('zh-CN')}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="到期">
+                    {new Date(latestQuery.data.expires_at).toLocaleString('zh-CN')}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="待处理">
+                    {totalReadyItems(latestQuery.data)}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="冲突">
+                    {totalConflicts(latestQuery.data)}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="提醒">{latestQuery.data.warnings}</Descriptions.Item>
+                </Descriptions>
+              ) : null}
+              {syncError && !syncPreview ? <Alert type="error" showIcon message={syncError} /> : null}
+              {postApplyWarning ? (
+                <Alert type="warning" showIcon message={postApplyWarning} />
+              ) : null}
+              <Space wrap>
+                <Button disabled={!latestQuery.data} onClick={viewLatestPreview}>
+                  查看预览
+                </Button>
+                <Button
+                  type="primary"
+                  loading={previewMutation.isPending}
+                  onClick={refreshPreview}
+                >
+                  刷新预览
+                </Button>
+              </Space>
+            </Space>
+          </section>
         ) : null}
         <Tree treeData={toTreeData(orgTreeQuery.data ?? [])} defaultExpandAll selectable={false} />
       </Card>
@@ -399,44 +522,38 @@ export default function OrgTreePage() {
         {syncPreview ? (
           <Space direction="vertical" size="middle" style={{ width: '100%' }}>
             <Alert
-              type="info"
+              type={totalConflicts(syncPreview) > 0 ? 'warning' : 'info'}
               showIcon
               message={`待应用：${syncPreview.ready_regions} 项区域变更、${syncPreview.ready_stores} 项门店变更、${syncPreview.ready_reviewers} 项负责人变更`}
-              description="当前可确认门店变更、负责人分配和负责人撤销。"
+              description={`冲突：${syncPreview.region_conflicts} 项区域、${syncPreview.store_conflicts} 项门店、${syncPreview.reviewer_conflicts} 项负责人；提醒 ${syncPreview.warnings} 项。`}
             />
-            {hasBlockedRegionChanges(syncPreview) ? (
-              <Alert
-                type="warning"
-                showIcon
-                message="区域变更暂不可确认"
-                description="区域变更将在组织层级应用支持完成后可确认。"
-              />
+            {isExpired(syncPreview, expiryClock) ? (
+              <Alert type="error" showIcon message="此预览已过期，请刷新预览后再应用" />
             ) : null}
-            <Alert
-              type={
-                totalConflicts(syncPreview) > 0 ? 'warning' : 'info'
-              }
-              showIcon
-              message={`冲突项：${syncPreview.region_conflicts} 项区域冲突、${syncPreview.store_conflicts} 项门店冲突、${syncPreview.reviewer_conflicts} 项负责人冲突`}
-              description={`钉钉区域 ${syncPreview.remote_regions} 个，本地区域 ${syncPreview.local_regions} 个；钉钉门店 ${syncPreview.remote_stores} 家，本地门店 ${syncPreview.local_stores} 家。`}
-            />
-            {syncPreview.reviewer_conflicts > 0 ? (
-              <Alert
-                type="error"
-                showIcon
-                message="请先修正钉钉负责人或员工身份信息后重新预览"
-                description="存在负责人冲突时不允许确认，避免工资查看权限分配给错误人员。"
-              />
+            {totalConflicts(syncPreview) > 0 ? (
+              <Alert type="error" showIcon message="请先解决全部冲突，再刷新预览并应用" />
+            ) : null}
+            {totalReadyItems(syncPreview) === 0 ? (
+              <Alert type="info" showIcon message="当前没有待应用的组织变更" />
             ) : null}
             {syncError ? <Alert type="error" showIcon message={syncError} /> : null}
             <Typography.Text type="secondary">
-              本预览批次有效期至 {new Date(syncPreview.expires_at).toLocaleString('zh-CN')}。
+              {syncPreview.trigger === 'SCHEDULED' ? '定时检查' : '手动检查'} · 最近检查{' '}
+              {new Date(syncPreview.last_checked_at).toLocaleString('zh-CN')} · 有效期至{' '}
+              {new Date(syncPreview.expires_at).toLocaleString('zh-CN')}
             </Typography.Text>
             <OrganizationChangesSection kind="REGION" items={syncPreview.region_items} />
             <OrganizationChangesSection kind="STORE" items={syncPreview.store_items} />
-            <ReviewerChangesSection action="ASSIGN" items={reviewerAssignments} />
-            <ReviewerChangesSection action="REMOVE" items={reviewerRemovals} />
-            <ReviewerChangesSection action="CONFLICT" items={reviewerConflicts} />
+            <section aria-label="负责人变更">
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <Typography.Title level={4} style={{ margin: 0 }}>
+                  负责人变更
+                </Typography.Title>
+                <ReviewerChangesSection title="负责人分配" items={reviewerAssignments} />
+                <ReviewerChangesSection title="负责人撤销" items={reviewerRemovals} removal />
+                <ReviewerChangesSection title="负责人冲突" items={reviewerConflicts} />
+              </Space>
+            </section>
           </Space>
         ) : null}
       </Modal>

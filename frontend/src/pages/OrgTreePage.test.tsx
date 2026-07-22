@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DingTalkOrganizationPreview } from '../api/dingtalk'
@@ -7,19 +7,16 @@ import type { DingTalkOrganizationPreview } from '../api/dingtalk'
 const masterdataApi = vi.hoisted(() => ({ fetchOrgTree: vi.fn() }))
 const dingtalkApi = vi.hoisted(() => ({
   applyDingTalkOrganization: vi.fn(),
+  fetchLatestDingTalkOrganization: vi.fn(),
   previewDingTalkOrganization: vi.fn(),
 }))
-const auth = vi.hoisted(() => ({
-  permissions: [] as string[],
-  globalPermissions: [] as string[],
-}))
+const auth = vi.hoisted(() => ({ globalPermissions: [] as string[] }))
 
 vi.mock('../api/masterdata', () => masterdataApi)
 vi.mock('../api/dingtalk', () => dingtalkApi)
 vi.mock('../auth/AuthContext', () => ({
   useAuth: () => ({
     user: { username: 'group-hr' },
-    hasPermission: (permission: string) => auth.permissions.includes(permission),
     hasGlobalPermission: (permission: string) => auth.globalPermissions.includes(permission),
   }),
 }))
@@ -50,19 +47,23 @@ const originalTree = [
   },
 ]
 
-const preview: DingTalkOrganizationPreview = {
+const basePreview: DingTalkOrganizationPreview = {
   batch_id: '3fe80f532f184247b477694427bad0ce',
+  trigger: 'MANUAL',
+  created_at: '2026-07-22T01:59:00Z',
+  last_checked_at: '2026-07-22T02:00:00Z',
   expires_at: '2026-07-22T04:00:00Z',
   remote_regions: 2,
   local_regions: 1,
-  ready_regions: 1,
+  ready_regions: 2,
   region_conflicts: 0,
-  remote_stores: 4,
-  local_stores: 5,
-  ready_stores: 5,
+  remote_stores: 2,
+  local_stores: 2,
+  ready_stores: 1,
   store_conflicts: 0,
   ready_reviewers: 2,
-  reviewer_conflicts: 1,
+  reviewer_conflicts: 0,
+  warnings: 1,
   region_items: [
     {
       id: 100,
@@ -80,74 +81,26 @@ const preview: DingTalkOrganizationPreview = {
       status: 'READY',
       conflict_code: null,
     },
+    {
+      id: 101,
+      kind: 'REGION',
+      remote_department_id: 8002,
+      remote_department_name: '佛山区域',
+      remote_department_path: '集团 / 华南 / 佛山区域',
+      action: 'UPDATE',
+      change_fields: ['parent_id'],
+      match_method: 'STABLE_DEPARTMENT_ID',
+      proposed_org_unit_id: 2,
+      proposed_org_unit_name: '佛山区域',
+      proposed_parent_org_unit_id: 10,
+      proposed_parent_org_unit_name: '华南大区',
+      status: 'READY',
+      conflict_code: null,
+    },
   ],
   store_items: [
     {
-      id: 101,
-      kind: 'STORE',
-      remote_department_id: 9001,
-      remote_department_name: '天河店',
-      remote_department_path: '集团 / 潮发运营中心 / 天河店',
-      action: 'LINK',
-      change_fields: [],
-      match_method: 'STABLE_DEPARTMENT_ID',
-      proposed_org_unit_id: 11,
-      proposed_org_unit_name: '天河店',
-      proposed_parent_org_unit_id: 1,
-      proposed_parent_org_unit_name: '广州区域',
-      status: 'READY',
-      conflict_code: null,
-    },
-    {
-      id: 102,
-      kind: 'STORE',
-      remote_department_id: 9002,
-      remote_department_name: '新DNA店',
-      remote_department_path: '集团 / 九亩地 / 新DNA店',
-      action: 'CREATE',
-      change_fields: [],
-      match_method: 'REMOTE_ONLY',
-      proposed_org_unit_id: null,
-      proposed_org_unit_name: '新DNA店',
-      proposed_parent_org_unit_id: 2,
-      proposed_parent_org_unit_name: '佛山区域',
-      status: 'READY',
-      conflict_code: null,
-    },
-    {
-      id: 103,
-      kind: 'STORE',
-      remote_department_id: 9003,
-      remote_department_name: '北城店',
-      remote_department_path: '集团 / 中山 / 北城店',
-      action: 'ACTIVATE',
-      change_fields: [],
-      match_method: 'STABLE_DEPARTMENT_ID',
-      proposed_org_unit_id: 13,
-      proposed_org_unit_name: '北城店',
-      proposed_parent_org_unit_id: 3,
-      proposed_parent_org_unit_name: '中山区域',
-      status: 'READY',
-      conflict_code: null,
-    },
-    {
-      id: 104,
-      kind: 'STORE',
-      remote_department_id: 9004,
-      remote_department_name: '西城店',
-      remote_department_path: '集团 / 潮发运营中心 / 西城店',
-      action: 'UPDATE',
-      change_fields: ['name'],
-      match_method: 'STABLE_DEPARTMENT_ID',
-      proposed_org_unit_id: 14,
-      proposed_org_unit_name: '西城店',
-      proposed_parent_org_unit_id: 1,
-      proposed_parent_org_unit_name: '广州区域',
-      status: 'READY',
-      conflict_code: null,
-    },
-    {
-      id: 105,
+      id: 110,
       kind: 'STORE',
       remote_department_id: null,
       remote_department_name: '旧城店',
@@ -155,10 +108,10 @@ const preview: DingTalkOrganizationPreview = {
       action: 'DEACTIVATE',
       change_fields: [],
       match_method: 'LOCAL_STORE_NOT_VISIBLE',
-      proposed_org_unit_id: 15,
+      proposed_org_unit_id: 11,
       proposed_org_unit_name: '旧城店',
-      proposed_parent_org_unit_id: 1,
-      proposed_parent_org_unit_name: '广州区域',
+      proposed_parent_org_unit_id: 2,
+      proposed_parent_org_unit_name: '佛山区域',
       status: 'READY',
       conflict_code: null,
     },
@@ -168,9 +121,9 @@ const preview: DingTalkOrganizationPreview = {
       id: 201,
       remote_department_id: 9001,
       remote_department_name: '天河店',
-      remote_department_path: '集团 / 潮发运营中心 / 天河店',
+      remote_department_path: '集团 / 广州区域 / 天河店',
       department: 'DINING',
-      action: 'ASSIGN',
+      action: 'ASSIGN_SCOPE',
       dingtalk_name: '店长甲',
       proposed_employee_id: 31,
       proposed_employee_name: '店长甲（M001）',
@@ -183,9 +136,9 @@ const preview: DingTalkOrganizationPreview = {
       id: 202,
       remote_department_id: 9001,
       remote_department_name: '天河店',
-      remote_department_path: '集团 / 潮发运营中心 / 天河店',
+      remote_department_path: '集团 / 广州区域 / 天河店',
       department: 'KITCHEN',
-      action: 'REMOVE',
+      action: 'REMOVE_SCOPE',
       dingtalk_name: null,
       proposed_employee_id: null,
       proposed_employee_name: null,
@@ -194,22 +147,11 @@ const preview: DingTalkOrganizationPreview = {
       status: 'READY',
       conflict_code: null,
     },
-    {
-      id: 203,
-      remote_department_id: 9004,
-      remote_department_name: '西城店',
-      remote_department_path: '集团 / 潮发运营中心 / 西城店',
-      department: 'DINING',
-      action: 'CONFLICT',
-      dingtalk_name: '店长丙',
-      proposed_employee_id: null,
-      proposed_employee_name: null,
-      match_method: 'NONE',
-      current_reviewer_name: '旧店长',
-      status: 'CONFLICT',
-      conflict_code: 'EMPLOYEE_NOT_FOUND',
-    },
   ],
+}
+
+function previewWith(overrides: Partial<DingTalkOrganizationPreview> = {}) {
+  return { ...basePreview, ...overrides }
 }
 
 function renderPage() {
@@ -223,233 +165,224 @@ function renderPage() {
   )
 }
 
+async function refreshAndOpen() {
+  fireEvent.click(await screen.findByRole('button', { name: '刷新预览' }))
+  return screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+}
+
 describe('OrgTreePage DingTalk organization sync', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    auth.permissions = ['dingtalk_org:sync', 'notification:manage']
+    vi.setSystemTime(new Date('2026-07-22T02:00:00Z'))
     auth.globalPermissions = ['dingtalk_org:sync', 'notification:manage']
     masterdataApi.fetchOrgTree.mockResolvedValue(originalTree)
-    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(preview)
+    dingtalkApi.fetchLatestDingTalkOrganization.mockResolvedValue(
+      previewWith({ trigger: 'SCHEDULED' }),
+    )
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(basePreview)
     dingtalkApi.applyDingTalkOrganization.mockResolvedValue({
-      applied_stores: 4,
+      applied_regions: 2,
+      applied_stores: 1,
       applied_reviewers: 2,
-      unresolved: 1,
+      unresolved: 0,
       already_applied: false,
     })
   })
 
-  afterEach(cleanup)
-
-  it('shows the sync entry only to HR users with the dedicated permission', async () => {
-    auth.permissions = []
-    auth.globalPermissions = []
-
-    renderPage()
-
-    expect(await screen.findByText('天河店（门店 · 广州）')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '同步钉钉门店与负责人' })).toBeNull()
-    expect(dingtalkApi.previewDingTalkOrganization).not.toHaveBeenCalled()
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
   })
 
-  it('hides the sync entry when either permission is only locally scoped', async () => {
+  it('gates both the status query and controls on both global permissions', async () => {
     auth.globalPermissions = ['dingtalk_org:sync']
-
     renderPage()
 
     expect(await screen.findByText('天河店（门店 · 广州）')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '同步钉钉门店与负责人' })).toBeNull()
+    expect(screen.queryByRole('region', { name: '钉钉组织同步状态' })).toBeNull()
+    expect(dingtalkApi.fetchLatestDingTalkOrganization).not.toHaveBeenCalled()
   })
 
-  it('separates assign, removal and conflict changes and blocks apply on reviewer conflicts', async () => {
+  it('shows a scheduled latest summary without opening the modal', async () => {
     renderPage()
 
-    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+    const status = await screen.findByRole('region', { name: '钉钉组织同步状态' })
+    expect(within(status).getByText('组织同步检查单')).toBeTruthy()
+    expect(await within(status).findByText('定时检查')).toBeTruthy()
+    expect(within(status).getByText('5')).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: '钉钉组织同步预览' })).toBeNull()
 
-    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
-    const assignments = within(dialog).getByRole('region', { name: '负责人分配（1）' })
+    fireEvent.click(within(status).getByRole('button', { name: '查看预览' }))
+    expect(await screen.findByRole('dialog', { name: '钉钉组织同步预览' })).toBeTruthy()
+  })
+
+  it('treats only latest 404 as an empty history state and keeps the tree usable', async () => {
+    dingtalkApi.fetchLatestDingTalkOrganization.mockRejectedValue({ response: { status: 404 } })
+    renderPage()
+
+    expect(await screen.findByText('暂无历史预览')).toBeTruthy()
+    expect(screen.getByText('天河店（门店 · 广州）')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '查看预览' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+  })
+
+  it('shows non-404 latest errors inside the sync status without breaking the tree', async () => {
+    dingtalkApi.fetchLatestDingTalkOrganization.mockRejectedValue({
+      response: { status: 503, data: { detail: '钉钉组织服务暂不可用' } },
+    })
+    renderPage()
+
+    expect(await screen.findByText('历史预览读取失败')).toBeTruthy()
+    expect(screen.getByText('钉钉组织服务暂不可用')).toBeTruthy()
+    expect(screen.getByText('天河店（门店 · 广州）')).toBeTruthy()
+  })
+
+  it('renders region create and move, store deactivation, and reviewer removal', async () => {
+    renderPage()
+    const dialog = await refreshAndOpen()
+
+    const regions = within(dialog).getByRole('region', { name: '区域变更（2）' })
+    expect(within(regions).getByText('创建新区域')).toBeTruthy()
+    expect(within(regions).getByText('更新区域')).toBeTruthy()
+    expect(within(regions).getAllByText('上级组织').length).toBeGreaterThan(0)
+    expect(within(regions).getByText('华南大区（ID 10）')).toBeTruthy()
+
+    const stores = within(dialog).getByRole('region', { name: '门店变更（1）' })
+    expect(within(stores).getByText('停用门店')).toBeTruthy()
+    expect(within(stores).getByText('本地 / 旧城店')).toBeTruthy()
+
     const removals = within(dialog).getByRole('region', { name: '负责人撤销（1）' })
-    const conflicts = within(dialog).getByRole('region', { name: '负责人冲突（1）' })
-
-    expect(within(assignments).getByText('店长甲（M001）（ID 31）')).toBeTruthy()
-    expect(within(assignments).getByText('JOB_NUMBER')).toBeTruthy()
+    expect(within(removals).getByText('撤销负责人权限')).toBeTruthy()
     expect(within(removals).getByText('将撤销旧负责人：旧厨房经理')).toBeTruthy()
-    expect(within(removals).queryByText(/安全唯一匹配/)).toBeNull()
-    expect(within(conflicts).getByText('EMPLOYEE_NOT_FOUND')).toBeTruthy()
-    expect(within(dialog).getByText('请先修正钉钉负责人或员工身份信息后重新预览')).toBeTruthy()
-
-    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
-    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
-    fireEvent.click(applyButton)
-    expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
+    expect((within(dialog).getByRole('button', { name: '确认应用变更' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
-  it('renders safe region changes but blocks them until hierarchy apply is supported', async () => {
-    const regionOnlyPreview = {
-      ...preview,
-      ready_stores: 0,
-      store_items: [],
-      ready_reviewers: 0,
-      reviewer_conflicts: 0,
-      reviewer_items: [],
-    }
-    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(regionOnlyPreview)
-
+  it('labels applied and ignored items without presenting them as conflicts', async () => {
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(
+      previewWith({
+        ready_regions: 0,
+        ready_stores: 0,
+        ready_reviewers: 0,
+        region_items: [{ ...basePreview.region_items[0], action: 'NO_CHANGE', status: 'APPLIED' }],
+        store_items: [{ ...basePreview.store_items[0], action: 'NO_CHANGE', status: 'IGNORED' }],
+        reviewer_items: [],
+      }),
+    )
     renderPage()
-    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+    const dialog = await refreshAndOpen()
 
-    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
-    const regionChanges = within(dialog).getByRole('region', { name: '区域变更（1）' })
-    expect(within(regionChanges).getByText('创建新区域')).toBeTruthy()
-    expect(within(regionChanges).getByText('集团 / 广州区域')).toBeTruthy()
-    expect(within(regionChanges).getByText('名称、钉钉部门 ID')).toBeTruthy()
-
-    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
-    expect(within(dialog).getByText('区域变更暂不可确认')).toBeTruthy()
     expect(
-      within(dialog).getByText('区域变更将在组织层级应用支持完成后可确认。'),
+      within(within(dialog).getByRole('region', { name: '区域变更（1）' })).getByText('已应用'),
     ).toBeTruthy()
-    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
-    fireEvent.click(applyButton)
-    expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
+    expect(
+      within(within(dialog).getByRole('region', { name: '门店变更（1）' })).getByText('已忽略'),
+    ).toBeTruthy()
   })
 
-  it('blocks apply when the preview contains a region conflict', async () => {
-    const regionConflictPreview = {
-      ...preview,
-      region_conflicts: 1,
-      ready_stores: 1,
-      store_items: [preview.store_items[0]],
-      ready_reviewers: 0,
-      reviewer_conflicts: 0,
-      reviewer_items: [],
-      region_items: [
-        ...preview.region_items,
-        {
-          ...preview.region_items[0],
-          id: 106,
-          status: 'CONFLICT' as const,
-          conflict_code: 'ORG_PATH_AMBIGUOUS',
-        },
-      ],
+  it('groups reviewer conflicts by status after raw action normalization', async () => {
+    const reviewerConflict = {
+      ...basePreview.reviewer_items[0],
+      id: 203,
+      action: 'NO_CHANGE' as const,
+      status: 'CONFLICT' as const,
+      conflict_code: 'EMPLOYEE_NOT_FOUND',
     }
-    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(regionConflictPreview)
-
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(
+      previewWith({ reviewer_conflicts: 1, reviewer_items: [reviewerConflict] }),
+    )
     renderPage()
-    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+    const dialog = await refreshAndOpen()
 
-    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
-    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
-    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
-    fireEvent.click(applyButton)
-    expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
+    const conflicts = within(dialog).getByRole('region', { name: '负责人冲突（1）' })
+    expect(within(conflicts).getByText('冲突')).toBeTruthy()
+    expect(within(conflicts).getByText('EMPLOYEE_NOT_FOUND')).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: '确认应用变更' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it.each([
-    ['a pending region count', { ready_regions: 1, region_conflicts: 0, region_items: [] }],
-    ['a region conflict count', { ready_regions: 0, region_conflicts: 1, region_items: [] }],
-    ['region preview items', { ready_regions: 0, region_conflicts: 0, region_items: preview.region_items }],
-  ])('fails closed for %s even when no other conflict is present', async (_reason, regionState) => {
-    dingtalkApi.previewDingTalkOrganization.mockResolvedValue({
-      ...preview,
-      ...regionState,
-      ready_stores: 1,
-      store_conflicts: 0,
-      store_items: [preview.store_items[0]],
-      ready_reviewers: 0,
-      reviewer_conflicts: 0,
-      reviewer_items: [],
-    })
-
+    ['区域', { region_conflicts: 1 }],
+    ['门店', { store_conflicts: 1 }],
+    ['负责人', { reviewer_conflicts: 1 }],
+  ])('blocks apply when %s changes contain conflicts', async (_category, conflicts) => {
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(previewWith(conflicts))
     renderPage()
-    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+    const dialog = await refreshAndOpen()
 
-    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
     const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
     expect((applyButton as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(applyButton)
     expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
   })
 
-  it('shows every store action and applies the exact staged batch once conflicts are resolved', async () => {
-    const resolvedPreview: DingTalkOrganizationPreview = {
-      ...preview,
-      ready_regions: 0,
-      region_conflicts: 0,
-      region_items: [],
-      reviewer_conflicts: 0,
-      reviewer_items: preview.reviewer_items.filter((item) => item.action !== 'CONFLICT'),
-    }
-    const refreshedTree = [
-      {
-        ...originalTree[0],
-        children: [
-          ...originalTree[0].children,
-          {
-            id: 12,
-            code: 'STORE-12',
-            name: '新DNA店',
-            type: 'STORE',
-            parent_id: 1,
-            city: null,
-            status: 'ACTIVE',
-            children: [],
-          },
-        ],
-      },
-    ]
-    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(resolvedPreview)
-    masterdataApi.fetchOrgTree
-      .mockResolvedValueOnce(originalTree)
-      .mockResolvedValueOnce(refreshedTree)
-
+  it('disables an open modal as soon as its preview expires', async () => {
+    vi.useRealTimers()
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    vi.setSystemTime(new Date('2026-07-22T02:00:00Z'))
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(
+      previewWith({ expires_at: '2026-07-22T02:00:05Z' }),
+    )
     renderPage()
-    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
+    const dialog = await refreshAndOpen()
+    expect((within(dialog).getByRole('button', { name: '确认应用变更' }) as HTMLButtonElement).disabled).toBe(false)
 
-    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
-    const storeChanges = within(dialog).getByRole('region', { name: '门店变更（5）' })
-    expect(within(storeChanges).getByText('关联已有门店')).toBeTruthy()
-    expect(within(storeChanges).getByText('创建新门店')).toBeTruthy()
-    expect(within(storeChanges).getByText('启用门店')).toBeTruthy()
-    expect(within(storeChanges).getByText('更新门店')).toBeTruthy()
-    expect(within(storeChanges).getByText('停用门店')).toBeTruthy()
-    expect(within(dialog).getByText('新建门店的城市信息需人事后续配置')).toBeTruthy()
-    expect(within(storeChanges).getByText('本地 / 旧城店')).toBeTruthy()
+    act(() => vi.advanceTimersByTime(5_000))
 
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认应用变更' }))
+    expect(await within(dialog).findByText('此预览已过期，请刷新预览后再应用')).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: '确认应用变更' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('blocks apply when there are zero ready changes', async () => {
+    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(
+      previewWith({ ready_regions: 0, ready_stores: 0, ready_reviewers: 0 }),
+    )
+    renderPage()
+    const dialog = await refreshAndOpen()
+
+    expect(within(dialog).getByText('当前没有待应用的组织变更')).toBeTruthy()
+    expect((within(dialog).getByRole('button', { name: '确认应用变更' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('applies exactly once and refreshes both latest preview and the tree', async () => {
+    renderPage()
+    const dialog = await refreshAndOpen()
+    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
+
+    fireEvent.click(applyButton)
+    fireEvent.click(applyButton)
 
     await waitFor(() =>
       expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledWith(
         '3fe80f532f184247b477694427bad0ce',
       ),
     )
-    expect(await screen.findByText('新DNA店（门店）')).toBeTruthy()
-    expect(masterdataApi.fetchOrgTree).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(masterdataApi.fetchOrgTree).toHaveBeenCalledTimes(2))
+    await waitFor(() =>
+      expect(dingtalkApi.fetchLatestDingTalkOrganization).toHaveBeenCalledTimes(2),
+    )
+    expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('dialog', { name: '钉钉组织同步预览' })).toBeNull()
   })
 
-  it('reports when apply succeeds but the organization tree cannot refresh', async () => {
-    const resolvedPreview: DingTalkOrganizationPreview = {
-      ...preview,
-      ready_regions: 0,
-      region_conflicts: 0,
-      region_items: [],
-      reviewer_conflicts: 0,
-      reviewer_items: preview.reviewer_items.filter((item) => item.action !== 'CONFLICT'),
-    }
-    dingtalkApi.previewDingTalkOrganization.mockResolvedValue(resolvedPreview)
+  it('keeps a persistent success warning when the tree refresh fails and never resubmits', async () => {
     masterdataApi.fetchOrgTree
       .mockResolvedValueOnce(originalTree)
       .mockRejectedValueOnce(new Error('refresh failed'))
-
     renderPage()
-    fireEvent.click(await screen.findByRole('button', { name: '同步钉钉门店与负责人' }))
-    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+    const dialog = await refreshAndOpen()
     fireEvent.click(within(dialog).getByRole('button', { name: '确认应用变更' }))
 
-    expect(
-      await screen.findByText(
-        '钉钉组织变更已应用，但组织架构刷新失败。请刷新页面后核对最新门店和负责人。',
-      ),
-    ).toBeTruthy()
-    expect(screen.queryByRole('dialog', { name: '钉钉组织同步预览' })).toBeNull()
+    const warning = await screen.findByText(
+      '应用已成功，但组织架构刷新失败。请刷新页面后核对最新区域、门店和负责人。',
+    )
+    expect(warning).toBeTruthy()
+    expect(dingtalkApi.fetchLatestDingTalkOrganization).toHaveBeenCalledTimes(2)
+    expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: '查看预览' }))
+    const reopened = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+    fireEvent.click(within(reopened).getByRole('button', { name: /取\s*消/ }))
+    expect(screen.getAllByText(/应用已成功，但组织架构刷新失败/).length).toBeGreaterThan(0)
+    expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledTimes(1)
   })
 })
