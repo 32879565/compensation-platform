@@ -140,6 +140,17 @@ class OrganizationApplyResult:
     already_applied: bool
 
 
+@dataclass(frozen=True)
+class _AppliedReviewerIdentityProof:
+    batch_public_id: str
+    snapshot_hash: str
+    remote_department_id: int
+    org_unit_id: int
+    department: Department
+    employee_id: int
+    identity_proof: str
+
+
 def get_latest_organization_preview(session: Session) -> OrganizationPreview | None:
     """Return the newest persisted organization preview without contacting DingTalk."""
 
@@ -208,6 +219,7 @@ class _LocalState:
     roles: tuple[Role, ...]
     user_roles: tuple[UserRole, ...]
     review_scopes: tuple[UserReviewScope, ...]
+    applied_reviewer_proofs: tuple[_AppliedReviewerIdentityProof, ...]
 
 
 @dataclass
@@ -220,7 +232,8 @@ class _ReviewerDraft:
 
 @dataclass(frozen=True)
 class _ReviewerIdentityIndex:
-    stable_by_hash: dict[str, tuple[Employee, ...]]
+    trusted_by_hash: dict[str, tuple[Employee, ...]]
+    all_by_hash: dict[str, tuple[Employee, ...]]
     active_by_emp_no: dict[str, tuple[Employee, ...]]
 
 
@@ -405,6 +418,22 @@ def _load_local_state(session: Session, *, for_update: bool = False) -> _LocalSt
     role_statement = select(Role).order_by(Role.id)
     user_role_statement = select(UserRole).order_by(UserRole.id)
     scope_statement = select(UserReviewScope).order_by(UserReviewScope.id)
+    proof_statement = (
+        select(DingTalkOrgSyncBatch, DingTalkOrgSyncItem)
+        .join(DingTalkOrgSyncItem, DingTalkOrgSyncItem.batch_id == DingTalkOrgSyncBatch.id)
+        .where(
+            DingTalkOrgSyncBatch.status == DingTalkOrgSyncBatchStatus.APPLIED,
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
+            DingTalkOrgSyncItem.status == DingTalkOrgSyncItemStatus.APPLIED,
+            DingTalkOrgSyncItem.action == DingTalkOrgSyncAction.ASSIGN_SCOPE,
+            DingTalkOrgSyncItem.applied_identity_proof.is_not(None),
+            DingTalkOrgSyncItem.remote_department_id.is_not(None),
+            DingTalkOrgSyncItem.proposed_org_unit_id.is_not(None),
+            DingTalkOrgSyncItem.department.is_not(None),
+            DingTalkOrgSyncItem.proposed_employee_id.is_not(None),
+        )
+        .order_by(DingTalkOrgSyncBatch.id, DingTalkOrgSyncItem.id)
+    )
     if for_update:
         org_statement = org_statement.with_for_update()
         employee_statement = employee_statement.with_for_update()
@@ -412,18 +441,38 @@ def _load_local_state(session: Session, *, for_update: bool = False) -> _LocalSt
         role_statement = role_statement.with_for_update()
         user_role_statement = user_role_statement.with_for_update()
         scope_statement = scope_statement.with_for_update()
+        proof_statement = proof_statement.with_for_update()
 
     # Keep the formal-data lock order aligned with reviewer administration:
     # user -> organization -> employee -> RBAC -> review scope.  In
     # particular, locking the store row protects an empty (store, department)
     # scope from a concurrent insertion after its baseline was checked.
+    users = tuple(session.scalars(user_statement).all())
+    org_units = tuple(session.scalars(org_statement).all())
+    employees = tuple(session.scalars(employee_statement).all())
+    roles = tuple(session.scalars(role_statement).all())
+    user_roles = tuple(session.scalars(user_role_statement).all())
+    review_scopes = tuple(session.scalars(scope_statement).all())
+    proof_rows = session.execute(proof_statement).all()
     return _LocalState(
-        users=tuple(session.scalars(user_statement).all()),
-        org_units=tuple(session.scalars(org_statement).all()),
-        employees=tuple(session.scalars(employee_statement).all()),
-        roles=tuple(session.scalars(role_statement).all()),
-        user_roles=tuple(session.scalars(user_role_statement).all()),
-        review_scopes=tuple(session.scalars(scope_statement).all()),
+        users=users,
+        org_units=org_units,
+        employees=employees,
+        roles=roles,
+        user_roles=user_roles,
+        review_scopes=review_scopes,
+        applied_reviewer_proofs=tuple(
+            _AppliedReviewerIdentityProof(
+                batch_public_id=batch.public_id,
+                snapshot_hash=batch.snapshot_hash,
+                remote_department_id=item.remote_department_id,  # type: ignore[arg-type]
+                org_unit_id=item.proposed_org_unit_id,  # type: ignore[arg-type]
+                department=item.department,  # type: ignore[arg-type]
+                employee_id=item.proposed_employee_id,  # type: ignore[arg-type]
+                identity_proof=item.applied_identity_proof,  # type: ignore[arg-type]
+            )
+            for batch, item in proof_rows
+        ),
     )
 
 
@@ -576,7 +625,78 @@ def _state_indexes(
     )
 
 
-def _complete_local_baseline(state: _LocalState) -> str:
+def _validated_reviewer_identity_bindings(
+    state: _LocalState,
+    *,
+    encryption_key: str,
+    tenant_id: str,
+) -> frozenset[tuple[int, str]]:
+    """Return only provider hashes backed by a recomputable applied proof."""
+
+    org_units_by_id = {organization.id: organization for organization in state.org_units}
+    employees_by_id = {employee.id: employee for employee in state.employees}
+    accounts_by_employee: dict[int, list[User]] = defaultdict(list)
+    users_by_id = {user.id: user for user in state.users}
+    for user in state.users:
+        if user.employee_id is not None:
+            accounts_by_employee[user.employee_id].append(user)
+    scopes_by_pair: dict[tuple[int, Department], list[int]] = defaultdict(list)
+    for scope in state.review_scopes:
+        scopes_by_pair[(scope.org_unit_id, scope.department)].append(scope.user_id)
+
+    trusted: set[tuple[int, str]] = set()
+    for evidence in state.applied_reviewer_proofs:
+        store = org_units_by_id.get(evidence.org_unit_id)
+        employee = employees_by_id.get(evidence.employee_id)
+        accounts = accounts_by_employee.get(evidence.employee_id, [])
+        if (
+            store is None
+            or store.is_deleted
+            or store.status != "ACTIVE"
+            or store.type != OrgType.STORE
+            or store.dingtalk_dept_id != evidence.remote_department_id
+            or employee is None
+            or employee.is_deleted
+            or employee.status != EmployeeStatus.ACTIVE
+            or employee.dingtalk_user_id_hash is None
+            or len(accounts) != 1
+        ):
+            continue
+        account = accounts[0]
+        if (
+            users_by_id.get(account.id) is not account
+            or account.is_deleted
+            or account.status != "ACTIVE"
+            or account.dingtalk_user_id is None
+            or account.dingtalk_user_id_hash != employee.dingtalk_user_id_hash
+            or tuple(sorted(scopes_by_pair.get((store.id, evidence.department), [])))
+            != (account.id,)
+        ):
+            continue
+        try:
+            expected_proof = dingtalk_organization_identity_proof(
+                employee.dingtalk_user_id_hash,
+                key=encryption_key,
+                tenant_id=tenant_id,
+                batch_public_id=evidence.batch_public_id,
+                snapshot_hash=evidence.snapshot_hash,
+                remote_department_id=evidence.remote_department_id,
+                org_unit_id=evidence.org_unit_id,
+                department=evidence.department.value,
+                employee_id=evidence.employee_id,
+            )
+        except ValueError:
+            continue
+        if hmac.compare_digest(expected_proof, evidence.identity_proof):
+            trusted.add((employee.id, employee.dingtalk_user_id_hash))
+    return frozenset(trusted)
+
+
+def _complete_local_baseline(
+    state: _LocalState,
+    *,
+    trusted_bindings: frozenset[tuple[int, str]] = frozenset(),
+) -> str:
     """Fingerprint every local row that can alter organization or reviewer planning."""
 
     return _fingerprint(
@@ -629,6 +749,7 @@ def _complete_local_baseline(state: _LocalState) -> str:
             (scope.user_id, scope.org_unit_id, scope.department.value)
             for scope in state.review_scopes
         ),
+        tuple(sorted(trusted_bindings)),
     )
 
 
@@ -1152,18 +1273,24 @@ def _nearest_remote_store_by_department(
 
 def _index_reviewer_identities(
     employees: tuple[Employee, ...],
+    *,
+    trusted_bindings: frozenset[tuple[int, str]] = frozenset(),
 ) -> _ReviewerIdentityIndex:
     """Index all strict reviewer identity keys in one employee pass."""
 
-    stable_by_hash: dict[str, list[Employee]] = defaultdict(list)
+    trusted_by_hash: dict[str, list[Employee]] = defaultdict(list)
+    all_by_hash: dict[str, list[Employee]] = defaultdict(list)
     active_by_emp_no: dict[str, list[Employee]] = defaultdict(list)
     for employee in employees:
         if employee.dingtalk_user_id_hash:
-            stable_by_hash[employee.dingtalk_user_id_hash].append(employee)
+            all_by_hash[employee.dingtalk_user_id_hash].append(employee)
+            if (employee.id, employee.dingtalk_user_id_hash) in trusted_bindings:
+                trusted_by_hash[employee.dingtalk_user_id_hash].append(employee)
         if employee.status == EmployeeStatus.ACTIVE and not employee.is_deleted:
             active_by_emp_no[employee.emp_no.strip()].append(employee)
     return _ReviewerIdentityIndex(
-        stable_by_hash={key: tuple(values) for key, values in stable_by_hash.items()},
+        trusted_by_hash={key: tuple(values) for key, values in trusted_by_hash.items()},
+        all_by_hash={key: tuple(values) for key, values in all_by_hash.items()},
         active_by_emp_no={key: tuple(values) for key, values in active_by_emp_no.items()},
     )
 
@@ -1177,14 +1304,17 @@ def _match_reviewer_identity(
     """Resolve a reviewer only by an established binding or exact employee number."""
 
     provider_hash = blind_index_dingtalk_user_id(remote_user.user_id, key=encryption_key)
-    stable_matches = identity_index.stable_by_hash.get(provider_hash, ())
-    if len(stable_matches) == 1:
-        stable_employee = stable_matches[0]
+    all_hash_owners = identity_index.all_by_hash.get(provider_hash, ())
+    trusted_matches = identity_index.trusted_by_hash.get(provider_hash, ())
+    if len(trusted_matches) > 1:
+        return None, "STABLE_ID", "ORG_IDENTITY_CONFLICT"
+    if len(trusted_matches) == 1:
+        stable_employee = trusted_matches[0]
+        if all_hash_owners != (stable_employee,):
+            return None, "STABLE_ID", "ORG_IDENTITY_CONFLICT"
         if stable_employee.status == EmployeeStatus.ACTIVE and not stable_employee.is_deleted:
             return stable_employee, "STABLE_ID", None
         return None, "STABLE_ID", "ORG_EMPLOYEE_MATCH_FAILED"
-    if len(stable_matches) > 1:
-        return None, "STABLE_ID", "ORG_IDENTITY_CONFLICT"
 
     job_number = (remote_user.job_number or "").strip()
     if not job_number:
@@ -1192,7 +1322,9 @@ def _match_reviewer_identity(
     job_number_matches = identity_index.active_by_emp_no.get(job_number, ())
     if len(job_number_matches) == 1:
         employee = job_number_matches[0]
-        if employee.dingtalk_user_id_hash not in (None, provider_hash):
+        if employee.dingtalk_user_id_hash not in (None, provider_hash) or any(
+            owner.id != employee.id for owner in all_hash_owners
+        ):
             return None, "JOB_NUMBER", "ORG_IDENTITY_CONFLICT"
         return employee, "JOB_NUMBER", None
     return (
@@ -1210,6 +1342,7 @@ def _plan_organization_reviewers(
     node_plan: _NodePlan,
     dining_manager_titles: frozenset[str],
     kitchen_manager_titles: frozenset[str],
+    trusted_bindings: frozenset[tuple[int, str]] = frozenset(),
 ) -> tuple[_ReviewerDraft, ...]:
     (
         _org_units_by_id,
@@ -1219,14 +1352,17 @@ def _plan_organization_reviewers(
         role_codes_by_user,
         scope_users_by_pair,
     ) = _state_indexes(state)
-    identity_index = _index_reviewer_identities(state.employees)
+    identity_index = _index_reviewer_identities(
+        state.employees,
+        trusted_bindings=trusted_bindings,
+    )
     active_remote_users = tuple(user for user in snapshot.users if user.active)
     account_ids_by_hash: dict[str, list[int]] = defaultdict(list)
     employee_ids_by_hash: dict[str, list[int]] = defaultdict(list)
     for account in state.users:
         if account.dingtalk_user_id_hash:
             account_ids_by_hash[account.dingtalk_user_id_hash].append(account.id)
-    for provider_hash, employees in identity_index.stable_by_hash.items():
+    for provider_hash, employees in identity_index.all_by_hash.items():
         employee_ids_by_hash[provider_hash].extend(employee.id for employee in employees)
 
     remote_store_ids = frozenset(node_plan.store_row_by_remote_id)
@@ -1702,6 +1838,7 @@ def preview_organization_sync(
     snapshot: DingTalkOrganizationSnapshot,
     *,
     encryption_key: str,
+    tenant_id: str,
     actor: tuple[int, str] | None,
     root_mappings: tuple[tuple[int, str], ...],
     trigger: DingTalkOrgSyncTrigger = DingTalkOrgSyncTrigger.MANUAL,
@@ -1712,6 +1849,11 @@ def preview_organization_sync(
     """Persist a point-in-time preview without modifying formal organization data."""
 
     current_time = now or datetime.now(UTC)
+    if not tenant_id.strip():
+        raise DingTalkOrganizationSyncError(
+            "TENANT_NOT_CONFIGURED",
+            "DingTalk CorpId is required before organization preview",
+        )
     if actor is None and trigger != DingTalkOrgSyncTrigger.SCHEDULED:
         raise DingTalkOrganizationSyncError(
             "ORG_ROOT_CONFIG_INVALID", "A manual organization preview requires an actor"
@@ -1723,7 +1865,15 @@ def preview_organization_sync(
     authority = _build_authority_index(state, resolved_root_mappings, org_units_by_id)
     root_config_hash = _root_config_hash(resolved_root_mappings)
     snapshot_hash = _snapshot_hash(snapshot, encryption_key=encryption_key)
-    complete_local_baseline = _complete_local_baseline(state)
+    trusted_bindings = _validated_reviewer_identity_bindings(
+        state,
+        encryption_key=encryption_key,
+        tenant_id=tenant_id,
+    )
+    complete_local_baseline = _complete_local_baseline(
+        state,
+        trusted_bindings=trusted_bindings,
+    )
 
     reusable = None
     if trigger == DingTalkOrgSyncTrigger.SCHEDULED:
@@ -1740,7 +1890,15 @@ def preview_organization_sync(
         locked_state = _load_local_state(session)
         locked_roots = _resolve_root_mappings(locked_state, root_mappings)
         locked_root_hash = _root_config_hash(locked_roots)
-        locked_local_hash = _complete_local_baseline(locked_state)
+        locked_trusted_bindings = _validated_reviewer_identity_bindings(
+            locked_state,
+            encryption_key=encryption_key,
+            tenant_id=tenant_id,
+        )
+        locked_local_hash = _complete_local_baseline(
+            locked_state,
+            trusted_bindings=locked_trusted_bindings,
+        )
         if locked_root_hash != root_config_hash or locked_local_hash != complete_local_baseline:
             session.rollback()
             raise DingTalkOrganizationSyncError(
@@ -1783,6 +1941,7 @@ def preview_organization_sync(
         node_plan=node_plan,
         dining_manager_titles=dining_manager_titles,
         kitchen_manager_titles=kitchen_manager_titles,
+        trusted_bindings=trusted_bindings,
     )
 
     take_organization_sync_lock(session)
@@ -1790,7 +1949,15 @@ def preview_organization_sync(
     locked_state = _load_local_state(session)
     locked_roots = _resolve_root_mappings(locked_state, root_mappings)
     locked_root_hash = _root_config_hash(locked_roots)
-    locked_local_hash = _complete_local_baseline(locked_state)
+    locked_trusted_bindings = _validated_reviewer_identity_bindings(
+        locked_state,
+        encryption_key=encryption_key,
+        tenant_id=tenant_id,
+    )
+    locked_local_hash = _complete_local_baseline(
+        locked_state,
+        trusted_bindings=locked_trusted_bindings,
+    )
     if locked_root_hash != root_config_hash or locked_local_hash != complete_local_baseline:
         session.rollback()
         raise DingTalkOrganizationSyncError(
@@ -1969,7 +2136,15 @@ def apply_organization_sync(
             "ORG_ROOT_CONFIG_CHANGED",
             "Organization root configuration changed; preview again",
         )
-    complete_local_baseline = _complete_local_baseline(state)
+    trusted_bindings = _validated_reviewer_identity_bindings(
+        state,
+        encryption_key=encryption_key,
+        tenant_id=tenant_id,
+    )
+    complete_local_baseline = _complete_local_baseline(
+        state,
+        trusted_bindings=trusted_bindings,
+    )
     if complete_local_baseline != batch.local_baseline_hash:
         _mark_batch_stale(session, batch, items, actor=actor, error_code="CONCURRENT_CHANGE")
         raise DingTalkOrganizationSyncError(

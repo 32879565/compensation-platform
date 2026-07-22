@@ -1431,15 +1431,21 @@ def test_reviewer_sync_conflicts_when_store_has_multiple_title_candidates(client
         (
             (
                 Employee(
+                    id=101,
                     emp_no="M101",
                     name="first",
+                    status=EmployeeStatus.ACTIVE,
+                    is_deleted=False,
                     dingtalk_user_id_hash=blind_index_dingtalk_user_id(
                         "provider-duplicate-stable", key=_settings().encryption_key
                     ),
                 ),
                 Employee(
+                    id=102,
                     emp_no="M102",
                     name="second",
+                    status=EmployeeStatus.ACTIVE,
+                    is_deleted=False,
                     dingtalk_user_id_hash=blind_index_dingtalk_user_id(
                         "provider-duplicate-stable", key=_settings().encryption_key
                     ),
@@ -1448,7 +1454,7 @@ def test_reviewer_sync_conflicts_when_store_has_multiple_title_candidates(client
             DingTalkOrganizationUser(
                 "provider-duplicate-stable", "manager", "M101", "店长", True, ()
             ),
-            "STABLE_ID",
+            "JOB_NUMBER",
         ),
     ],
 )
@@ -1491,8 +1497,159 @@ def test_reviewer_identity_rejects_inactive_or_deleted_stable_binding(status, is
     )
 
     assert matched_employee is None
-    assert method == "STABLE_ID"
+    assert method == "JOB_NUMBER"
     assert conflict_code == "ORG_EMPLOYEE_MATCH_FAILED"
+
+
+def test_reviewer_identity_uses_stable_id_only_for_a_validated_applied_binding():
+    remote_user = DingTalkOrganizationUser(
+        "provider-proven-stable", "manager", "CHANGED-NUMBER", "搴楅暱", True, ()
+    )
+    provider_hash = blind_index_dingtalk_user_id(
+        remote_user.user_id, key=_settings().encryption_key
+    )
+    employee = Employee(
+        id=101,
+        emp_no="M-PROVEN",
+        name="proven manager",
+        status=EmployeeStatus.ACTIVE,
+        is_deleted=False,
+        dingtalk_user_id_hash=provider_hash,
+    )
+
+    untrusted_employee, untrusted_method, untrusted_conflict = org_sync._match_reviewer_identity(
+        remote_user,
+        identity_index=org_sync._index_reviewer_identities((employee,)),
+        encryption_key=_settings().encryption_key,
+    )
+    trusted_employee, trusted_method, trusted_conflict = org_sync._match_reviewer_identity(
+        remote_user,
+        identity_index=org_sync._index_reviewer_identities(
+            (employee,),
+            trusted_bindings=frozenset({(employee.id, provider_hash)}),
+        ),
+        encryption_key=_settings().encryption_key,
+    )
+
+    assert (untrusted_employee, untrusted_method, untrusted_conflict) == (
+        None,
+        "JOB_NUMBER",
+        "ORG_EMPLOYEE_MATCH_FAILED",
+    )
+    assert (trusted_employee, trusted_method, trusted_conflict) == (
+        employee,
+        "STABLE_ID",
+        None,
+    )
+
+
+def test_applied_reviewer_proof_allows_stable_match_after_job_number_changes(client, db_session):
+    _seed_store_and_managers(db_session)
+    admin = _group_hr(db_session, "org-sync-proven-stable")
+    initial = _FakeOrganizationClient().list_organization_snapshot(root_department_ids=(10,))
+    remote_by_job_number = {user.job_number: user for user in initial.users}
+    for employee in db_session.scalars(
+        select(Employee).where(Employee.emp_no.in_(("M001", "M002")))
+    ):
+        employee.dingtalk_user_id_hash = blind_index_dingtalk_user_id(
+            remote_by_job_number[employee.emp_no].user_id,
+            key=_settings().encryption_key,
+        )
+    db_session.commit()
+    changed_job_numbers = DingTalkOrganizationSnapshot(
+        departments=initial.departments,
+        users=tuple(
+            DingTalkOrganizationUser(
+                user.user_id,
+                user.name,
+                f"CHANGED-{index}",
+                user.title,
+                user.active,
+                user.department_ids,
+            )
+            for index, user in enumerate(initial.users, start=1)
+        ),
+    )
+    fake = _FakeOrganizationClient(snapshots=(initial, initial, changed_job_numbers))
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+    headers = _token(client, admin.username)
+
+    first = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
+    assert first.status_code == 200, first.text
+    assert {item["match_method"] for item in first.json()["reviewer_items"]} == {"JOB_NUMBER"}
+    applied = client.post(
+        f"/api/dingtalk/sync/organization/{first.json()['batch_id']}/apply",
+        headers=headers,
+    )
+    assert applied.status_code == 200, applied.text
+
+    applied_items = list(
+        db_session.scalars(
+            select(DingTalkOrgSyncItem)
+            .where(
+                DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
+                DingTalkOrgSyncItem.status == DingTalkOrgSyncItemStatus.APPLIED,
+            )
+            .order_by(DingTalkOrgSyncItem.id)
+        ).all()
+    )
+    valid_state = org_sync._load_local_state(db_session)
+    valid_bindings = org_sync._validated_reviewer_identity_bindings(
+        valid_state,
+        encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
+    )
+    assert {employee_id for employee_id, _provider_hash in valid_bindings} == {
+        item.proposed_employee_id for item in applied_items
+    }
+    assert (
+        org_sync._validated_reviewer_identity_bindings(
+            valid_state,
+            encryption_key=_settings().encryption_key,
+            tenant_id="wrong-tenant",
+        )
+        == frozenset()
+    )
+    tampered_item = applied_items[0]
+    original_proof = tampered_item.applied_identity_proof
+    tampered_item.applied_identity_proof = "f" * 64
+    db_session.commit()
+    tampered_bindings = org_sync._validated_reviewer_identity_bindings(
+        org_sync._load_local_state(db_session),
+        encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
+    )
+    assert tampered_item.proposed_employee_id not in {
+        employee_id for employee_id, _provider_hash in tampered_bindings
+    }
+    tampered_item.applied_identity_proof = original_proof
+    db_session.commit()
+
+    second = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
+    assert second.status_code == 200, second.text
+    assert {item["match_method"] for item in second.json()["reviewer_items"]} == {"STABLE_ID"}
+
+    tampered_item.applied_identity_proof = None
+    db_session.commit()
+    stale_apply = client.post(
+        f"/api/dingtalk/sync/organization/{second.json()['batch_id']}/apply",
+        headers=headers,
+    )
+    assert stale_apply.status_code == 409
+    db_session.expire_all()
+    assert (
+        db_session.scalars(
+            select(DingTalkOrgSyncBatch).where(
+                DingTalkOrgSyncBatch.public_id == second.json()["batch_id"]
+            )
+        )
+        .one()
+        .status
+        == DingTalkOrgSyncBatchStatus.STALE
+    )
 
 
 def test_reviewer_identity_indexes_employees_once_for_multiple_managers():
@@ -2397,6 +2554,7 @@ def test_scheduled_organization_preview_reuses_only_complete_unchanged_baseline(
         db_session,
         snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=None,
         root_mappings=((10, "DIRECT-GROUP"),),
         trigger=DingTalkOrgSyncTrigger.SCHEDULED,
@@ -2409,6 +2567,7 @@ def test_scheduled_organization_preview_reuses_only_complete_unchanged_baseline(
         db_session,
         snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=None,
         root_mappings=((10, "DIRECT-GROUP"),),
         trigger=DingTalkOrgSyncTrigger.SCHEDULED,
@@ -2430,6 +2589,7 @@ def test_scheduled_organization_preview_reuses_only_complete_unchanged_baseline(
         db_session,
         snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=None,
         root_mappings=((10, "DIRECT-GROUP"),),
         trigger=DingTalkOrgSyncTrigger.SCHEDULED,
@@ -2444,6 +2604,7 @@ def test_scheduled_organization_preview_reuses_only_complete_unchanged_baseline(
         db_session,
         snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=None,
         root_mappings=((10, "DIRECT-GROUP"),),
         trigger=DingTalkOrgSyncTrigger.SCHEDULED,
@@ -2471,6 +2632,7 @@ def test_manual_organization_preview_stales_only_the_same_root_hash(db_session):
         db_session,
         first_snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=(actor.id, actor.username),
         root_mappings=((10, "DIRECT-GROUP"),),
     )
@@ -2478,6 +2640,7 @@ def test_manual_organization_preview_stales_only_the_same_root_hash(db_session):
         db_session,
         other_snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=(actor.id, actor.username),
         root_mappings=((20, "OTHER-GROUP"),),
     )
@@ -2491,6 +2654,7 @@ def test_manual_organization_preview_stales_only_the_same_root_hash(db_session):
         db_session,
         first_snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=(actor.id, actor.username),
         root_mappings=((10, "DIRECT-GROUP"),),
     )
@@ -2811,6 +2975,7 @@ def test_scheduled_cache_hit_skips_full_planners_and_does_not_insert(db_session,
         db_session,
         snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=None,
         root_mappings=((10, "DIRECT-GROUP"),),
         trigger=DingTalkOrgSyncTrigger.SCHEDULED,
@@ -2838,6 +3003,7 @@ def test_scheduled_cache_hit_skips_full_planners_and_does_not_insert(db_session,
         db_session,
         snapshot,
         encryption_key=_settings().encryption_key,
+        tenant_id=_settings().dingtalk_corp_id or "",
         actor=None,
         root_mappings=((10, "DIRECT-GROUP"),),
         trigger=DingTalkOrgSyncTrigger.SCHEDULED,
@@ -2936,10 +3102,13 @@ def test_reviewer_planner_scans_users_and_store_rows_once(db_session, monkeypatc
     identity_index_calls = 0
     index_reviewer_identities = org_sync._index_reviewer_identities
 
-    def count_identity_index_builds(employees):
+    def count_identity_index_builds(employees, *, trusted_bindings=frozenset()):
         nonlocal identity_index_calls
         identity_index_calls += 1
-        return index_reviewer_identities(employees)
+        return index_reviewer_identities(
+            employees,
+            trusted_bindings=trusted_bindings,
+        )
 
     monkeypatch.setattr(org_sync, "_match_reviewer_identity", fail_identity_match)
     monkeypatch.setattr(org_sync, "_index_reviewer_identities", count_identity_index_builds)

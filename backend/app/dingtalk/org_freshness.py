@@ -39,7 +39,7 @@ class ReviewerAuthorizationInvalidation:
     """Aggregate-only result safe to include in a master-data audit event."""
 
     invalidated_proof_count: int
-    revoked_user_count: int
+    targeted_session_user_count: int
 
 
 def invalidate_applied_reviewer_proofs(
@@ -128,7 +128,7 @@ def invalidate_reviewer_authorization(
         revoke_all_for_user(session, user_id)
     return ReviewerAuthorizationInvalidation(
         invalidated_proof_count=invalidated,
-        revoked_user_count=len(affected_user_ids),
+        targeted_session_user_count=len(affected_user_ids),
     )
 
 

@@ -151,6 +151,7 @@ def run_scheduled_org_sync(
                 session,
                 snapshot,
                 encryption_key=settings.encryption_key,
+                tenant_id=settings.dingtalk_corp_id or "",
                 actor=None,
                 root_mappings=settings.dingtalk_org_root_mapping_pairs,
                 trigger=DingTalkOrgSyncTrigger.SCHEDULED,

@@ -225,7 +225,6 @@ def create_employee(
     principal: Principal = Depends(require_permission(Perm.EMPLOYEE_WRITE)),
     session: Session = Depends(get_session),
 ) -> EmployeeOut:
-    take_organization_sync_lock(session)
     # A newly created employee may join the cohort of a concurrent payroll run
     # or backfill an already-calculated cohort.  Both paths share the payroll
     # source lock and reject historical omissions outside the audit workflow.
@@ -235,12 +234,13 @@ def create_employee(
         raise HTTPException(status_code=409, detail=str(exc)) from None
     org_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
     _visible_store_or_error(session, org_scope, body.org_unit_id)
+    if body.id_card is not None or body.bank_account is not None:
+        _require_pii_write(session, principal, body.org_unit_id)
+    take_organization_sync_lock(session)
     _visible_grade_or_error(session, body.job_grade_id)
     locked_store = _lock_employee_org_units(session, {body.org_unit_id}).get(body.org_unit_id)
     if locked_store is None or locked_store.is_deleted or locked_store.type != OrgType.STORE:
         raise HTTPException(status_code=409, detail="所属门店已被其他操作修改，请刷新后重试")
-    if body.id_card is not None or body.bank_account is not None:
-        _require_pii_write(session, principal, body.org_unit_id)
     emp = Employee(
         emp_no=body.emp_no,
         name=body.name,
@@ -293,7 +293,6 @@ def update_employee(
     principal: Principal = Depends(require_permission(Perm.EMPLOYEE_WRITE)),
     session: Session = Depends(get_session),
 ) -> EmployeeOut:
-    take_organization_sync_lock(session)
     write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
     statement = select(Employee).where(
         Employee.id == employee_id,
@@ -337,11 +336,6 @@ def update_employee(
             hire_date=data.get("hire_date", emp.hire_date),
             leave_date=data.get("leave_date", emp.leave_date),
         )
-    # Grade is a current master-data assignment used by compa analysis, not a
-    # payroll calculation input.  Validate only actual reassignment and do not
-    # make promotions impossible merely because the employee has prior payroll.
-    if grade_assignment_changed:
-        _visible_grade_or_error(session, data["job_grade_id"])
     # 转移组织时，目标组织也必须在可见范围内（防越权把员工移出/移入不可见组织）
     if "org_unit_id" in data and data["org_unit_id"] is not None:
         _visible_store_or_error(
@@ -352,8 +346,18 @@ def update_employee(
     routing_changed = any(
         field in data and data[field] != getattr(emp, field) for field in ("org_unit_id", "status")
     )
+    take_organization_sync_lock(session)
+    refreshed_emp = session.scalars(statement.execution_options(populate_existing=True)).first()
+    if refreshed_emp is None or refreshed_emp.version != observed_version:
+        raise HTTPException(status_code=409, detail="员工已被其他操作修改，请刷新后重试")
+    emp = refreshed_emp
+    # Grade is a current master-data assignment used by compa analysis, not a
+    # payroll calculation input.  Validate only actual reassignment and do not
+    # make promotions impossible merely because the employee has prior payroll.
+    if grade_assignment_changed:
+        _visible_grade_or_error(session, data["job_grade_id"])
     invalidated_proof_count = 0
-    revoked_session_user_count = 0
+    targeted_session_user_count = 0
     affected_user_ids = (
         reviewer_authorization_user_ids(session, employee_ids={emp.id}) if routing_changed else ()
     )
@@ -377,7 +381,7 @@ def update_employee(
             locked_user_ids=affected_user_ids,
         )
         invalidated_proof_count = invalidation.invalidated_proof_count
-        revoked_session_user_count = invalidation.revoked_user_count
+        targeted_session_user_count = invalidation.targeted_session_user_count
     for field, value in data.items():
         setattr(emp, field, value)
     previous_version = emp.version
@@ -388,7 +392,7 @@ def update_employee(
         "from_version": previous_version,
         "to_version": emp.version,
         "invalidated_sync_proof_count": invalidated_proof_count,
-        "revoked_session_user_count": revoked_session_user_count,
+        "targeted_session_user_count": targeted_session_user_count,
     }
     if grade_assignment_changed:
         audit_detail["job_grade_assignment"] = {
@@ -416,7 +420,6 @@ def delete_employee(
     principal: Principal = Depends(require_permission(Perm.EMPLOYEE_WRITE)),
     session: Session = Depends(get_session),
 ) -> None:
-    take_organization_sync_lock(session)
     write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
     statement = select(Employee).where(
         Employee.id == employee_id,
@@ -435,6 +438,11 @@ def delete_employee(
         hire_date=emp.hire_date,
         leave_date=emp.leave_date,
     )
+    take_organization_sync_lock(session)
+    refreshed_emp = session.scalars(statement.execution_options(populate_existing=True)).first()
+    if refreshed_emp is None or refreshed_emp.version != observed_version:
+        raise HTTPException(status_code=409, detail="员工已被其他操作修改，请刷新后重试")
+    emp = refreshed_emp
     affected_user_ids = reviewer_authorization_user_ids(session, employee_ids={emp.id})
     lock_reviewer_authorization_users(session, affected_user_ids)
     locked_store = _lock_employee_org_units(session, {emp.org_unit_id}).get(emp.org_unit_id)
@@ -460,7 +468,7 @@ def delete_employee(
         target_id=employee_id,
         detail={
             "invalidated_sync_proof_count": invalidation.invalidated_proof_count,
-            "revoked_session_user_count": invalidation.revoked_user_count,
+            "targeted_session_user_count": invalidation.targeted_session_user_count,
         },
     )
     session.commit()

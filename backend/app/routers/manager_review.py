@@ -244,6 +244,14 @@ def _lock_manager_authorization(session: Session) -> None:
     session.expire_all()
 
 
+def _lock_manager_payroll_batch(session: Session, batch_id: int) -> PayrollBatch | None:
+    """Take the payroll state-machine lock before any organization lock."""
+
+    return session.scalars(
+        select(PayrollBatch).where(PayrollBatch.id == batch_id).with_for_update()
+    ).one_or_none()
+
+
 def _delivery_link_is_current(session: Session, delivery: DingTalkDelivery) -> bool:
     anchor = delivery.dispatched_at
     if anchor is None and delivery.status is DingTalkDeliveryStatus.SANDBOXED:
@@ -292,7 +300,11 @@ def _require_live_organization_access(
 
 
 def _load_review_context(
-    review_id: str, request: Request, session: Session
+    review_id: str,
+    request: Request,
+    session: Session,
+    *,
+    lock_batch_first: bool = False,
 ) -> _ManagerReviewContext:
     try:
         claims = decode_manager_review_token(_bearer_token(request))
@@ -306,6 +318,7 @@ def _load_review_context(
     ).first()
     if preliminary_delivery is None or preliminary_delivery.batch_version != claims.batch_version:
         raise _unauthorized()
+    preliminary_batch_id = preliminary_delivery.batch_id
     preliminary_user = session.get(User, claims.user_id)
     preliminary_status = preliminary_delivery.status
     preliminary_provider_user_id = (
@@ -318,6 +331,9 @@ def _load_review_context(
             raise _unauthorized()
         access = _read_live_organization_access(preliminary_provider_user_id)
 
+    if lock_batch_first:
+        if _lock_manager_payroll_batch(session, preliminary_batch_id) is None:
+            raise _unauthorized()
     _lock_manager_authorization(session)
     delivery = session.scalars(
         select(DingTalkDelivery)
@@ -327,7 +343,11 @@ def _load_review_context(
         )
         .execution_options(populate_existing=True)
     ).first()
-    if delivery is None or delivery.batch_version != claims.batch_version:
+    if (
+        delivery is None
+        or delivery.batch_id != preliminary_batch_id
+        or delivery.batch_version != claims.batch_version
+    ):
         raise _unauthorized()
     user = session.scalars(
         select(User).where(User.id == claims.user_id).execution_options(populate_existing=True)
@@ -337,7 +357,10 @@ def _load_review_context(
     if not _delivery_link_is_current(session, delivery):
         raise _unauthorized()
     _require_live_organization_access(session, delivery=delivery, user=user, access=access)
-    batch = session.get(PayrollBatch, delivery.batch_id)
+    batch_statement = select(PayrollBatch).where(PayrollBatch.id == preliminary_batch_id)
+    if lock_batch_first:
+        batch_statement = batch_statement.with_for_update()
+    batch = session.scalars(batch_statement.execution_options(populate_existing=True)).one_or_none()
     if batch is None:
         raise _unauthorized()
     if batch.status in {BatchStatus.CONFIRMED, BatchStatus.LOCKED}:
@@ -616,7 +639,12 @@ def create_manager_dispute(
     session: Session = Depends(get_session),
 ) -> ManagerDisputeOut:
     _no_store(response)
-    context = _load_review_context(review_id, request, session)
+    context = _load_review_context(
+        review_id,
+        request,
+        session,
+        lock_batch_first=True,
+    )
     result = _result_for_employee(session, context.delivery, body.employee_id)
     employee = session.get(Employee, body.employee_id) if result is not None else None
     if employee is None:
@@ -652,7 +680,12 @@ def confirm_manager_review(
     session: Session = Depends(get_session),
 ) -> ManagerConfirmOut:
     _no_store(response)
-    context = _load_review_context(review_id, request, session)
+    context = _load_review_context(
+        review_id,
+        request,
+        session,
+        lock_batch_first=True,
+    )
     try:
         confirmation = confirm_scope(
             session,

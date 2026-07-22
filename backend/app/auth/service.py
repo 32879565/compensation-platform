@@ -71,7 +71,15 @@ def get_user_by_username(session: Session, username: str) -> User | None:
 
 def authenticate(session: Session, username: str, password: str) -> User:
     """校验用户名+口令。失败一律抛 AuthError（不泄露是用户不存在还是口令错）。"""
-    user = get_user_by_username(session, username)
+    # Keep the account row locked through refresh-token issuance and the
+    # caller's commit. Account/session revocation takes the same lock first,
+    # so a concurrent successful login cannot publish a token after revocation.
+    user = session.scalars(
+        select(User)
+        .where(User.username == username, User.is_deleted.is_(False))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
     # 用户不存在时也做一次哈希校验以抵消时序差异（防用户名枚举）
     stored_hash = user.password_hash if user else _DUMMY_HASH
     ok = verify_password(stored_hash, password)
@@ -282,6 +290,10 @@ def build_principal(session: Session, user: User) -> Principal:
 
 
 def issue_refresh_token(session: Session, user_id: int) -> str:
+    # Do not rely on every caller already holding the account lock. This
+    # defensive lock serializes direct issuance with account-wide revocation.
+    if _lock_user_for_update(session, user_id) is None:
+        raise AuthError("account unavailable")
     settings = get_settings()
     now = datetime.now(UTC)
     raw, digest = generate_refresh_token()
@@ -310,11 +322,18 @@ def rotate_refresh_token(session: Session, raw_token: str) -> tuple[int, str]:
       （RFC 9700 refresh token 重用检测）。
     """
     digest = hash_refresh_token(raw_token)
+    # Locate the lifecycle root without first locking the token row. The
+    # locator result is revalidated after the User -> RefreshToken lock order.
+    user_id = session.scalar(select(RefreshToken.user_id).where(RefreshToken.token_hash == digest))
+    if user_id is None:
+        raise AuthError("refresh token invalid")
+    if _lock_user_for_update(session, user_id) is None:
+        raise AuthError("refresh token invalid")
     rec = session.scalars(
         select(RefreshToken).where(RefreshToken.token_hash == digest).with_for_update()
     ).first()
     now = datetime.now(UTC)
-    if rec is None:
+    if rec is None or rec.user_id != user_id:
         raise AuthError("refresh token 无效")
     if rec.revoked_at is not None:
         # 已被轮换/吊销的 token 再次出现 = 强泄露信号，连坐吊销该用户所有会话
@@ -330,21 +349,37 @@ def rotate_refresh_token(session: Session, raw_token: str) -> tuple[int, str]:
 
 def revoke_refresh_token(session: Session, raw_token: str) -> None:
     digest = hash_refresh_token(raw_token)
-    rec = session.scalars(select(RefreshToken).where(RefreshToken.token_hash == digest)).first()
-    if rec is not None and rec.revoked_at is None:
+    user_id = session.scalar(select(RefreshToken.user_id).where(RefreshToken.token_hash == digest))
+    if user_id is None or _lock_user_for_update(session, user_id) is None:
+        return
+    rec = session.scalars(
+        select(RefreshToken).where(RefreshToken.token_hash == digest).with_for_update()
+    ).first()
+    if rec is None or rec.user_id != user_id:
+        return
+    if rec.revoked_at is None:
         rec.revoked_at = datetime.now(UTC)
         session.flush()
 
 
 def revoke_all_for_user(session: Session, user_id: int) -> None:
+    if _lock_user_for_update(session, user_id) is None:
+        return
     now = datetime.now(UTC)
     for rec in session.scalars(
-        select(RefreshToken).where(
-            RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None)
-        )
+        select(RefreshToken)
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+        .order_by(RefreshToken.id)
+        .with_for_update()
     ):
         rec.revoked_at = now
     session.flush()
+
+
+def _lock_user_for_update(session: Session, user_id: int) -> User | None:
+    """Take the lifecycle root lock before any refresh-token row lock/write."""
+
+    return session.scalars(select(User).where(User.id == user_id).with_for_update()).first()
 
 
 def access_token_for(user_id: int) -> str:

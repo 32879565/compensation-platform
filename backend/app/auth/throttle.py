@@ -148,6 +148,8 @@ class LoginThrottle:
         ip: str,
         username: str | None,
         account_id: int | None,
+        *,
+        purge_expired: bool,
     ) -> tuple[_BucketKey, ...]:
         keys = self._keys(ip, username, account_id)
         try:
@@ -159,16 +161,20 @@ class LoginThrottle:
                 session.execute(
                     select(func.pg_advisory_xact_lock(self._advisory_lock_id(key.digest)))
                 )
-            expired_ids = (
-                select(LoginThrottleBucket.id)
-                .where(LoginThrottleBucket.expires_at <= self._now())
-                .order_by(LoginThrottleBucket.expires_at)
-                .limit(_PURGE_BATCH_SIZE)
-                .scalar_subquery()
-            )
-            session.execute(
-                delete(LoginThrottleBucket).where(LoginThrottleBucket.id.in_(expired_ids))
-            )
+            # Global cleanup may lock unrelated bucket rows. Run it only in
+            # the pre-authentication check phase, before the router can hold a
+            # User row lock. Post-auth updates reacquire only their own keys.
+            if purge_expired:
+                expired_ids = (
+                    select(LoginThrottleBucket.id)
+                    .where(LoginThrottleBucket.expires_at <= self._now())
+                    .order_by(LoginThrottleBucket.expires_at)
+                    .limit(_PURGE_BATCH_SIZE)
+                    .scalar_subquery()
+                )
+                session.execute(
+                    delete(LoginThrottleBucket).where(LoginThrottleBucket.id.in_(expired_ids))
+                )
         except SQLAlchemyError as exc:
             raise ThrottleUnavailableError("shared login throttle is unavailable") from exc
         return keys
@@ -195,7 +201,7 @@ class LoginThrottle:
     def check(
         self, session: Session, ip: str, username: str, account_id: int | None = None
     ) -> ThrottleDecision:
-        keys = self._prepare(session, ip, username, account_id)
+        keys = self._prepare(session, ip, username, account_id, purge_expired=True)
         now = self._now()
         rows = self._rows(session, keys)
         by_scope = {key.scope: rows.get((key.scope, key.digest)) for key in keys}
@@ -219,7 +225,7 @@ class LoginThrottle:
     def check_ip(self, session: Session, ip: str) -> ThrottleDecision:
         """Check only the source bucket before any account lookup or Argon2 work."""
 
-        keys = self._prepare(session, ip, None, None)
+        keys = self._prepare(session, ip, None, None, purge_expired=True)
         now = self._now()
         rows = self._rows(session, keys)
         ip_row = rows.get((BucketScope.IP, keys[0].digest))
@@ -240,7 +246,7 @@ class LoginThrottle:
     def record_failure(
         self, session: Session, ip: str, username: str, account_id: int | None = None
     ) -> ThrottleFailure:
-        keys = self._prepare(session, ip, username, account_id)
+        keys = self._prepare(session, ip, username, account_id, purge_expired=False)
         now = self._now()
         rows = self._rows(session, keys)
         ip_became_locked = False
@@ -299,7 +305,7 @@ class LoginThrottle:
     ) -> None:
         """Clear credential-specific failures without clearing the IP bucket."""
 
-        keys = self._prepare(session, ip, username, account_id)
+        keys = self._prepare(session, ip, username, account_id, purge_expired=False)
         credential_pairs = [
             (key.scope.value, key.digest) for key in keys if key.scope != BucketScope.IP
         ]

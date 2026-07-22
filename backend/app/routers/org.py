@@ -178,7 +178,7 @@ def update_unit(
         if repo.get(new_parent) is None:
             raise HTTPException(status_code=404, detail="上级组织不存在或不可见")
     invalidated_proof_count = 0
-    revoked_session_user_count = 0
+    targeted_session_user_count = 0
     subtree_ids = repo.descendant_ids(unit.id)
     store_ids: set[int] = set()
     affected_scopes: set[tuple[int, Department]] = set()
@@ -222,7 +222,7 @@ def update_unit(
             locked_user_ids=affected_user_ids,
         )
         invalidated_proof_count = invalidation.invalidated_proof_count
-        revoked_session_user_count = invalidation.revoked_user_count
+        targeted_session_user_count = invalidation.targeted_session_user_count
     for field, value in data.items():
         setattr(unit, field, value)
     session.flush()
@@ -235,7 +235,7 @@ def update_unit(
         detail={
             "changed": sorted(data.keys()),
             "invalidated_sync_proof_count": invalidated_proof_count,
-            "revoked_session_user_count": revoked_session_user_count,
+            "targeted_session_user_count": targeted_session_user_count,
         },
     )
     session.commit()
@@ -248,12 +248,17 @@ def delete_unit(
     principal: Principal = Depends(require_permission(Perm.ORG_WRITE)),
     session: Session = Depends(get_session),
 ) -> None:
-    take_organization_sync_lock(session)
     repo = _repo(session, principal, Perm.ORG_WRITE)
     unit = repo.get(unit_id)
     if unit is None:
         raise HTTPException(status_code=404, detail="组织不存在或不可见")
     _ensure_org_not_in_active_payroll(session, unit.id)
+    take_organization_sync_lock(session)
+    session.expire(unit)
+    refreshed_unit = repo.get(unit_id)
+    if refreshed_unit is None:
+        raise HTTPException(status_code=409, detail="组织已被其他操作修改，请刷新后重试")
+    unit = refreshed_unit
     subtree_ids = repo.descendant_ids(unit.id)
     store_ids = set(
         session.scalars(
@@ -292,7 +297,7 @@ def delete_unit(
         target_id=unit_id,
         detail={
             "invalidated_sync_proof_count": invalidation.invalidated_proof_count,
-            "revoked_session_user_count": invalidation.revoked_user_count,
+            "targeted_session_user_count": invalidation.targeted_session_user_count,
         },
     )
     session.commit()

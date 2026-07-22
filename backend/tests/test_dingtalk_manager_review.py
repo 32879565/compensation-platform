@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from threading import Event as ThreadEvent
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from app.auth.bootstrap import seed_rbac
 from app.core.config import get_settings
@@ -25,6 +29,7 @@ from app.dingtalk.manager_security import (
     create_manager_review_token,
     decode_manager_review_token,
 )
+from app.dingtalk.org_sync import take_organization_sync_lock
 from app.dingtalk.read_sync import (
     blind_index_dingtalk_user_id,
     dingtalk_organization_identity_proof,
@@ -450,6 +455,110 @@ def test_manager_can_confirm_only_the_delivery_store_department(client, db_sessi
     db_session.refresh(world["kitchen_confirmation"])
     assert world["dining_confirmation"].status is ConfirmStatus.CONFIRMED
     assert world["kitchen_confirmation"].status is ConfirmStatus.PENDING
+
+
+@pytest.mark.parametrize("operation", ["dispute", "confirm"])
+def test_manager_payroll_writes_lock_batch_before_organization_authorization(
+    client,
+    db_session,
+    pg_engine,
+    monkeypatch,
+    operation,
+):
+    world = _review_world(db_session)
+    token = _exchange(client, monkeypatch, world)
+    headers = {"Authorization": f"Bearer {token}"}
+    review_url = f"/api/manager-review/reviews/{world['delivery'].review_public_id}"
+    from app.routers import manager_review
+
+    observed: list[str] = []
+    original_lock = manager_review._lock_manager_authorization
+
+    def record_authorization_lock(session):
+        observed.append("organization")
+        return original_lock(session)
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        normalized = " ".join(statement.lower().split())
+        if "payroll_batch" in normalized and "for update" in normalized:
+            observed.append("batch")
+
+    monkeypatch.setattr(manager_review, "_lock_manager_authorization", record_authorization_lock)
+    event.listen(pg_engine, "before_cursor_execute", record_statement)
+    try:
+        if operation == "dispute":
+            response = client.post(
+                f"{review_url}/disputes",
+                headers=headers,
+                json={
+                    "employee_id": world["dining_employee"].id,
+                    "salary_item": "ATTEND_WAGE",
+                    "opinion": "Please verify attendance.",
+                },
+            )
+            assert response.status_code == 201, response.text
+        else:
+            response = client.post(f"{review_url}/confirm", headers=headers)
+            assert response.status_code == 200, response.text
+    finally:
+        event.remove(pg_engine, "before_cursor_execute", record_statement)
+
+    assert observed[:2] == ["batch", "organization"]
+
+
+def test_manager_write_holds_batch_lock_while_waiting_for_organization_writer(
+    pg_engine,
+):
+    from app.routers import manager_review
+
+    with Session(pg_engine) as setup_session:
+        batch = PayrollBatch(
+            period="LCK-001",
+            attendance_start=date(2099, 1, 1),
+            attendance_end=date(2099, 1, 31),
+            status=BatchStatus.PENDING_STORE_CONFIRM,
+        )
+        setup_session.add(batch)
+        setup_session.commit()
+        batch_id = batch.id
+
+    reached_organization_lock = ThreadEvent()
+
+    def manager_write_lock_sequence():
+        with Session(pg_engine) as manager_session:
+            assert manager_review._lock_manager_payroll_batch(manager_session, batch_id) is not None
+            reached_organization_lock.set()
+            manager_review._lock_manager_authorization(manager_session)
+            manager_session.rollback()
+
+    try:
+        with (
+            Session(pg_engine) as organization_writer,
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            take_organization_sync_lock(organization_writer)
+            future = executor.submit(manager_write_lock_sequence)
+            try:
+                assert reached_organization_lock.wait(timeout=5)
+                with Session(pg_engine) as contender:
+                    with pytest.raises(OperationalError):
+                        contender.scalars(
+                            select(PayrollBatch)
+                            .where(PayrollBatch.id == batch_id)
+                            .with_for_update(nowait=True)
+                        ).one()
+                    contender.rollback()
+            finally:
+                organization_writer.rollback()
+            future.result(timeout=10)
+
+        assert future.done()
+    finally:
+        with Session(pg_engine) as cleanup_session:
+            persisted = cleanup_session.get(PayrollBatch, batch_id)
+            if persisted is not None:
+                cleanup_session.delete(persisted)
+                cleanup_session.commit()
 
 
 def _install_live_manager_review(monkeypatch, live_client):
