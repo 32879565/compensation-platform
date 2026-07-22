@@ -319,7 +319,9 @@ class DingTalkClient:
             {"userid": normalized_user_id},
         )
         parent_result = parent_payload.get("result")
-        raw_parent_list = parent_result.get("parent_list") if isinstance(parent_result, dict) else None
+        raw_parent_list = (
+            parent_result.get("parent_list") if isinstance(parent_result, dict) else None
+        )
         if not isinstance(raw_parent_list, list) or not raw_parent_list:
             raise DingTalkClientError("DingTalk returned an invalid organization access")
         paths: list[tuple[int, ...]] = []

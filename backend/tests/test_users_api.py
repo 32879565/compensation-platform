@@ -18,7 +18,6 @@ from app.models.auth import (
     UserReviewScope,
     UserRole,
 )
-from app.models.employee import Department, Employee
 from app.models.dingtalk import (
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncBatchStatus,
@@ -26,6 +25,7 @@ from app.models.dingtalk import (
     DingTalkOrgSyncItemKind,
     DingTalkOrgSyncItemStatus,
 )
+from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 
 pytestmark = pytest.mark.usefixtures("pg_engine")

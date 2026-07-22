@@ -351,7 +351,9 @@ def replace_dingtalk_recipient(
     if new_hash is not None and user.employee_id is None and any(
         employee_hash == new_hash for _employee_id, employee_hash in employee_bindings
     ):
-        raise HTTPException(status_code=409, detail="该钉钉账号已绑定员工，不能用于未关联员工的账号")
+        raise HTTPException(
+            status_code=409, detail="该钉钉账号已绑定员工，不能用于未关联员工的账号"
+        )
     account_bindings = session.execute(
         select(
             User.id,

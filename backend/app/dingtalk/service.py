@@ -21,13 +21,13 @@ from app.auth.permissions import Perm
 from app.auth.service import Principal
 from app.core.config import DingTalkMode, Settings, get_settings
 from app.db.session import SessionLocal
+from app.dingtalk.authorization import lock_review_authorization_tables
 from app.dingtalk.client import (
     DingTalkClient,
     DingTalkClientError,
     DingTalkSendOutcomeUnknown,
     get_dingtalk_client,
 )
-from app.dingtalk.authorization import lock_review_authorization_tables
 from app.dingtalk.org_freshness import (
     DingTalkOrganizationFreshnessError,
     require_recent_organization_scopes,

@@ -11,8 +11,8 @@ import pytest
 from sqlalchemy import select
 
 from app.auth.bootstrap import seed_rbac
-from app.core.security import create_access_token, hash_password
 from app.core.config import get_settings
+from app.core.security import create_access_token, hash_password
 from app.dingtalk.client import (
     DingTalkClient,
     DingTalkClientError,
@@ -23,6 +23,10 @@ from app.dingtalk.manager_security import (
     ManagerReviewTokenError,
     create_manager_review_token,
     decode_manager_review_token,
+)
+from app.dingtalk.read_sync import (
+    blind_index_dingtalk_user_id,
+    dingtalk_organization_identity_proof,
 )
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
@@ -43,10 +47,6 @@ from app.models.payroll_result import (
     CompDispute,
     ConfirmStatus,
     PayrollResult,
-)
-from app.dingtalk.read_sync import (
-    blind_index_dingtalk_user_id,
-    dingtalk_organization_identity_proof,
 )
 
 pytestmark = pytest.mark.usefixtures("pg_engine")

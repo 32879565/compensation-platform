@@ -30,13 +30,13 @@ from app.dingtalk.client import (
     DingTalkOrganizationSnapshot,
     DingTalkOrganizationUser,
 )
+from app.dingtalk.org_rules import manager_department_for_title
 from app.dingtalk.read_sync import (
     LocalEmployeeIdentity,
     blind_index_dingtalk_user_id,
     dingtalk_organization_identity_proof,
     match_directory_users,
 )
-from app.dingtalk.org_rules import manager_department_for_title
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
     DingTalkOrgSyncBatch,

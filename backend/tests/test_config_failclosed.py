@@ -4,6 +4,49 @@ from pydantic import SecretStr, ValidationError
 from app.core.config import DingTalkMode, Settings
 
 
+def _set_dingtalk_read_env(monkeypatch) -> None:
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.setenv("COMP_DINGTALK_CLIENT_ID", "ding-client")
+    monkeypatch.setenv("COMP_DINGTALK_CLIENT_SECRET", "c" * 48)
+    monkeypatch.setenv("COMP_DINGTALK_AGENT_ID", "123")
+    monkeypatch.setenv("COMP_DINGTALK_CORP_ID", "corp-1")
+    monkeypatch.setenv("COMP_DINGTALK_READ_SYNC_ENABLED", "true")
+
+
+def test_live_read_sync_requires_stable_root_mappings(monkeypatch):
+    _set_dingtalk_read_env(monkeypatch)
+    monkeypatch.setenv("COMP_DINGTALK_MODE", "live")
+    monkeypatch.setenv("COMP_DINGTALK_PUBLIC_BASE_URL", "https://pay.example.test")
+    monkeypatch.setenv("COMP_DINGTALK_ORG_ROOT_MAPPINGS", "")
+
+    with pytest.raises(ValidationError, match="root mappings"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["abc:GROUP", "0:GROUP", "1:", "1:GROUP,1:OTHER"],
+)
+def test_dingtalk_root_mappings_reject_invalid_or_duplicate_values(monkeypatch, value):
+    _set_dingtalk_read_env(monkeypatch)
+    monkeypatch.setenv("COMP_DINGTALK_ORG_ROOT_MAPPINGS", value)
+
+    with pytest.raises(ValidationError, match="root mappings"):
+        Settings(_env_file=None)
+
+
+def test_dingtalk_root_mappings_are_canonical(monkeypatch):
+    _set_dingtalk_read_env(monkeypatch)
+    monkeypatch.setenv("COMP_DINGTALK_ORG_ROOT_MAPPINGS", " 100 : GROUP-GZ , 200:GROUP-SZ ")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.dingtalk_org_root_mappings == "100:GROUP-GZ,200:GROUP-SZ"
+    assert settings.dingtalk_org_root_mapping_pairs == ((100, "GROUP-GZ"), (200, "GROUP-SZ"))
+
+
 def test_missing_secret_key_fails_closed(monkeypatch):
     # 清空环境中的必填项，构造时不读 .env，应因缺 secret_key/database_url 而失败
     for key in ("COMP_SECRET_KEY", "COMP_DATABASE_URL"):
@@ -90,6 +133,7 @@ def test_live_dingtalk_manager_review_requires_corp_id(monkeypatch):
 
     monkeypatch.setenv("COMP_DINGTALK_CORP_ID", "ding-corp")
     monkeypatch.setenv("COMP_DINGTALK_READ_SYNC_ENABLED", "true")
+    monkeypatch.setenv("COMP_DINGTALK_ORG_ROOT_MAPPINGS", "1:GROUP")
     assert Settings(_env_file=None).dingtalk_corp_id == "ding-corp"
 
 

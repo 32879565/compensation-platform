@@ -2,6 +2,7 @@ import enum
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AnyHttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -84,6 +85,8 @@ class Settings(BaseSettings):
     dingtalk_dining_manager_titles: str = "店长"
     dingtalk_kitchen_manager_titles: str = "厨房经理"
     dingtalk_org_sync_freshness_minutes: int = 5
+    dingtalk_org_root_mappings: str = ""
+    dingtalk_org_sync_timezone: str = "Asia/Shanghai"
 
     @field_validator("secret_key", "encryption_key")
     @classmethod
@@ -211,6 +214,37 @@ class Settings(BaseSettings):
             raise ValueError("must be between 1 and 15 minutes")
         return value
 
+    @field_validator("dingtalk_org_root_mappings")
+    @classmethod
+    def validate_dingtalk_org_root_mappings(cls, value: str) -> str:
+        pairs: list[tuple[int, str]] = []
+        for raw_pair in value.split(","):
+            if not raw_pair.strip():
+                continue
+            raw_id, separator, raw_code = raw_pair.partition(":")
+            code = raw_code.strip()
+            if separator != ":" or not raw_id.strip().isdigit() or not code:
+                raise ValueError("root mappings must use <positive-id>:<local-code>")
+            remote_id = int(raw_id.strip())
+            if remote_id <= 0 or len(code) > 64 or ":" in code or "," in code:
+                raise ValueError("root mappings contain an invalid id or local code")
+            pairs.append((remote_id, code))
+        if len(pairs) > 20:
+            raise ValueError("root mappings must contain at most 20 roots")
+        if len({remote_id for remote_id, _ in pairs}) != len(pairs):
+            raise ValueError("root mappings contain a duplicate remote root")
+        return ",".join(f"{remote_id}:{code}" for remote_id, code in pairs)
+
+    @field_validator("dingtalk_org_sync_timezone")
+    @classmethod
+    def validate_dingtalk_org_sync_timezone(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            ZoneInfo(normalized)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("must be a valid IANA timezone") from exc
+        return normalized
+
     @model_validator(mode="after")
     def validate_dingtalk_configuration(self) -> "Settings":
         credential_parts = (
@@ -243,6 +277,12 @@ class Settings(BaseSettings):
             raise ValueError("DingTalk read sync requires complete application credentials")
         if self.dingtalk_read_sync_enabled and self.dingtalk_corp_id is None:
             raise ValueError("DingTalk read sync requires dingtalk_corp_id")
+        if (
+            self.dingtalk_mode is DingTalkMode.LIVE
+            and self.dingtalk_read_sync_enabled
+            and not self.dingtalk_org_root_mapping_pairs
+        ):
+            raise ValueError("DingTalk live read sync requires root mappings")
         dining_titles = {title.casefold() for title in self.dingtalk_dining_manager_title_set}
         kitchen_titles = {title.casefold() for title in self.dingtalk_kitchen_manager_title_set}
         if dining_titles & kitchen_titles:
@@ -265,6 +305,16 @@ class Settings(BaseSettings):
     @property
     def dingtalk_store_root_name_set(self) -> frozenset[str]:
         return frozenset(self.dingtalk_store_root_names.split(","))
+
+    @property
+    def dingtalk_org_root_mapping_pairs(self) -> tuple[tuple[int, str], ...]:
+        if not self.dingtalk_org_root_mappings:
+            return ()
+        return tuple(
+            (int(raw_id), code)
+            for pair in self.dingtalk_org_root_mappings.split(",")
+            for raw_id, code in [pair.split(":", 1)]
+        )
 
     @property
     def dingtalk_dining_manager_title_set(self) -> frozenset[str]:
