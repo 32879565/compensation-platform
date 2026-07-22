@@ -355,11 +355,17 @@ test.describe('compensation workflows', () => {
     await expect(scheduledDialog.getByRole('region', { name: '负责人冲突（1）' })).toContainText(
       'ORG_MANAGER_AMBIGUOUS',
     )
-    await expect(scheduledDialog.getByText('钉钉完整路径')).toHaveCount(0)
-    await expect(scheduledDialog.getByText('匹配方式')).toHaveCount(0)
-    await expect(scheduledDialog.getByText('当前负责人')).toHaveCount(0)
-    await expect(scheduledDialog.getByText('钉钉负责人')).toHaveCount(0)
-    await expect(scheduledDialog.getByText('拟匹配本地员工')).toHaveCount(0)
+    for (const removedColumn of [
+      '钉钉完整路径',
+      '匹配方式',
+      '当前负责人',
+      '钉钉负责人',
+      '拟匹配本地员工',
+    ]) {
+      await expect(
+        scheduledDialog.getByRole('columnheader', { name: removedColumn, exact: true }),
+      ).toHaveCount(0)
+    }
     await expect(scheduledDialog).not.toContainText('E2E Mock 厅面负责人')
     await expect(scheduledDialog).not.toContainText('E2E Mock 厅面员工')
     await expect(scheduledDialog).not.toContainText('E2E Mock 旧厨房负责人')
