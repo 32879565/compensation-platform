@@ -216,6 +216,28 @@ describe('OrgTreePage DingTalk organization sync', () => {
     expect(await screen.findByRole('dialog', { name: '钉钉组织同步预览' })).toBeTruthy()
   })
 
+  it('does not apply an APPLIED latest batch whose historical ready counters remain non-zero', async () => {
+    dingtalkApi.fetchLatestDingTalkOrganization.mockResolvedValue(
+      previewWith({
+        trigger: 'SCHEDULED',
+        region_items: basePreview.region_items.map((item) => ({ ...item, status: 'APPLIED' })),
+        store_items: basePreview.store_items.map((item) => ({ ...item, status: 'IGNORED' })),
+        reviewer_items: basePreview.reviewer_items.map((item) => ({ ...item, status: 'APPLIED' })),
+      }),
+    )
+    renderPage()
+
+    const status = await screen.findByRole('region', { name: '钉钉组织同步状态' })
+    await within(status).findByText('定时检查')
+    fireEvent.click(within(status).getByRole('button', { name: '查看预览' }))
+
+    const dialog = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+    const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(applyButton)
+    expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
+  })
+
   it('treats only latest 404 as an empty history state and keeps the tree usable', async () => {
     dingtalkApi.fetchLatestDingTalkOrganization.mockRejectedValue({ response: { status: 404 } })
     renderPage()
@@ -362,6 +384,55 @@ describe('OrgTreePage DingTalk organization sync', () => {
     )
     expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole('dialog', { name: '钉钉组织同步预览' })).toBeNull()
+  })
+
+  it('does not reapply a submitted batch when latest refresh fails and leaves old READY cache', async () => {
+    dingtalkApi.fetchLatestDingTalkOrganization
+      .mockResolvedValueOnce(previewWith({ trigger: 'SCHEDULED' }))
+      .mockRejectedValueOnce({ response: { status: 503, data: { detail: 'refresh failed' } } })
+    renderPage()
+    const dialog = await refreshAndOpen()
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认应用变更' }))
+
+    await waitFor(() =>
+      expect(dingtalkApi.fetchLatestDingTalkOrganization).toHaveBeenCalledTimes(2),
+    )
+    const status = screen.getByRole('region', { name: '钉钉组织同步状态' })
+    fireEvent.click(within(status).getByRole('button', { name: '查看预览' }))
+    const reopened = await screen.findByRole('dialog', { name: '钉钉组织同步预览' })
+    const applyButton = within(reopened).getByRole('button', { name: '确认应用变更' })
+
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(applyButton)
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+    expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledTimes(1)
+  })
+
+  it('locks an uncertain failed batch across reopen and same-batch refresh but allows a new batch', async () => {
+    const newBatch = previewWith({ batch_id: '4fe80f532f184247b477694427bad0ce' })
+    dingtalkApi.previewDingTalkOrganization
+      .mockResolvedValueOnce(basePreview)
+      .mockResolvedValueOnce(basePreview)
+      .mockResolvedValueOnce(newBatch)
+    dingtalkApi.applyDingTalkOrganization.mockRejectedValueOnce(new Error('network timeout'))
+    renderPage()
+    const dialog = await refreshAndOpen()
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认应用变更' }))
+    expect(await within(dialog).findByText('network timeout')).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: /取\s*消/ }))
+
+    const sameBatch = await refreshAndOpen()
+    const lockedButton = within(sameBatch).getByRole('button', { name: '确认应用变更' })
+    expect((lockedButton as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(lockedButton)
+    expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledTimes(1)
+    fireEvent.click(within(sameBatch).getByRole('button', { name: /取\s*消/ }))
+
+    const nextBatch = await refreshAndOpen()
+    expect(
+      (within(nextBatch).getByRole('button', { name: '确认应用变更' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false)
   })
 
   it('keeps a persistent success warning when the tree refresh fails and never resubmits', async () => {

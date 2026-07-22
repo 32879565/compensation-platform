@@ -230,8 +230,21 @@ function isExpired(preview: DingTalkOrganizationPreview, now: number): boolean {
   return !Number.isFinite(expiry) || expiry <= now
 }
 
+function hasReadyItem(preview: DingTalkOrganizationPreview): boolean {
+  return (
+    preview.region_items.some((item) => item.status === 'READY') ||
+    preview.store_items.some((item) => item.status === 'READY') ||
+    preview.reviewer_items.some((item) => item.status === 'READY')
+  )
+}
+
 function canApply(preview: DingTalkOrganizationPreview, now: number): boolean {
-  return totalReadyItems(preview) > 0 && totalConflicts(preview) === 0 && !isExpired(preview, now)
+  return (
+    totalReadyItems(preview) > 0 &&
+    hasReadyItem(preview) &&
+    totalConflicts(preview) === 0 &&
+    !isExpired(preview, now)
+  )
 }
 
 interface OrganizationChangesSectionProps {
@@ -320,7 +333,7 @@ export default function OrgTreePage() {
   const [syncError, setSyncError] = useState<string | null>(null)
   const [postApplyWarning, setPostApplyWarning] = useState<string | null>(null)
   const [expiryClock, setExpiryClock] = useState(() => Date.now())
-  const applySubmittedRef = useRef(false)
+  const submittedBatchRef = useRef<string | null>(null)
 
   const orgTreeQuery = useQuery({
     queryKey: ['orgTree', queryScope],
@@ -344,7 +357,6 @@ export default function OrgTreePage() {
     mutationFn: previewDingTalkOrganization,
     retry: false,
     onSuccess: (preview) => {
-      applySubmittedRef.current = false
       setSyncError(null)
       setExpiryClock(Date.now())
       setSyncPreview(preview)
@@ -374,7 +386,6 @@ export default function OrgTreePage() {
       )
     },
     onError: (error) => {
-      applySubmittedRef.current = false
       setSyncError(errorMessage(error))
     },
   })
@@ -399,7 +410,6 @@ export default function OrgTreePage() {
 
   function viewLatestPreview(): void {
     if (!latestQuery.data) return
-    applySubmittedRef.current = false
     setSyncError(null)
     setExpiryClock(Date.now())
     setSyncPreview(latestQuery.data)
@@ -415,19 +425,22 @@ export default function OrgTreePage() {
     const preview = syncPreview
     if (
       !preview ||
-      applySubmittedRef.current ||
+      submittedBatchRef.current === preview.batch_id ||
       applyMutation.isPending ||
       !canApply(preview, Date.now())
     ) {
       return
     }
-    applySubmittedRef.current = true
+    submittedBatchRef.current = preview.batch_id
     applyMutation.mutate(preview.batch_id)
   }
 
   if (orgTreeQuery.isLoading) return <Spin />
 
-  const canApplyPreview = syncPreview !== null && canApply(syncPreview, expiryClock)
+  const canApplyPreview =
+    syncPreview !== null &&
+    syncPreview.batch_id !== submittedBatchRef.current &&
+    canApply(syncPreview, expiryClock)
   const reviewerAssignments =
     syncPreview?.reviewer_items.filter(
       (item) => item.status !== 'CONFLICT' && item.action === 'ASSIGN_SCOPE',
