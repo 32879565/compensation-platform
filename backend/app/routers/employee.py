@@ -75,6 +75,16 @@ def _repo(session: Session, principal: Principal, permission: str) -> EmployeeRe
     )
 
 
+def _visible_employee_statement(employee_id: int, org_scope: frozenset[int] | None):
+    statement = select(Employee).where(
+        Employee.id == employee_id,
+        Employee.is_deleted.is_(False),
+    )
+    if org_scope is not None:
+        statement = statement.where(Employee.org_unit_id.in_(org_scope))
+    return statement
+
+
 def _pii_scope(session: Session, principal: Principal) -> frozenset[int] | None:
     """Return the scope that may receive unmasked employee identifiers.
 
@@ -237,6 +247,13 @@ def create_employee(
     if body.id_card is not None or body.bank_account is not None:
         _require_pii_write(session, principal, body.org_unit_id)
     take_organization_sync_lock(session)
+    # Authorization depends on the current organization tree.  Resolve it
+    # again while holding the organization lock so a concurrent reparent
+    # cannot preserve authority from the preliminary check above.
+    org_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
+    _visible_store_or_error(session, org_scope, body.org_unit_id)
+    if body.id_card is not None or body.bank_account is not None:
+        _require_pii_write(session, principal, body.org_unit_id)
     _visible_grade_or_error(session, body.job_grade_id)
     locked_store = _lock_employee_org_units(session, {body.org_unit_id}).get(body.org_unit_id)
     if locked_store is None or locked_store.is_deleted or locked_store.type != OrgType.STORE:
@@ -294,12 +311,7 @@ def update_employee(
     session: Session = Depends(get_session),
 ) -> EmployeeOut:
     write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
-    statement = select(Employee).where(
-        Employee.id == employee_id,
-        Employee.is_deleted.is_(False),
-    )
-    if write_scope is not None:
-        statement = statement.where(Employee.org_unit_id.in_(write_scope))
+    statement = _visible_employee_statement(employee_id, write_scope)
     emp = session.scalars(statement.execution_options(populate_existing=True)).first()
     if emp is None:
         raise HTTPException(status_code=404, detail="员工不存在或不可见")
@@ -347,10 +359,16 @@ def update_employee(
         field in data and data[field] != getattr(emp, field) for field in ("org_unit_id", "status")
     )
     take_organization_sync_lock(session)
+    write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
+    statement = _visible_employee_statement(employee_id, write_scope)
     refreshed_emp = session.scalars(statement.execution_options(populate_existing=True)).first()
     if refreshed_emp is None or refreshed_emp.version != observed_version:
         raise HTTPException(status_code=409, detail="员工已被其他操作修改，请刷新后重试")
     emp = refreshed_emp
+    target_org_unit_id = data.get("org_unit_id") or emp.org_unit_id
+    _visible_store_or_error(session, write_scope, target_org_unit_id)
+    if {"id_card", "bank_account"}.intersection(data):
+        _require_pii_write(session, principal, target_org_unit_id)
     # Grade is a current master-data assignment used by compa analysis, not a
     # payroll calculation input.  Validate only actual reassignment and do not
     # make promotions impossible merely because the employee has prior payroll.
@@ -421,12 +439,7 @@ def delete_employee(
     session: Session = Depends(get_session),
 ) -> None:
     write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
-    statement = select(Employee).where(
-        Employee.id == employee_id,
-        Employee.is_deleted.is_(False),
-    )
-    if write_scope is not None:
-        statement = statement.where(Employee.org_unit_id.in_(write_scope))
+    statement = _visible_employee_statement(employee_id, write_scope)
     emp = session.scalars(statement.execution_options(populate_existing=True)).first()
     if emp is None:
         raise HTTPException(status_code=404, detail="员工不存在或不可见")
@@ -439,6 +452,8 @@ def delete_employee(
         leave_date=emp.leave_date,
     )
     take_organization_sync_lock(session)
+    write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
+    statement = _visible_employee_statement(employee_id, write_scope)
     refreshed_emp = session.scalars(statement.execution_options(populate_existing=True)).first()
     if refreshed_emp is None or refreshed_emp.version != observed_version:
         raise HTTPException(status_code=409, detail="员工已被其他操作修改，请刷新后重试")

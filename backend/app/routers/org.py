@@ -255,6 +255,7 @@ def delete_unit(
     _ensure_org_not_in_active_payroll(session, unit.id)
     take_organization_sync_lock(session)
     session.expire(unit)
+    repo = _repo(session, principal, Perm.ORG_WRITE)
     refreshed_unit = repo.get(unit_id)
     if refreshed_unit is None:
         raise HTTPException(status_code=409, detail="组织已被其他操作修改，请刷新后重试")

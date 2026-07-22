@@ -1,12 +1,26 @@
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
 from app.auth.bootstrap import seed_rbac
+from app.auth.permissions import Perm
+from app.auth.service import Principal
 from app.core.security import hash_password
-from app.models.auth import RefreshToken, Role, User, UserOrgScope, UserReviewScope, UserRole
+from app.models.auth import (
+    Permission,
+    RefreshToken,
+    Role,
+    RolePermission,
+    User,
+    UserOrgScope,
+    UserReviewScope,
+    UserRole,
+)
 from app.models.dingtalk import (
     DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
@@ -15,8 +29,9 @@ from app.models.dingtalk import (
     DingTalkOrgSyncItemKind,
     DingTalkOrgSyncItemStatus,
 )
-from app.models.employee import Department, Employee
+from app.models.employee import Department, Employee, EmployeeStatus
 from app.models.org import OrgType, OrgUnit
+from app.schemas.employee import EmployeeCreate, EmployeeUpdate
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -926,3 +941,423 @@ def test_manual_employee_routing_change_invalidates_proof_and_linked_sessions(cl
     db_session.refresh(refresh_token)
     assert proof.applied_identity_proof is None
     assert refresh_token.revoked_at is not None
+
+
+def test_scoped_employee_update_reauthorizes_after_organization_lock(monkeypatch, pg_engine):
+    """A store moved out of scope while the writer waits must fail closed."""
+    from app.routers import employee as employee_router
+
+    unique = uuid4().hex[:12]
+    proof_marker = uuid4().hex + uuid4().hex
+    with Session(pg_engine) as setup:
+        group = OrgUnit(code=f"TOCTOU-G-{unique}", name="group", type=OrgType.GROUP)
+        setup.add(group)
+        setup.flush()
+        allowed = OrgUnit(
+            code=f"TOCTOU-A-{unique}",
+            name="allowed",
+            type=OrgType.REGION,
+            parent_id=group.id,
+        )
+        outside = OrgUnit(
+            code=f"TOCTOU-B-{unique}",
+            name="outside",
+            type=OrgType.REGION,
+            parent_id=group.id,
+        )
+        setup.add_all([allowed, outside])
+        setup.flush()
+        store = OrgUnit(
+            code=f"TOCTOU-S-{unique}",
+            name="store",
+            type=OrgType.STORE,
+            parent_id=allowed.id,
+        )
+        writer = User(username=f"writer-{unique}", password_hash=hash_password("StrongPass123!"))
+        reviewer = User(
+            username=f"reviewer-{unique}", password_hash=hash_password("StrongPass123!")
+        )
+        setup.add_all([store, writer, reviewer])
+        setup.flush()
+        setup.add(UserOrgScope(user_id=writer.id, org_unit_id=allowed.id))
+        employee = Employee(
+            emp_no=f"TOCTOU-{unique}",
+            name="Scoped employee",
+            org_unit_id=store.id,
+            department=Department.DINING,
+            hire_date=date(2026, 1, 1),
+        )
+        setup.add(employee)
+        setup.flush()
+        proof, refresh_token = _applied_reviewer_authorization(
+            setup,
+            store=store,
+            employee=employee,
+            reviewer=reviewer,
+            suffix="f",
+        )
+        proof.applied_identity_proof = proof_marker
+        refresh_token.token_hash = proof_marker
+        setup.commit()
+        ids = {
+            "group": group.id,
+            "allowed": allowed.id,
+            "outside": outside.id,
+            "store": store.id,
+            "writer": writer.id,
+            "reviewer": reviewer.id,
+            "employee": employee.id,
+            "proof": proof.id,
+            "token": refresh_token.id,
+            "batch": proof.batch_id,
+        }
+
+    principal = Principal(
+        user_id=ids["writer"],
+        username=f"writer-{unique}",
+        permissions=frozenset({Perm.EMPLOYEE_WRITE}),
+        org_scope=frozenset({ids["allowed"], ids["store"]}),
+    )
+
+    def move_store_before_lock_returns(_request_session):
+        with Session(pg_engine) as mover:
+            current_store = mover.get(OrgUnit, ids["store"])
+            assert current_store is not None
+            current_store.parent_id = ids["outside"]
+            mover.commit()
+
+    monkeypatch.setattr(
+        employee_router,
+        "take_organization_sync_lock",
+        move_store_before_lock_returns,
+    )
+    try:
+        with Session(pg_engine) as request_session:
+            with pytest.raises(HTTPException) as exc_info:
+                employee_router.update_employee(
+                    ids["employee"],
+                    EmployeeUpdate(status=EmployeeStatus.SUSPENDED),
+                    principal,
+                    request_session,
+                )
+            request_session.rollback()
+        assert exc_info.value.status_code in {403, 404, 409}
+
+        with Session(pg_engine) as verify:
+            current_employee = verify.get(Employee, ids["employee"])
+            current_proof = verify.get(DingTalkOrgSyncItem, ids["proof"])
+            current_token = verify.get(RefreshToken, ids["token"])
+            assert current_employee is not None
+            assert current_employee.status == EmployeeStatus.ACTIVE
+            assert current_employee.version == 1
+            assert current_proof is not None
+            assert current_proof.applied_identity_proof == proof_marker
+            assert current_token is not None
+            assert current_token.revoked_at is None
+    finally:
+        with Session(pg_engine) as cleanup:
+            cleanup.execute(
+                delete(DingTalkOrgSyncItem).where(DingTalkOrgSyncItem.batch_id == ids["batch"])
+            )
+            cleanup.execute(
+                delete(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.id == ids["batch"])
+            )
+            cleanup.execute(delete(RefreshToken).where(RefreshToken.id == ids["token"]))
+            cleanup.execute(
+                delete(UserReviewScope).where(UserReviewScope.user_id == ids["reviewer"])
+            )
+            cleanup.execute(delete(UserOrgScope).where(UserOrgScope.user_id == ids["writer"]))
+            cleanup.execute(delete(User).where(User.id.in_([ids["writer"], ids["reviewer"]])))
+            cleanup.execute(delete(Employee).where(Employee.id == ids["employee"]))
+            cleanup.execute(delete(OrgUnit).where(OrgUnit.id == ids["store"]))
+            cleanup.execute(delete(OrgUnit).where(OrgUnit.id.in_([ids["allowed"], ids["outside"]])))
+            cleanup.execute(delete(OrgUnit).where(OrgUnit.id == ids["group"]))
+            cleanup.commit()
+
+
+@contextmanager
+def _committed_scope_toctou_world(pg_engine, *, global_employee_write=False):
+    """Build committed rows visible to the request and concurrent mover sessions."""
+    unique = uuid4().hex[:12]
+    proof_marker = uuid4().hex + uuid4().hex
+    with Session(pg_engine) as setup:
+        if global_employee_write:
+            seed_rbac(setup)
+        group = OrgUnit(code=f"RACE-G-{unique}", name="group", type=OrgType.GROUP)
+        setup.add(group)
+        setup.flush()
+        allowed = OrgUnit(
+            code=f"RACE-A-{unique}",
+            name="allowed",
+            type=OrgType.REGION,
+            parent_id=group.id,
+        )
+        outside = OrgUnit(
+            code=f"RACE-B-{unique}",
+            name="outside",
+            type=OrgType.REGION,
+            parent_id=group.id,
+        )
+        setup.add_all([allowed, outside])
+        setup.flush()
+        store = OrgUnit(
+            code=f"RACE-S-{unique}",
+            name="store",
+            type=OrgType.STORE,
+            parent_id=allowed.id,
+        )
+        writer = User(username=f"writer-{unique}", password_hash=hash_password("StrongPass123!"))
+        reviewer = User(
+            username=f"reviewer-{unique}", password_hash=hash_password("StrongPass123!")
+        )
+        setup.add_all([store, writer, reviewer])
+        setup.flush()
+        setup.add(UserOrgScope(user_id=writer.id, org_unit_id=allowed.id))
+        global_role_id = None
+        if global_employee_write:
+            role = Role(
+                code=f"RACE-GLOBAL-WRITE-{unique}",
+                name="TOCTOU global employee writer",
+                is_global_scope=True,
+            )
+            setup.add(role)
+            setup.flush()
+            permission_id = setup.scalars(
+                select(Permission.id).where(Permission.code == Perm.EMPLOYEE_WRITE)
+            ).one()
+            setup.add_all(
+                [
+                    RolePermission(role_id=role.id, permission_id=permission_id),
+                    UserRole(user_id=writer.id, role_id=role.id),
+                ]
+            )
+            global_role_id = role.id
+        employee = Employee(
+            emp_no=f"RACE-{unique}",
+            name="Scoped employee",
+            org_unit_id=store.id,
+            department=Department.DINING,
+            hire_date=date(2026, 1, 1),
+        )
+        setup.add(employee)
+        setup.flush()
+        proof, refresh_token = _applied_reviewer_authorization(
+            setup,
+            store=store,
+            employee=employee,
+            reviewer=reviewer,
+            suffix="e",
+        )
+        proof.applied_identity_proof = proof_marker
+        refresh_token.token_hash = proof_marker
+        setup.commit()
+        ids = {
+            "group": group.id,
+            "allowed": allowed.id,
+            "outside": outside.id,
+            "store": store.id,
+            "writer": writer.id,
+            "reviewer": reviewer.id,
+            "employee": employee.id,
+            "proof": proof.id,
+            "token": refresh_token.id,
+            "batch": proof.batch_id,
+            "global_role": global_role_id,
+        }
+
+    try:
+        yield ids, unique, proof_marker
+    finally:
+        with Session(pg_engine) as cleanup:
+            cleanup.execute(
+                delete(DingTalkOrgSyncItem).where(DingTalkOrgSyncItem.batch_id == ids["batch"])
+            )
+            cleanup.execute(
+                delete(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.id == ids["batch"])
+            )
+            cleanup.execute(delete(RefreshToken).where(RefreshToken.id == ids["token"]))
+            cleanup.execute(
+                delete(UserReviewScope).where(UserReviewScope.user_id == ids["reviewer"])
+            )
+            cleanup.execute(delete(UserOrgScope).where(UserOrgScope.user_id == ids["writer"]))
+            cleanup.execute(delete(UserRole).where(UserRole.user_id == ids["writer"]))
+            if ids["global_role"] is not None:
+                cleanup.execute(
+                    delete(RolePermission).where(RolePermission.role_id == ids["global_role"])
+                )
+                cleanup.execute(delete(Role).where(Role.id == ids["global_role"]))
+            cleanup.execute(delete(User).where(User.id.in_([ids["writer"], ids["reviewer"]])))
+            cleanup.execute(delete(Employee).where(Employee.org_unit_id == ids["store"]))
+            cleanup.execute(delete(OrgUnit).where(OrgUnit.id == ids["store"]))
+            cleanup.execute(delete(OrgUnit).where(OrgUnit.id.in_([ids["allowed"], ids["outside"]])))
+            cleanup.execute(delete(OrgUnit).where(OrgUnit.id == ids["group"]))
+            cleanup.commit()
+
+
+def _move_store_before_lock_returns(pg_engine, ids):
+    def move_store(_request_session):
+        with Session(pg_engine) as mover:
+            current_store = mover.get(OrgUnit, ids["store"])
+            assert current_store is not None
+            current_store.parent_id = ids["outside"]
+            mover.commit()
+
+    return move_store
+
+
+def _assert_scope_toctou_sentinels_unchanged(pg_engine, ids, proof_marker):
+    with Session(pg_engine) as verify:
+        employee = verify.get(Employee, ids["employee"])
+        proof = verify.get(DingTalkOrgSyncItem, ids["proof"])
+        token = verify.get(RefreshToken, ids["token"])
+        assert employee is not None
+        assert employee.status == EmployeeStatus.ACTIVE
+        assert employee.version == 1
+        assert employee.is_deleted is False
+        assert proof is not None
+        assert proof.applied_identity_proof == proof_marker
+        assert token is not None
+        assert token.revoked_at is None
+
+
+def test_scoped_employee_create_reauthorizes_after_organization_lock(monkeypatch, pg_engine):
+    from app.routers import employee as employee_router
+
+    with _committed_scope_toctou_world(pg_engine) as (ids, unique, proof_marker):
+        principal = Principal(
+            user_id=ids["writer"],
+            username=f"writer-{unique}",
+            permissions=frozenset({Perm.EMPLOYEE_WRITE}),
+            org_scope=frozenset({ids["allowed"], ids["store"]}),
+        )
+        monkeypatch.setattr(
+            employee_router,
+            "take_organization_sync_lock",
+            _move_store_before_lock_returns(pg_engine, ids),
+        )
+        with Session(pg_engine) as request_session:
+            with pytest.raises(HTTPException) as exc_info:
+                employee_router.create_employee(
+                    EmployeeCreate(
+                        emp_no=f"NEW-{unique}",
+                        name="Rejected employee",
+                        org_unit_id=ids["store"],
+                        hire_date=date(2026, 1, 1),
+                    ),
+                    principal,
+                    request_session,
+                )
+            request_session.rollback()
+        assert exc_info.value.status_code in {403, 404, 409}
+        with Session(pg_engine) as verify:
+            assert (
+                verify.scalar(select(Employee.id).where(Employee.emp_no == f"NEW-{unique}")) is None
+            )
+        _assert_scope_toctou_sentinels_unchanged(pg_engine, ids, proof_marker)
+
+
+def test_scoped_employee_delete_reauthorizes_after_organization_lock(monkeypatch, pg_engine):
+    from app.routers import employee as employee_router
+
+    with _committed_scope_toctou_world(pg_engine) as (ids, unique, proof_marker):
+        principal = Principal(
+            user_id=ids["writer"],
+            username=f"writer-{unique}",
+            permissions=frozenset({Perm.EMPLOYEE_WRITE}),
+            org_scope=frozenset({ids["allowed"], ids["store"]}),
+        )
+        monkeypatch.setattr(
+            employee_router,
+            "take_organization_sync_lock",
+            _move_store_before_lock_returns(pg_engine, ids),
+        )
+        with Session(pg_engine) as request_session:
+            with pytest.raises(HTTPException) as exc_info:
+                employee_router.delete_employee(ids["employee"], principal, request_session)
+            request_session.rollback()
+        assert exc_info.value.status_code in {403, 404, 409}
+        _assert_scope_toctou_sentinels_unchanged(pg_engine, ids, proof_marker)
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_scoped_employee_pii_write_reauthorizes_after_organization_lock(
+    monkeypatch,
+    pg_engine,
+    operation,
+):
+    from app.routers import employee as employee_router
+
+    with _committed_scope_toctou_world(pg_engine, global_employee_write=True) as (
+        ids,
+        unique,
+        proof_marker,
+    ):
+        principal = Principal(
+            user_id=ids["writer"],
+            username=f"writer-{unique}",
+            permissions=frozenset({Perm.EMPLOYEE_WRITE, Perm.EMPLOYEE_PII}),
+            org_scope=frozenset({ids["allowed"], ids["store"]}),
+        )
+        monkeypatch.setattr(
+            employee_router,
+            "take_organization_sync_lock",
+            _move_store_before_lock_returns(pg_engine, ids),
+        )
+        with Session(pg_engine) as request_session:
+            with pytest.raises(HTTPException) as exc_info:
+                if operation == "create":
+                    employee_router.create_employee(
+                        EmployeeCreate(
+                            emp_no=f"PII-{unique}",
+                            name="Rejected PII employee",
+                            org_unit_id=ids["store"],
+                            hire_date=date(2026, 1, 1),
+                            id_card="440101199001011234",
+                        ),
+                        principal,
+                        request_session,
+                    )
+                else:
+                    employee_router.update_employee(
+                        ids["employee"],
+                        EmployeeUpdate(id_card="440101199001011234"),
+                        principal,
+                        request_session,
+                    )
+            request_session.rollback()
+        assert exc_info.value.status_code == 403
+        with Session(pg_engine) as verify:
+            employee = verify.get(Employee, ids["employee"])
+            assert employee is not None
+            assert employee.id_card is None
+            assert (
+                verify.scalar(select(Employee.id).where(Employee.emp_no == f"PII-{unique}")) is None
+            )
+        _assert_scope_toctou_sentinels_unchanged(pg_engine, ids, proof_marker)
+
+
+def test_scoped_org_delete_reauthorizes_after_organization_lock(monkeypatch, pg_engine):
+    from app.routers import org as org_router
+
+    with _committed_scope_toctou_world(pg_engine) as (ids, unique, proof_marker):
+        principal = Principal(
+            user_id=ids["writer"],
+            username=f"writer-{unique}",
+            permissions=frozenset({Perm.ORG_WRITE}),
+            org_scope=frozenset({ids["allowed"], ids["store"]}),
+        )
+        monkeypatch.setattr(
+            org_router,
+            "take_organization_sync_lock",
+            _move_store_before_lock_returns(pg_engine, ids),
+        )
+        with Session(pg_engine) as request_session:
+            with pytest.raises(HTTPException) as exc_info:
+                org_router.delete_unit(ids["store"], principal, request_session)
+            request_session.rollback()
+        assert exc_info.value.status_code in {403, 404, 409}
+        with Session(pg_engine) as verify:
+            store = verify.get(OrgUnit, ids["store"])
+            assert store is not None
+            assert store.is_deleted is False
+        _assert_scope_toctou_sentinels_unchanged(pg_engine, ids, proof_marker)
