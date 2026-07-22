@@ -49,37 +49,40 @@ def _schedule_lock(session: Session) -> Iterator[bool]:
     connection = _dedicated_connection(session)
     acquired = False
     pending_error: BaseException | None = None
-    safe_to_close = True
 
     def invalidate_connection() -> BaseException | None:
-        nonlocal safe_to_close
-
-        # Until invalidation succeeds, closing could return an unknown-lock
-        # connection to the pool. Prefer leaking that handle to doing so.
-        safe_to_close = False
         try:
             connection.invalidate()
         except BaseException as exc:
             return exc
-        safe_to_close = True
         return None
 
     try:
-        try:
-            acquired = bool(
-                connection.scalar(select(func.pg_try_advisory_lock(func.hashtext(_SCHEDULE_LOCK))))
-            )
-        except BaseException as exc:
-            # The server may have acquired the session lock before the client
-            # lost the outcome. This connection can never safely re-enter the pool.
-            pending_error = exc
-            invalidate_connection()
-            raise
+        # A schedule-lock handle must never be eligible for QueuePool check-in,
+        # including through Connection's GC finalizer.
+        connection.detach()
 
         try:
+            try:
+                acquired = bool(
+                    connection.scalar(
+                        select(func.pg_try_advisory_lock(func.hashtext(_SCHEDULE_LOCK)))
+                    )
+                )
+            except BaseException as exc:
+                # The server may have acquired the session lock before the
+                # client lost the outcome. Invalidate the detached handle, then
+                # preserve the acquisition error.
+                pending_error = exc
+                invalidate_connection()
+                raise
+
             yield acquired
         except BaseException as exc:
-            pending_error = exc
+            # This handler and the following finally cover acquisition, the
+            # boundary immediately after it, and the complete protected body.
+            if pending_error is None:
+                pending_error = exc
             raise
         finally:
             if acquired:
@@ -100,13 +103,20 @@ def _schedule_lock(session: Session) -> Iterator[bool]:
                         if invalidation_error is not None and pending_error is None:
                             pending_error = invalidation_error
                             raise invalidation_error
+    except BaseException as exc:
+        # Also protect the boundary immediately after detach so close failures
+        # cannot replace cancellation before the lock lifecycle starts.
+        if pending_error is None:
+            pending_error = exc
+        raise
     finally:
-        if safe_to_close:
-            try:
-                connection.close()
-            except BaseException:
-                if pending_error is None:
-                    raise
+        # Detach makes close a physical DBAPI close, never a pool check-in. It
+        # is also safe after detach failure because no lock SQL has executed.
+        try:
+            connection.close()
+        except BaseException:
+            if pending_error is None:
+                raise
 
 
 def _failure_code(error: DingTalkClientError | DingTalkOrganizationSyncError) -> str:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gc
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import QueuePool
 
 from app.auth.bootstrap import seed_rbac
 from app.core.config import Settings
@@ -15,7 +17,7 @@ from app.dingtalk.client import (
     DingTalkDepartment,
     DingTalkOrganizationSnapshot,
 )
-from app.dingtalk.org_sync_job import _schedule_lock, run_scheduled_org_sync
+from app.dingtalk.org_sync_job import _SCHEDULE_LOCK, _schedule_lock, run_scheduled_org_sync
 from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import DingTalkOrgSyncBatch, DingTalkOrgSyncNotification
@@ -27,19 +29,32 @@ class _Connection:
     def __init__(
         self,
         *results: object,
+        detach_error: BaseException | None = None,
         invalidate_error: BaseException | None = None,
         close_error: BaseException | None = None,
     ) -> None:
         self.results = iter(results)
+        self.detach_error = detach_error
         self.invalidate_error = invalidate_error
         self.close_error = close_error
         self.statements: list[str] = []
+        self.operations: list[str] = []
         self.closed = False
+        self.detached = False
         self.invalidated = False
         self.close_calls = 0
+        self.detach_calls = 0
         self.invalidate_calls = 0
 
+    def detach(self) -> None:
+        self.operations.append("detach")
+        self.detach_calls += 1
+        if self.detach_error is not None:
+            raise self.detach_error
+        self.detached = True
+
     def scalar(self, statement: object) -> object:
+        self.operations.append("scalar")
         self.statements.append(str(statement))
         result = next(self.results)
         if isinstance(result, BaseException):
@@ -47,12 +62,14 @@ class _Connection:
         return result
 
     def invalidate(self) -> None:
+        self.operations.append("invalidate")
         self.invalidate_calls += 1
         if self.invalidate_error is not None:
             raise self.invalidate_error
         self.invalidated = True
 
     def close(self) -> None:
+        self.operations.append("close")
         self.close_calls += 1
         if self.close_error is not None:
             raise self.close_error
@@ -99,6 +116,8 @@ def test_schedule_lock_is_nonblocking_and_released_on_body_failure() -> None:
 
     assert "pg_try_advisory_lock" in connection.statements[0]
     assert "pg_advisory_unlock" in connection.statements[1]
+    assert connection.operations[:2] == ["detach", "scalar"]
+    assert connection.detached is True
     assert connection.closed is True
 
 
@@ -110,6 +129,8 @@ def test_schedule_lock_contention_does_not_attempt_unlock() -> None:
     ) as acquired:
         assert acquired is False
 
+    assert connection.operations == ["detach", "scalar", "close"]
+    assert connection.detached is True
     assert len(connection.statements) == 1
     assert connection.closed is True
 
@@ -157,6 +178,8 @@ def test_schedule_lock_invalidates_and_reraises_acquire_error(
             pytest.fail("the lock body must not run")
 
     assert raised.value is acquire_error
+    assert connection.operations[:2] == ["detach", "scalar"]
+    assert connection.detached is True
     assert connection.invalidated is True
     assert connection.closed is True
 
@@ -192,7 +215,7 @@ def test_schedule_lock_preserves_body_interrupt_when_unlock_also_fails() -> None
     assert connection.closed is True
 
 
-def test_schedule_lock_never_closes_when_acquire_invalidation_fails() -> None:
+def test_schedule_lock_closes_detached_connection_when_acquire_invalidation_fails() -> None:
     acquire_error = KeyboardInterrupt()
     connection = _Connection(
         acquire_error,
@@ -206,11 +229,12 @@ def test_schedule_lock_never_closes_when_acquire_invalidation_fails() -> None:
             pytest.fail("the lock body must not run")
 
     assert raised.value is acquire_error
+    assert connection.detached is True
     assert connection.invalidate_calls == 1
-    assert connection.close_calls == 0
+    assert connection.close_calls == 1
 
 
-def test_schedule_lock_preserves_body_error_when_unlock_invalidation_fails() -> None:
+def test_schedule_lock_closes_detached_connection_when_unlock_invalidation_fails() -> None:
     body_error = SystemExit("body cancelled")
     connection = _Connection(
         True,
@@ -226,8 +250,9 @@ def test_schedule_lock_preserves_body_error_when_unlock_invalidation_fails() -> 
             raise body_error
 
     assert raised.value is body_error
+    assert connection.detached is True
     assert connection.invalidate_calls == 1
-    assert connection.close_calls == 0
+    assert connection.close_calls == 1
 
 
 def test_schedule_lock_preserves_acquire_error_when_close_also_fails() -> None:
@@ -287,6 +312,26 @@ def test_schedule_lock_preserves_body_error_when_safe_close_fails() -> None:
     assert connection.close_calls == 1
 
 
+def test_schedule_lock_detach_failure_closes_before_any_lock_sql() -> None:
+    detach_error = KeyboardInterrupt()
+    connection = _Connection(
+        detach_error=detach_error,
+        close_error=SystemExit("close interrupted"),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ):
+            pytest.fail("the lock body must not run")
+
+    assert raised.value is detach_error
+    assert connection.detach_calls == 1
+    assert connection.statements == []
+    assert connection.invalidate_calls == 0
+    assert connection.close_calls == 1
+
+
 @pytest.mark.usefixtures("pg_engine")
 def test_postgresql_schedule_lock_contends_then_releases(db_session, pg_engine) -> None:
     with _schedule_lock(db_session) as acquired:
@@ -297,6 +342,85 @@ def test_postgresql_schedule_lock_contends_then_releases(db_session, pg_engine) 
 
     with _schedule_lock(db_session) as reacquired:
         assert reacquired is True
+
+
+@pytest.mark.usefixtures("pg_engine")
+def test_detached_postgresql_lock_never_checks_in_after_cleanup_failures(
+    pg_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.dingtalk.org_sync_job as job
+
+    isolated_engine = create_engine(
+        pg_engine.url,
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=2,
+        future=True,
+    )
+    checked_in_connections: list[object] = []
+
+    @event.listens_for(isolated_engine.pool, "checkin")
+    def record_checkin(dbapi_connection: object, _connection_record: object) -> None:
+        checked_in_connections.append(dbapi_connection)
+
+    real_connection = isolated_engine.connect()
+    locked_driver_connection = real_connection.connection.driver_connection
+
+    class CleanupFailureConnection:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+            self.locked_backend_pid: int | None = None
+
+        def detach(self) -> None:
+            self.connection.detach()
+
+        def scalar(self, statement: object) -> object:
+            if "pg_advisory_unlock" in str(statement):
+                raise RuntimeError("unlock outcome unknown")
+            result = self.connection.scalar(statement)
+            self.locked_backend_pid = self.connection.scalar(text("SELECT pg_backend_pid()"))
+            return result
+
+        def invalidate(self) -> None:
+            raise KeyboardInterrupt()
+
+        def close(self) -> None:
+            self.connection.close()
+
+    faulty_connection = CleanupFailureConnection(real_connection)
+    holder = [faulty_connection]
+    monkeypatch.setattr(job, "_dedicated_connection", lambda _session: holder.pop())
+
+    try:
+        with Session(isolated_engine) as session:
+            with pytest.raises(RuntimeError, match="unlock outcome unknown"):
+                with _schedule_lock(session) as acquired:
+                    assert acquired is True
+
+        locked_backend_pid = faulty_connection.locked_backend_pid
+        assert locked_backend_pid is not None
+        holder.clear()
+        faulty_connection = None  # type: ignore[assignment]
+        real_connection = None  # type: ignore[assignment]
+        gc.collect()
+
+        dirty_connection_checked_in = any(
+            candidate is locked_driver_connection for candidate in checked_in_connections
+        )
+        with isolated_engine.connect() as probe:
+            probe_backend_pid = probe.scalar(text("SELECT pg_backend_pid()"))
+            inherited_lock = bool(
+                probe.scalar(select(func.pg_advisory_unlock(func.hashtext(_SCHEDULE_LOCK))))
+            )
+            assert probe.scalar(select(func.pg_try_advisory_lock(func.hashtext(_SCHEDULE_LOCK))))
+            assert probe.scalar(select(func.pg_advisory_unlock(func.hashtext(_SCHEDULE_LOCK))))
+    finally:
+        isolated_engine.dispose()
+
+    assert dirty_connection_checked_in is False
+    assert probe_backend_pid != locked_backend_pid
+    assert inherited_lock is False
 
 
 class _JobSession:
