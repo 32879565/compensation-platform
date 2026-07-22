@@ -655,6 +655,37 @@ def _lock_org_unit_table_against_phantoms(session: Session) -> None:
         session.execute(text("LOCK TABLE org_unit IN SHARE ROW EXCLUSIVE MODE"))
 
 
+def _locked_local_depths(
+    parent_by_id: dict[int, int | None],
+    organization_ids: set[int],
+) -> dict[int, int]:
+    """Resolve local hierarchy depths without trusting staged display paths."""
+
+    depths: dict[int, int] = {}
+    for organization_id in organization_ids:
+        current_id = organization_id
+        path: list[int] = []
+        seen: set[int] = set()
+        while current_id not in depths:
+            if current_id in seen:
+                raise _ConcurrentChange("organization hierarchy contains a cycle")
+            seen.add(current_id)
+            if current_id not in parent_by_id:
+                raise _ConcurrentChange("organization hierarchy contains an orphan")
+            path.append(current_id)
+            parent_id = parent_by_id[current_id]
+            if parent_id is None:
+                depth = 0
+                break
+            current_id = parent_id
+        else:
+            depth = depths[current_id]
+        for path_id in reversed(path):
+            depth += 1
+            depths[path_id] = depth
+    return {organization_id: depths[organization_id] for organization_id in organization_ids}
+
+
 def _reviewer_baseline(
     *,
     store: OrgUnit | None,
@@ -948,14 +979,14 @@ def _plan_organization_nodes(
                 proposed_parent is not None and proposed.parent_id != proposed_parent.id
             ) or parent_is_staged_create:
                 change_fields.append("parent_id")
+            if proposed.dingtalk_dept_id is None:
+                change_fields.append("dingtalk_dept_id")
             if proposed.status == "HISTORICAL":
                 action = DingTalkOrgSyncAction.ACTIVATE
-            elif change_fields:
+            elif any(field != "dingtalk_dept_id" for field in change_fields):
                 action = DingTalkOrgSyncAction.UPDATE
             else:
                 action = DingTalkOrgSyncAction.LINK
-                if proposed.dingtalk_dept_id is None:
-                    change_fields = ["dingtalk_dept_id"]
 
         status = (
             DingTalkOrgSyncItemStatus.READY
@@ -2078,8 +2109,11 @@ def apply_organization_sync(
     remote_parent_by_id = {
         department.department_id: department.parent_id for department in fresh_snapshot.departments
     }
+    locked_parent_by_id = {
+        organization.id: organization.parent_id for organization in state.org_units
+    }
 
-    def item_depth(item: DingTalkOrgSyncItem) -> int:
+    def remote_item_depth(item: DingTalkOrgSyncItem) -> int:
         return item.remote_department_path.count(" / ") + 1
 
     def resolve_node_parent(item: DingTalkOrgSyncItem) -> OrgUnit | None:
@@ -2092,9 +2126,22 @@ def apply_organization_sync(
         return nodes_by_remote_id.get(remote_parent_id) if remote_parent_id is not None else None
 
     try:
+        deactivate_items = [
+            item for item in ready_node_items if item.action == DingTalkOrgSyncAction.DEACTIVATE
+        ]
+        if any(item.proposed_org_unit_id is None for item in deactivate_items):
+            raise _ConcurrentChange("deactivation target baseline changed")
+        deactivation_depths = _locked_local_depths(
+            locked_parent_by_id,
+            {
+                item.proposed_org_unit_id
+                for item in deactivate_items
+                if item.proposed_org_unit_id is not None
+            },
+        )
         active_node_items = sorted(
             (item for item in ready_node_items if item.action != DingTalkOrgSyncAction.DEACTIVATE),
-            key=lambda item: (item_depth(item), item.remote_department_id or 0, item.id),
+            key=lambda item: (remote_item_depth(item), item.remote_department_id or 0, item.id),
         )
         for item in active_node_items:
             action = item.action
@@ -2134,7 +2181,7 @@ def apply_organization_sync(
                 if before_store is None:
                     raise _ConcurrentChange("organization baseline changed")
                 applied_store = before_store
-                if action in {DingTalkOrgSyncAction.LINK, DingTalkOrgSyncAction.ACTIVATE}:
+                if "dingtalk_dept_id" in item.change_fields:
                     applied_store.dingtalk_dept_id = remote_department_id
                 if action == DingTalkOrgSyncAction.ACTIVATE:
                     applied_store.status = "ACTIVE"
@@ -2146,8 +2193,6 @@ def apply_organization_sync(
                         if parent is None:
                             raise _ConcurrentChange("organization parent baseline changed")
                         applied_store.parent_id = parent.id
-                    if "dingtalk_dept_id" in item.change_fields:
-                        applied_store.dingtalk_dept_id = remote_department_id
             nodes_by_remote_id[remote_department_id] = applied_store
             item.status = DingTalkOrgSyncItemStatus.APPLIED
             changes = (
@@ -2168,13 +2213,10 @@ def apply_organization_sync(
 
         # Remove every affected authorization edge and revoke every displaced
         # account before any node becomes historical.
-        deactivate_items = [
-            item for item in ready_node_items if item.action == DingTalkOrgSyncAction.DEACTIVATE
-        ]
         children_by_parent: dict[int, list[int]] = defaultdict(list)
-        for organization in state.org_units:
-            if organization.parent_id is not None:
-                children_by_parent[organization.parent_id].append(organization.id)
+        for organization_id, parent_id in locked_parent_by_id.items():
+            if parent_id is not None:
+                children_by_parent[parent_id].append(organization_id)
 
         deactivated_store_ids: set[int] = set()
         for item in deactivate_items:
@@ -2182,8 +2224,12 @@ def apply_organization_sync(
             if deactivate_root is None:
                 raise _ConcurrentChange("organization baseline changed")
             stack = [deactivate_root.id]
+            visited_descendants: set[int] = set()
             while stack:
                 organization_id = stack.pop()
+                if organization_id in visited_descendants:
+                    raise _ConcurrentChange("organization hierarchy contains a cycle")
+                visited_descendants.add(organization_id)
                 descendant = org_units_by_id[organization_id]
                 if descendant.type == OrgType.STORE:
                     deactivated_store_ids.add(descendant.id)
@@ -2225,7 +2271,11 @@ def apply_organization_sync(
 
         for item in sorted(
             deactivate_items,
-            key=lambda item: (-item_depth(item), item.proposed_org_unit_id or 0, item.id),
+            key=lambda item: (
+                -deactivation_depths[item.proposed_org_unit_id],  # type: ignore[index]
+                item.proposed_org_unit_id or 0,
+                item.id,
+            ),
         ):
             node_to_deactivate = _optional_get(org_units_by_id, item.proposed_org_unit_id)
             if node_to_deactivate is None:
