@@ -61,11 +61,14 @@ class Settings(BaseSettings):
     # configuring credentials does not enable outbound salary notifications.
     dingtalk_mode: DingTalkMode = DingTalkMode.SANDBOX
     dingtalk_app_id: str | None = None
+    # Public CorpId used by the H5 JSAPI when requesting a one-time login code.
+    dingtalk_corp_id: str | None = None
     dingtalk_client_id: str | None = None
     dingtalk_client_secret: SecretStr | None = None
     dingtalk_agent_id: int | None = None
     dingtalk_public_base_url: AnyHttpUrl | None = None
     dingtalk_timeout_seconds: float = 5.0
+    dingtalk_review_session_ttl_minutes: int = 15
     # Contact/attendance reads are a separate, explicit capability.  Keeping
     # outbound transport in sandbox does not disable these reads once an
     # administrator deliberately enables them.
@@ -102,7 +105,7 @@ class Settings(BaseSettings):
             return value.strip() or None
         return value
 
-    @field_validator("dingtalk_app_id", "dingtalk_client_id", mode="before")
+    @field_validator("dingtalk_app_id", "dingtalk_corp_id", "dingtalk_client_id", mode="before")
     @classmethod
     def normalize_optional_dingtalk_identifiers(cls, value: object) -> object:
         if isinstance(value, str):
@@ -131,6 +134,13 @@ class Settings(BaseSettings):
             raise ValueError("must be between 1 and 30 seconds")
         return value
 
+    @field_validator("dingtalk_review_session_ttl_minutes")
+    @classmethod
+    def validate_dingtalk_review_session_ttl(cls, value: int) -> int:
+        if not 5 <= value <= 30:
+            raise ValueError("must be between 5 and 30 minutes")
+        return value
+
     @model_validator(mode="after")
     def validate_dingtalk_configuration(self) -> "Settings":
         credential_parts = (
@@ -151,6 +161,8 @@ class Settings(BaseSettings):
         if self.dingtalk_mode is DingTalkMode.LIVE:
             if not all(credential_parts):
                 raise ValueError("DingTalk live mode requires complete application credentials")
+            if self.dingtalk_corp_id is None:
+                raise ValueError("DingTalk live mode requires dingtalk_corp_id for H5 review")
             if self.dingtalk_public_base_url is None:
                 raise ValueError("DingTalk live mode requires dingtalk_public_base_url")
             if self.dingtalk_public_base_url.scheme != "https":

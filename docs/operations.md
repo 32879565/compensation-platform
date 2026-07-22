@@ -99,8 +99,19 @@ WHERE source = 'HISTORICAL' AND employee_id IS NOT NULL;
 
 钉钉企业应用始终以 `COMP_DINGTALK_MODE=sandbox` 起步。凭证完整只允许管理员执行连通性检测，
 不会发送工作通知。正式发送前必须同时完成加密的用户 userid 路由、可从钉钉访问的 HTTPS
-申诉地址和业务方抽样核对，然后在受控发布窗口显式切换为 `live`；Client Secret 只进入后端
+复核地址和业务方抽样核对，然后在受控发布窗口显式切换为 `live`；Client Secret 只进入后端
 secret manager/未跟踪环境文件，不得写入前端变量、仓库、日志或审计明细。
+
+经理端复核采用钉钉 H5 免登，不使用人事后台账号密码。生产环境还必须配置
+`COMP_DINGTALK_CORP_ID`，并在钉钉企业内部应用中把 HTTPS 域名加入安全域名。工作通知只显示
+月份、门店、部门和人数；员工姓名及金额仅在 `/manager-review/<随机标识>` 页面通过一次性
+免登码换取 15 分钟专用会话后返回。该会话不写入 local/session storage，不能调用人事 API，
+且每次请求都会重新校验通知收件人及“门店 + 部门”复核范围。
+
+在人事后台“用户复核范围”页为店长/厨房经理完成三项配置：钉钉 userid、精确复核范围、
+“仅钉钉复核”。最后一项会禁止密码和 refresh token 登录，但不会停用工作通知。上线前用
+厅面、厨房各一个账号验证：只能看到本部门员工；错误钉钉身份、转发链接、旧批次链接均不能
+继续操作。`COMP_DINGTALK_REVIEW_SESSION_TTL_MINUTES` 只允许 5–30 分钟，默认 15 分钟。
 
 ## 获批薪酬申诉的受控更正
 

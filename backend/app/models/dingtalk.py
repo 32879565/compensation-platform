@@ -10,6 +10,7 @@ second, less protected copy of salary data.
 from __future__ import annotations
 
 import enum
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
@@ -114,6 +115,11 @@ class DingTalkDelivery(Base, TimestampMixin):
     # tokens, message bodies, and recipient provider ids are never persisted.
     provider_task_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    # A routing identifier, not a credential. Salary access still requires a
+    # DingTalk identity exchange and a purpose-bound short-lived session.
+    review_public_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, unique=True, index=True, default=lambda: uuid.uuid4().hex
+    )
 
 
 class DingTalkAttendanceSync(Base, TimestampMixin):

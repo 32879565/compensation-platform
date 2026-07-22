@@ -28,6 +28,7 @@ _WORK_NOTIFICATION_URL = "https://oapi.dingtalk.com/topapi/message/corpconversat
 _DEPARTMENT_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/department/listsub"
 _DEPARTMENT_USER_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/user/list"
 _ATTENDANCE_RESULT_URL = "https://oapi.dingtalk.com/attendance/list"
+_LOGIN_USERINFO_URL = "https://oapi.dingtalk.com/topapi/v2/user/getuserinfo"
 _MAX_RESPONSE_BYTES = 64 * 1024
 _TOKEN_REFRESH_MARGIN_SECONDS = 120
 _DIRECTORY_PAGE_SIZE = 100
@@ -93,6 +94,13 @@ class DingTalkAttendanceResult:
     plan_check_time: int | str | None
     user_check_time: int | str | None
     record_id: int | str | None
+
+
+@dataclass(frozen=True)
+class DingTalkLoginIdentity:
+    """The only identity field required from a one-time H5 login code."""
+
+    user_id: str
 
 
 class DingTalkClient:
@@ -191,6 +199,19 @@ class DingTalkClient:
     def check_connection(self) -> DingTalkConnection:
         _token, expires_in = self.access_token(force_refresh=True)
         return DingTalkConnection(expires_in_seconds=expires_in)
+
+    def resolve_login_code(self, auth_code: str) -> DingTalkLoginIdentity:
+        """Exchange a single-use H5 auth code without putting it in a URL."""
+
+        normalized = auth_code.strip()
+        if not normalized or len(normalized) > 512:
+            raise DingTalkClientError("DingTalk login code is invalid")
+        payload = self._post_legacy_json(_LOGIN_USERINFO_URL, {"code": normalized})
+        result = payload.get("result")
+        user_id = result.get("userid") if isinstance(result, dict) else None
+        if not isinstance(user_id, str) or not user_id or len(user_id) > 256:
+            raise DingTalkClientError("DingTalk login returned an invalid identity")
+        return DingTalkLoginIdentity(user_id=user_id)
 
     def _post_legacy_json(self, url: str, body: dict[str, object]) -> dict[str, Any]:
         """POST JSON to one of this module's fixed legacy OpenAPI destinations."""

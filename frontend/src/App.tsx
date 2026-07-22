@@ -24,6 +24,7 @@ const GradesPage = lazy(() => import('./pages/GradesPage'))
 const HolidayCalendarPage = lazy(() => import('./pages/HolidayCalendarPage'))
 const ImportsPage = lazy(() => import('./pages/ImportsPage'))
 const Login = lazy(() => import('./pages/Login'))
+const ManagerReviewPage = lazy(() => import('./pages/ManagerReviewPage'))
 const MonthlyPayrollAdjustmentsPage = lazy(() => import('./pages/MonthlyPayrollAdjustmentsPage'))
 const OrgTreePage = lazy(() => import('./pages/OrgTreePage'))
 const PayrollPage = lazy(() => import('./pages/PayrollPage'))
@@ -98,6 +99,7 @@ export default function App() {
         <Suspense fallback={<RouteLoading />}>
           <Routes>
             <Route path="/login" element={<Login />} />
+            <Route path="/manager-review/:reviewId" element={<ManagerReviewPage />} />
             <Route element={<ProtectedLayout />}>
               <Route path="/" element={<HomeRedirect />} />
               <Route path="/no-access" element={<NoAccessPage />} />

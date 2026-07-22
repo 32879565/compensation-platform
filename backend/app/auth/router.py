@@ -242,7 +242,7 @@ def refresh(
     from app.models.auth import User
 
     user = session.get(User, user_id)
-    if user is None or user.is_deleted or user.status != "ACTIVE":
+    if user is None or user.is_deleted or user.status != "ACTIVE" or not user.login_enabled:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="账号不可用",

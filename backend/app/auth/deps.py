@@ -38,7 +38,7 @@ def get_current_principal(request: Request, session: Session = Depends(get_sessi
         raise _UNAUTH from None
 
     user = session.get(User, user_id)
-    if user is None or user.is_deleted or user.status != "ACTIVE":
+    if user is None or user.is_deleted or user.status != "ACTIVE" or not user.login_enabled:
         raise _UNAUTH
     set_actor(user.id, user.username)  # 供审计记录识别操作者
     return build_principal(session, user)

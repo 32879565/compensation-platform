@@ -10,6 +10,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,6 +38,11 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     dingtalk_user_id: Mapped[str | None] = mapped_column(EncryptedString(512), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ACTIVE", server_default="ACTIVE"
+    )
+    # DingTalk-only reviewers remain active notification recipients while all
+    # password and refresh-token paths into the HR console reject them.
+    login_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
     )
 
 

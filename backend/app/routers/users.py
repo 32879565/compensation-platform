@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.audit import service as audit
 from app.auth.deps import require_permission
 from app.auth.permissions import Perm
-from app.auth.service import Principal, resolve_permission_org_scope
+from app.auth.service import Principal, resolve_permission_org_scope, revoke_all_for_user
 from app.db.session import get_session
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.employee import Department
@@ -62,6 +62,7 @@ class UserSummaryOut(BaseModel):
     status: str
     employee_id: int | None
     dingtalk_recipient_configured: bool
+    login_enabled: bool
     roles: list[str]
     review_scopes: list[ReviewScopeOut]
 
@@ -117,6 +118,7 @@ def list_users(
             status=user.status,
             employee_id=user.employee_id,
             dingtalk_recipient_configured=user.dingtalk_user_id is not None,
+            login_enabled=user.login_enabled,
             roles=roles_by_user[user.id],
             review_scopes=scopes_by_user[user.id],
         )
@@ -230,6 +232,44 @@ class DingTalkRecipientBody(BaseModel):
 
 class DingTalkRecipientOut(BaseModel):
     configured: bool
+
+
+class UserLoginEnabledBody(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    login_enabled: bool
+
+
+class UserLoginEnabledOut(BaseModel):
+    login_enabled: bool
+
+
+@router.put("/{user_id}/login-enabled", response_model=UserLoginEnabledOut)
+def replace_login_enabled(
+    user_id: int,
+    body: UserLoginEnabledBody,
+    principal: Principal = Depends(_require_global_user_manager),
+    session: Session = Depends(get_session),
+) -> UserLoginEnabledOut:
+    """Make a reviewer DingTalk-only without disabling notification routing."""
+
+    if user_id == principal.user_id and not body.login_enabled:
+        raise HTTPException(status_code=409, detail="You cannot disable your own login.")
+    user = _target_user_or_404(session, user_id, for_update=True)
+    before = user.login_enabled
+    user.login_enabled = body.login_enabled
+    if not body.login_enabled:
+        revoke_all_for_user(session, user.id)
+    audit.record(
+        session,
+        action="user.login_enabled.replace",
+        actor=(principal.user_id, principal.username),
+        target_type="app_user",
+        target_id=user.id,
+        detail={"before": before, "after": body.login_enabled},
+    )
+    session.commit()
+    return UserLoginEnabledOut(login_enabled=user.login_enabled)
 
 
 @router.put("/{user_id}/dingtalk-recipient", response_model=DingTalkRecipientOut)

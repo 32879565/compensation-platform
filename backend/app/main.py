@@ -27,6 +27,7 @@ from app.routers.holiday import router as holiday_router
 from app.routers.imports import router as imports_router
 from app.routers.imports import salary_router
 from app.routers.legacy_catalog import router as legacy_catalog_router
+from app.routers.manager_review import router as manager_review_router
 from app.routers.org import router as org_router
 from app.routers.payroll import router as payroll_router
 from app.routers.payroll_adjustment import router as payroll_adjustment_router
@@ -112,6 +113,7 @@ def create_app() -> FastAPI:
     app.include_router(export_router)
     app.include_router(dingtalk_router)
     app.include_router(dingtalk_sync_router)
+    app.include_router(manager_review_router)
     app.include_router(payroll_adjustment_router)
     app.include_router(payroll_router)
     app.include_router(payslip_router)

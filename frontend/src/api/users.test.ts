@@ -8,6 +8,7 @@ import {
   fetchReviewScopes,
   fetchUsers,
   replaceDingTalkRecipient,
+  replaceLoginEnabled,
   replaceReviewScopes,
 } from './users'
 
@@ -25,12 +26,16 @@ describe('user scope API client', () => {
     await fetchReviewScopes(4)
     await replaceReviewScopes(4, scopes)
     await replaceDingTalkRecipient(4, 'provider-user-id')
+    await replaceLoginEnabled(4, false)
 
     expect(client.get).toHaveBeenNthCalledWith(1, '/api/users')
     expect(client.get).toHaveBeenNthCalledWith(2, '/api/users/4/review-scopes')
     expect(client.put).toHaveBeenNthCalledWith(1, '/api/users/4/review-scopes', { scopes })
     expect(client.put).toHaveBeenNthCalledWith(2, '/api/users/4/dingtalk-recipient', {
       dingtalk_user_id: 'provider-user-id',
+    })
+    expect(client.put).toHaveBeenNthCalledWith(3, '/api/users/4/login-enabled', {
+      login_enabled: false,
     })
   })
 })

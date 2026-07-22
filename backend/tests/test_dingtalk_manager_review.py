@@ -264,9 +264,7 @@ def test_dingtalk_only_manager_sees_exact_employee_scope_and_can_raise_item_disp
     payload = detail.json()
     assert payload["store_name"] == "Review Store"
     assert payload["department"] == "DINING"
-    assert [row["employee_id"] for row in payload["employees"]] == [
-        world["dining_employee"].id
-    ]
+    assert [row["employee_id"] for row in payload["employees"]] == [world["dining_employee"].id]
     assert payload["employees"][0]["employee_name"] == "Dining Employee"
     assert payload["employees"][0]["lines"] == [
         {"code": "ATTEND_WAGE", "name": "Attendance wage", "amount": "6000.00"},
@@ -317,9 +315,7 @@ def test_manager_review_rejects_wrong_dingtalk_identity_without_disclosing_assig
     assert response.json() == {"detail": "Unable to authorize this payroll review."}
 
 
-def test_manager_can_confirm_only_the_delivery_store_department(
-    client, db_session, monkeypatch
-):
+def test_manager_can_confirm_only_the_delivery_store_department(client, db_session, monkeypatch):
     world = _review_world(db_session)
     token = _exchange(client, monkeypatch, world)
     response = client.post(

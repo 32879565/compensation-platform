@@ -1,5 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Alert, Button, Card, Input, Popconfirm, Select, Space, Table, Tag, Typography, message } from 'antd'
+import {
+  Alert,
+  Button,
+  Card,
+  Input,
+  Popconfirm,
+  Select,
+  Space,
+  Table,
+  Tag,
+  Typography,
+  message,
+} from 'antd'
 import type { TableProps } from 'antd'
 import { useEffect, useMemo, useState } from 'react'
 
@@ -8,6 +20,7 @@ import {
   fetchReviewScopes,
   fetchUsers,
   replaceDingTalkRecipient,
+  replaceLoginEnabled,
   replaceReviewScopes,
   type ManagedUser,
   type ReviewDepartment,
@@ -90,13 +103,24 @@ export default function UsersPage() {
     },
     onError: (error) => message.error(errorMessage(error)),
   })
+  const loginEnabledMutation = useMutation({
+    mutationFn: ({ userId, enabled }: { userId: number; enabled: boolean }) =>
+      replaceLoginEnabled(userId, enabled),
+    onSuccess: async (result) => {
+      message.success(result.login_enabled ? '后台登录已启用' : '已设为仅钉钉复核')
+      await queryClient.invalidateQueries({ queryKey: ['managedUsers', queryScope] })
+    },
+    onError: (error) => message.error(errorMessage(error)),
+  })
 
   const addScope = () => {
     if (storeId === undefined) {
       message.warning('请先选择门店')
       return
     }
-    if (draftScopes.some((scope) => scope.org_unit_id === storeId && scope.department === department)) {
+    if (
+      draftScopes.some((scope) => scope.org_unit_id === storeId && scope.department === department)
+    ) {
       message.warning('该门店和部门已在复核范围内')
       return
     }
@@ -130,7 +154,8 @@ export default function UsersPage() {
             setDraftScopes((current) =>
               current.filter(
                 (candidate) =>
-                  candidate.org_unit_id !== scope.org_unit_id || candidate.department !== scope.department,
+                  candidate.org_unit_id !== scope.org_unit_id ||
+                  candidate.department !== scope.department,
               ),
             )
           }
@@ -152,7 +177,9 @@ export default function UsersPage() {
         message="门店薪资复核必须显式授权"
         description="这里维护的是“门店 + 部门”复核范围；它不会自动授予集团或区域工资查看权限。角色和账号生命周期仍由受控的管理员流程维护。"
       />
-      {usersQuery.isError && <Alert type="error" showIcon message={errorMessage(usersQuery.error)} />}
+      {usersQuery.isError && (
+        <Alert type="error" showIcon message={errorMessage(usersQuery.error)} />
+      )}
       <Card title="选择账号">
         <Select
           showSearch
@@ -170,16 +197,52 @@ export default function UsersPage() {
         />
         {selectedUser && (
           <Space wrap style={{ marginLeft: 16, marginTop: 8 }}>
-            <Tag color={selectedUser.status === 'ACTIVE' ? 'green' : 'default'}>{selectedUser.status}</Tag>
+            <Tag color={selectedUser.status === 'ACTIVE' ? 'green' : 'default'}>
+              {selectedUser.status}
+            </Tag>
             {selectedUser.roles.map((role) => (
               <Tag key={role}>{role}</Tag>
             ))}
             <Tag color={selectedUser.dingtalk_recipient_configured ? 'blue' : 'default'}>
               {selectedUser.dingtalk_recipient_configured ? '钉钉收件人已配置' : '钉钉收件人未配置'}
             </Tag>
+            <Tag color={selectedUser.login_enabled ? 'green' : 'purple'}>
+              {selectedUser.login_enabled ? '可登录后台' : '仅钉钉复核'}
+            </Tag>
           </Space>
         )}
       </Card>
+      {selectedUser && (
+        <Card title={`配置 ${selectedUser.username} 的登录方式`}>
+          <Alert
+            type="info"
+            showIcon
+            message="店长和厨房经理应设为仅钉钉复核"
+            description="关闭后台登录后，账号仍可接收钉钉工资通知，并通过钉钉免登查看本人负责范围；普通密码和历史刷新会话会立即失效。"
+            style={{ marginBottom: 16 }}
+          />
+          <Popconfirm
+            title={
+              selectedUser.login_enabled ? '确认关闭该账号的后台登录？' : '确认重新启用后台登录？'
+            }
+            okText="确认"
+            cancelText="取消"
+            onConfirm={() =>
+              loginEnabledMutation.mutate({
+                userId: selectedUser.id,
+                enabled: !selectedUser.login_enabled,
+              })
+            }
+          >
+            <Button
+              loading={loginEnabledMutation.isPending}
+              disabled={selectedUser.username === user?.username || loginEnabledMutation.isPending}
+            >
+              {selectedUser.login_enabled ? '设为仅钉钉复核' : '启用后台登录'}
+            </Button>
+          </Popconfirm>
+        </Card>
+      )}
       {selectedUser && (
         <Card title={`配置 ${selectedUser.username} 的钉钉收件人`}>
           <Alert
@@ -259,7 +322,9 @@ export default function UsersPage() {
               添加范围
             </Button>
           </Space>
-          {scopesQuery.isError && <Alert type="error" showIcon message={errorMessage(scopesQuery.error)} />}
+          {scopesQuery.isError && (
+            <Alert type="error" showIcon message={errorMessage(scopesQuery.error)} />
+          )}
           <Table<ReviewScope>
             rowKey={(scope) => `${scope.org_unit_id}-${scope.department}`}
             columns={scopeColumns}

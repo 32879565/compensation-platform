@@ -488,6 +488,7 @@ def _live_settings() -> Settings:
         _env_file=None,
         dingtalk_mode="live",
         dingtalk_app_id="00000000-0000-0000-0000-000000000001",
+        dingtalk_corp_id="ding-test-corp",
         dingtalk_client_id="ding-test-client",
         dingtalk_client_secret="test-dingtalk-secret-value",
         dingtalk_agent_id=123,

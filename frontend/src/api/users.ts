@@ -13,6 +13,7 @@ export interface ManagedUser {
   status: string
   employee_id: number | null
   dingtalk_recipient_configured: boolean
+  login_enabled: boolean
   roles: string[]
   review_scopes: ReviewScope[]
 }
@@ -39,6 +40,17 @@ export async function replaceDingTalkRecipient(
   return (
     await api.put<{ configured: boolean }>(`/api/users/${userId}/dingtalk-recipient`, {
       dingtalk_user_id: dingtalkUserId,
+    })
+  ).data
+}
+
+export async function replaceLoginEnabled(
+  userId: number,
+  loginEnabled: boolean,
+): Promise<{ login_enabled: boolean }> {
+  return (
+    await api.put<{ login_enabled: boolean }>(`/api/users/${userId}/login-enabled`, {
+      login_enabled: loginEnabled,
     })
   ).data
 }

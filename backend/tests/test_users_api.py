@@ -76,6 +76,7 @@ def test_user_manager_can_list_roles_and_explicit_review_scopes(client, db_sessi
     assert response.status_code == 200, response.text
     by_username = {item["username"]: item for item in response.json()}
     assert by_username["manager"]["roles"] == ["STORE_MANAGER"]
+    assert by_username["manager"]["login_enabled"] is True
     assert by_username["manager"]["review_scopes"] == [
         {"org_unit_id": store.id, "department": "DINING"}
     ]
@@ -143,3 +144,53 @@ def test_dingtalk_recipient_is_encrypted_audited_and_never_read_back(client, db_
         json={"dingtalk_user_id": None},
     )
     assert cleared.json() == {"configured": False}
+
+
+def test_user_manager_can_make_reviewer_dingtalk_only(client, db_session):
+    admin = _user(db_session, "login-control-admin", ["SUPER_ADMIN"])
+    manager = _user(db_session, "login-control-manager", ["STORE_MANAGER"])
+    db_session.commit()
+    manager_login = client.post(
+        "/api/auth/login",
+        json={"username": manager.username, "password": "StrongPass123!"},
+    )
+    assert manager_login.status_code == 200
+    manager_headers = {"Authorization": f"Bearer {manager_login.json()['access_token']}"}
+    manager_refresh = client.cookies.get("comp_refresh")
+    assert manager_refresh
+    headers = _token(client, admin.username)
+
+    response = client.put(
+        f"/api/users/{manager.id}/login-enabled",
+        headers=headers,
+        json={"login_enabled": False},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"login_enabled": False}
+    assert client.get("/api/auth/me", headers=manager_headers).status_code == 401
+    assert (
+        client.post(
+            "/api/auth/refresh",
+            cookies={"comp_refresh": manager_refresh},
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            "/api/auth/login",
+            json={"username": manager.username, "password": "StrongPass123!"},
+        ).status_code
+        == 401
+    )
+
+    audit_row = db_session.scalars(
+        select(AuditLog).where(AuditLog.action == "user.login_enabled.replace")
+    ).one()
+    assert audit_row.detail == {"before": True, "after": False}
+
+    own_disable = client.put(
+        f"/api/users/{admin.id}/login-enabled",
+        headers=headers,
+        json={"login_enabled": False},
+    )
+    assert own_disable.status_code == 409

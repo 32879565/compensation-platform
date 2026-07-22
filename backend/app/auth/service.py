@@ -77,7 +77,7 @@ def authenticate(session: Session, username: str, password: str) -> User:
     ok = verify_password(stored_hash, password)
     if not user or not ok:
         raise AuthError("用户名或密码错误")
-    if user.status != "ACTIVE":
+    if user.status != "ACTIVE" or not user.login_enabled:
         raise AuthError("账号已禁用")
     return user
 

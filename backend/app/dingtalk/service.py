@@ -11,7 +11,6 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from urllib.parse import urlencode
 
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, aliased
@@ -449,56 +448,33 @@ def _review_action_card(
         .correlate(PayrollResult)
         .scalar_subquery()
     )
-    results = list(
-        session.execute(
-            select(
-                PayrollResult.employee_name_snapshot,
-                PayrollResult.employee_id,
-                PayrollResult.gross,
-                PayrollResult.net,
-            )
-            .where(
-                PayrollResult.batch_id == delivery.batch_id,
-                PayrollResult.batch_version == delivery.batch_version,
-                PayrollResult.org_unit_id == delivery.org_unit_id,
-                PayrollResult.department == delivery.department,
-                PayrollResult.version == latest_version,
-            )
-            .order_by(PayrollResult.employee_name_snapshot, PayrollResult.employee_id)
-        ).all()
+    result_count = session.scalar(
+        select(func.count())
+        .select_from(PayrollResult)
+        .where(
+            PayrollResult.batch_id == delivery.batch_id,
+            PayrollResult.batch_version == delivery.batch_version,
+            PayrollResult.org_unit_id == delivery.org_unit_id,
+            PayrollResult.department == delivery.department,
+            PayrollResult.version == latest_version,
+        )
     )
-    if not results:
+    if not result_count:
         raise DingTalkError("The delivery has no payroll results")
 
     title = f"{delivery.period_snapshot} 薪资复核"
-    lines = [
-        f"### {_markdown_plain(title)}",
-        f"门店：{_markdown_plain(delivery.org_unit_name_snapshot)}",
-        f"部门：{_DEPARTMENT_LABEL[delivery.department]}",
-        f"人数：{len(results)}",
-        "",
-    ]
-    detail_lines: list[str] = []
-
-    def render(candidate_lines: list[str]) -> str:
-        omitted = len(results) - len(candidate_lines)
-        rendered = [*lines, *candidate_lines]
-        if omitted:
-            rendered.append(f"- 另有 {omitted} 人，请进入系统查看")
-        rendered.extend(["", _REVIEW_CONFIDENTIALITY_FOOTER])
-        return "\n".join(rendered)
-
-    for name, employee_id, gross, net in results:
-        display_name = name or f"员工#{employee_id}"
-        line = f"- {_markdown_plain(display_name)}：应发 {gross:.2f}，实发 {net:.2f}"
-        candidate = render([*detail_lines, line])
-        if (
-            len(candidate) > _REVIEW_MARKDOWN_MAX_CHARS
-            or len(candidate.encode("utf-8")) > _REVIEW_MARKDOWN_MAX_BYTES
-        ):
-            break
-        detail_lines.append(line)
-    markdown = render(detail_lines)
+    markdown = "\n".join(
+        [
+            f"### {_markdown_plain(title)}",
+            f"门店：{_markdown_plain(delivery.org_unit_name_snapshot)}",
+            f"部门：{_DEPARTMENT_LABEL[delivery.department]}",
+            f"人数：{result_count}",
+            "",
+            "请点击下方按钮，在钉钉内完成员工级工资明细复核。",
+            "",
+            _REVIEW_CONFIDENTIALITY_FOOTER,
+        ]
+    )
     if (
         len(markdown) > _REVIEW_MARKDOWN_MAX_CHARS
         or len(markdown.encode("utf-8")) > _REVIEW_MARKDOWN_MAX_BYTES
@@ -508,8 +484,7 @@ def _review_action_card(
     public_base_url = settings.dingtalk_public_base_url
     if public_base_url is None:
         raise DingTalkError("DingTalk public base URL is not configured")
-    query = urlencode({"delivery_id": delivery.id})
-    action_url = f"{str(public_base_url).rstrip('/')}/comp-appeals?{query}"
+    action_url = f"{str(public_base_url).rstrip('/')}/manager-review/{delivery.review_public_id}"
     return title, markdown, action_url
 
 
