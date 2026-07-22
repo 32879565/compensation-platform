@@ -153,6 +153,58 @@ def test_client_reads_only_configured_root_subtrees(monkeypatch):
     assert 1 not in {department_id for _url, department_id in requests}
 
 
+def test_scoped_client_rejects_global_root_returned_as_a_descendant(monkeypatch):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+    requested_department_ids: list[int] = []
+
+    def fake_post(url: str, body: dict[str, object]) -> dict[str, object]:
+        department_id = body["dept_id"]
+        assert isinstance(department_id, int)
+        requested_department_ids.append(department_id)
+        assert url == client_module._DEPARTMENT_LIST_URL
+        return {
+            "errcode": 0,
+            "result": [{"dept_id": 1, "parent_id": 100, "name": "伪造全局根"}],
+        }
+
+    monkeypatch.setattr(client, "_post_legacy_json", fake_post)
+
+    with pytest.raises(DingTalkClientError, match="directory response"):
+        client.list_organization_snapshot(root_department_ids=(100,))
+
+    assert requested_department_ids == [100]
+
+
+def test_explicit_global_root_remains_a_valid_boundary(monkeypatch):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+
+    def fake_post(url: str, _body: dict[str, object]) -> dict[str, object]:
+        if url == client_module._DEPARTMENT_LIST_URL:
+            return {"errcode": 0, "result": []}
+        return {"errcode": 0, "result": {"list": [], "has_more": False}}
+
+    monkeypatch.setattr(client, "_post_legacy_json", fake_post)
+
+    assert client.list_organization_snapshot(root_department_ids=(1,)).departments == ()
+
+
+@pytest.mark.parametrize("root_id", [1, 100])
+def test_client_rejects_configured_root_returned_as_its_own_child(monkeypatch, root_id):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+
+    def fake_post(url: str, _body: dict[str, object]) -> dict[str, object]:
+        assert url == client_module._DEPARTMENT_LIST_URL
+        return {
+            "errcode": 0,
+            "result": [{"dept_id": root_id, "parent_id": root_id, "name": "重复根"}],
+        }
+
+    monkeypatch.setattr(client, "_post_legacy_json", fake_post)
+
+    with pytest.raises(DingTalkClientError, match="duplicate organization department"):
+        client.list_organization_snapshot(root_department_ids=(root_id,))
+
+
 @pytest.mark.parametrize("root_department_ids", [(), (0,), (True,), (100, 100)])
 def test_client_rejects_invalid_configured_roots(monkeypatch, root_department_ids):
     client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
@@ -249,6 +301,37 @@ def test_safe_read_does_not_retry_provider_business_errors(monkeypatch):
     assert sleep_delays == []
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"result": []},
+        {"errcode": False, "result": []},
+        {"errcode": 0.0, "result": []},
+        {"errcode": "0", "result": []},
+    ],
+    ids=["missing", "boolean", "float", "string"],
+)
+def test_safe_read_rejects_non_integer_zero_errcodes_without_retry(monkeypatch, payload):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+    transport_calls = 0
+    sleep_delays: list[float] = []
+    monkeypatch.setattr(client, "access_token", lambda: ("provider-token", 3600))
+    monkeypatch.setattr(client_module.time, "sleep", sleep_delays.append)
+
+    def invalid_errcode(_request):
+        nonlocal transport_calls
+        transport_calls += 1
+        return payload
+
+    monkeypatch.setattr(client, "_perform", invalid_errcode)
+
+    with pytest.raises(DingTalkClientError, match="code -1"):
+        client._post_legacy_json(client_module._DEPARTMENT_LIST_URL, {"dept_id": 100})
+
+    assert transport_calls == 1
+    assert sleep_delays == []
+
+
 def test_safe_read_does_not_retry_invalid_response_structures(monkeypatch):
     client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
     transport_calls = 0
@@ -268,3 +351,105 @@ def test_safe_read_does_not_retry_invalid_response_structures(monkeypatch):
 
     assert transport_calls == 1
     assert sleep_delays == []
+
+
+class _SequentialRecordingExecutor:
+    def __init__(self) -> None:
+        self.map_result_sizes: list[tuple[int, ...]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def map(self, function, values):
+        results = tuple(function(value) for value in values)
+        self.map_result_sizes.append(tuple(len(result) for result in results))
+        return iter(results)
+
+
+def test_department_user_pages_are_deduplicated_before_executor_handoff(monkeypatch):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+    executor = _SequentialRecordingExecutor()
+    repeated_user = {
+        "userid": "same-user",
+        "name": "同一员工",
+        "job_number": "E001",
+        "title": "店长",
+        "active": True,
+    }
+
+    def fake_post(url: str, body: dict[str, object]) -> dict[str, object]:
+        if url == client_module._DEPARTMENT_LIST_URL:
+            return {"errcode": 0, "result": []}
+        cursor = body["cursor"]
+        return {
+            "errcode": 0,
+            "result": {
+                "list": [repeated_user] * client_module._DIRECTORY_PAGE_SIZE,
+                "has_more": cursor == 0,
+                **({"next_cursor": 1} if cursor == 0 else {}),
+            },
+        }
+
+    monkeypatch.setattr(client, "_post_legacy_json", fake_post)
+    monkeypatch.setattr(
+        client_module,
+        "ThreadPoolExecutor",
+        lambda **_kwargs: executor,
+    )
+
+    snapshot = client.list_organization_snapshot(root_department_ids=(100,))
+
+    assert [user.user_id for user in snapshot.users] == ["same-user"]
+    assert executor.map_result_sizes[-1] == (1,)
+
+
+def test_department_user_page_over_provider_size_fails_closed(monkeypatch):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+    raw_user = {"userid": "same-user", "name": "员工", "active": True}
+
+    def fake_post(url: str, _body: dict[str, object]) -> dict[str, object]:
+        if url == client_module._DEPARTMENT_LIST_URL:
+            return {"errcode": 0, "result": []}
+        return {
+            "errcode": 0,
+            "result": {
+                "list": [raw_user] * (client_module._DIRECTORY_PAGE_SIZE + 1),
+                "has_more": False,
+            },
+        }
+
+    monkeypatch.setattr(client, "_post_legacy_json", fake_post)
+
+    with pytest.raises(DingTalkClientError, match="invalid directory response"):
+        client.list_organization_snapshot(root_department_ids=(100,))
+
+
+def test_conflicting_duplicate_user_across_pages_fails_closed(monkeypatch):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+
+    def fake_post(url: str, body: dict[str, object]) -> dict[str, object]:
+        if url == client_module._DEPARTMENT_LIST_URL:
+            return {"errcode": 0, "result": []}
+        cursor = body["cursor"]
+        return {
+            "errcode": 0,
+            "result": {
+                "list": [
+                    {
+                        "userid": "same-user",
+                        "name": "员工甲" if cursor == 0 else "员工乙",
+                        "active": True,
+                    }
+                ],
+                "has_more": cursor == 0,
+                **({"next_cursor": 1} if cursor == 0 else {}),
+            },
+        }
+
+    monkeypatch.setattr(client, "_post_legacy_json", fake_post)
+
+    with pytest.raises(DingTalkClientError, match="inconsistent organization users"):
+        client.list_organization_snapshot(root_department_ids=(100,))

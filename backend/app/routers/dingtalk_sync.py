@@ -66,14 +66,17 @@ AttendanceRefreshRunner = Callable[[str, tuple[int, str]], None]
 _ORGANIZATION_READ_LOCK = threading.Lock()
 
 
-def _read_organization_snapshot(client: DingTalkClient) -> DingTalkOrganizationSnapshot:
+def _read_organization_snapshot(
+    client: DingTalkClient,
+    root_department_ids: tuple[int, ...],
+) -> DingTalkOrganizationSnapshot:
     if not _ORGANIZATION_READ_LOCK.acquire(blocking=False):
         raise HTTPException(
             status_code=429,
             detail="A DingTalk organization read is already in progress",
         )
     try:
-        return client.list_organization_snapshot()
+        return client.list_organization_snapshot(root_department_ids=root_department_ids)
     finally:
         _ORGANIZATION_READ_LOCK.release()
 
@@ -613,7 +616,13 @@ def preview_dingtalk_organization(
         # the potentially long provider traversal, then open a short staging
         # transaction only after the snapshot is complete.
         session.rollback()
-        snapshot = _read_organization_snapshot(client)
+        snapshot = _read_organization_snapshot(
+            client,
+            tuple(
+                remote_id
+                for remote_id, _local_anchor_code in settings.dingtalk_org_root_mapping_pairs
+            ),
+        )
         preview = preview_organization_sync(
             session,
             snapshot,
@@ -665,7 +674,13 @@ def apply_dingtalk_organization(
         # Re-read DingTalk at confirmation time so a manager transfer made
         # after preview cannot be applied from a stale staged identity.
         session.rollback()
-        snapshot = _read_organization_snapshot(client)
+        snapshot = _read_organization_snapshot(
+            client,
+            tuple(
+                remote_id
+                for remote_id, _local_anchor_code in settings.dingtalk_org_root_mapping_pairs
+            ),
+        )
         result = apply_organization_sync(
             session,
             batch_id,

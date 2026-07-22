@@ -41,12 +41,18 @@ class _FakeOrganizationClient:
         snapshots: tuple[DingTalkOrganizationSnapshot, ...] | None = None,
     ) -> None:
         self.calls = 0
+        self.root_department_id_calls: list[tuple[int, ...] | None] = []
         self.users = users
         self.departments = departments
         self.snapshots = snapshots
 
-    def list_organization_snapshot(self) -> DingTalkOrganizationSnapshot:
+    def list_organization_snapshot(
+        self,
+        *,
+        root_department_ids: tuple[int, ...] | None = None,
+    ) -> DingTalkOrganizationSnapshot:
         self.calls += 1
+        self.root_department_id_calls.append(root_department_ids)
         if self.snapshots is not None:
             return self.snapshots[min(self.calls - 1, len(self.snapshots) - 1)]
         return DingTalkOrganizationSnapshot(
@@ -283,6 +289,32 @@ def test_organization_preview_persists_the_configured_root_mapping_hash(client, 
     assert batch.root_config_hash == _expected_root_config_hash(
         ((20, "REGION-B"), (10, "DIRECT-GROUP"))
     )
+
+
+def test_organization_preview_and_confirmation_read_only_configured_roots(client, db_session):
+    _seed_store_and_managers(db_session)
+    admin = _group_hr(db_session, "org-sync-scoped-provider-roots")
+    fake = _FakeOrganizationClient()
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = lambda: _settings(root_mappings="10:DIRECT-GROUP")
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+    headers = _token(client, admin.username)
+
+    preview_response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=headers,
+    )
+    assert preview_response.status_code == 200, preview_response.text
+
+    apply_response = client.post(
+        f"/api/dingtalk/sync/organization/{preview_response.json()['batch_id']}/apply",
+        headers=headers,
+    )
+
+    assert apply_response.status_code == 200, apply_response.text
+    assert fake.root_department_id_calls == [(10,), (10,)]
+    assert all(1 not in root_ids for root_ids in fake.root_department_id_calls if root_ids)
 
 
 def test_organization_apply_missing_batch_does_not_read_provider(client, db_session):

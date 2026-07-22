@@ -387,7 +387,7 @@ class DingTalkClient:
                     )
                 )
                 errcode = payload.get("errcode")
-                if errcode != 0:
+                if not isinstance(errcode, int) or isinstance(errcode, bool) or errcode != 0:
                     safe_code = (
                         errcode
                         if isinstance(errcode, int) and not isinstance(errcode, bool)
@@ -476,6 +476,39 @@ class DingTalkClient:
                 )
             return tuple(normalized_children)
 
+        def merge_organization_user(
+            users: dict[str, DingTalkOrganizationUser],
+            user: DingTalkOrganizationUser,
+        ) -> None:
+            existing = users.get(user.user_id)
+            if existing is None:
+                if len(users) >= _MAX_DIRECTORY_USERS:
+                    raise DingTalkClientError("DingTalk directory exceeds the safety limit")
+                users[user.user_id] = user
+                return
+            if (
+                existing.name != user.name
+                or (
+                    existing.job_number is not None
+                    and user.job_number is not None
+                    and existing.job_number != user.job_number
+                )
+                or (
+                    existing.title is not None
+                    and user.title is not None
+                    and existing.title != user.title
+                )
+            ):
+                raise DingTalkClientError("DingTalk returned inconsistent organization users")
+            users[user.user_id] = DingTalkOrganizationUser(
+                user_id=user.user_id,
+                name=user.name,
+                job_number=existing.job_number or user.job_number,
+                title=existing.title or user.title,
+                active=existing.active and user.active,
+                department_ids=tuple(sorted(set(existing.department_ids + user.department_ids))),
+            )
+
         page_lock = threading.Lock()
         page_count = 0
 
@@ -483,7 +516,7 @@ class DingTalkClient:
             nonlocal page_count
             page_cursor = 0
             seen_cursors: set[int] = set()
-            users: list[DingTalkOrganizationUser] = []
+            users_by_id: dict[str, DingTalkOrganizationUser] = {}
             while True:
                 if page_cursor in seen_cursors:
                     raise DingTalkClientError("DingTalk returned an invalid directory cursor")
@@ -505,6 +538,8 @@ class DingTalkClient:
                 if not isinstance(result, dict):
                     raise DingTalkClientError("DingTalk returned an invalid directory response")
                 raw_users = self._require_list(result.get("list"))
+                if len(raw_users) > _DIRECTORY_PAGE_SIZE:
+                    raise DingTalkClientError("DingTalk returned an invalid directory response")
                 for raw_user in raw_users:
                     if not isinstance(raw_user, dict):
                         raise DingTalkClientError("DingTalk returned an invalid directory response")
@@ -543,7 +578,8 @@ class DingTalkClient:
                         active = raw_active.casefold() == "true"
                     else:
                         raise DingTalkClientError("DingTalk returned an invalid directory response")
-                    users.append(
+                    merge_organization_user(
+                        users_by_id,
                         DingTalkOrganizationUser(
                             user_id=normalized_user_id,
                             name=name.strip(),
@@ -551,13 +587,13 @@ class DingTalkClient:
                             title=title,
                             active=active,
                             department_ids=(department_id,),
-                        )
+                        ),
                     )
                 has_more = result.get("has_more", False)
                 if not isinstance(has_more, bool):
                     raise DingTalkClientError("DingTalk returned an invalid directory response")
                 if not has_more:
-                    return tuple(users)
+                    return tuple(users_by_id.values())
                 next_cursor = result.get("next_cursor")
                 if (
                     not isinstance(next_cursor, int)
@@ -582,6 +618,10 @@ class DingTalkClient:
                 for children in child_groups:
                     for child in children:
                         child_id = child.department_id
+                        if root_department_ids is not None and child_id == 1 and 1 not in roots:
+                            raise DingTalkClientError(
+                                "DingTalk returned an invalid directory response"
+                            )
                         if child_id in known_department_ids:
                             raise DingTalkClientError(
                                 "DingTalk returned a duplicate organization department"
@@ -596,38 +636,7 @@ class DingTalkClient:
 
             for users in executor.map(department_users, department_ids):
                 for user in users:
-                    existing = users_by_id.get(user.user_id)
-                    if existing is None:
-                        users_by_id[user.user_id] = user
-                    else:
-                        if (
-                            existing.name != user.name
-                            or (
-                                existing.job_number is not None
-                                and user.job_number is not None
-                                and existing.job_number != user.job_number
-                            )
-                            or (
-                                existing.title is not None
-                                and user.title is not None
-                                and existing.title != user.title
-                            )
-                        ):
-                            raise DingTalkClientError(
-                                "DingTalk returned inconsistent organization users"
-                            )
-                        users_by_id[user.user_id] = DingTalkOrganizationUser(
-                            user_id=user.user_id,
-                            name=user.name,
-                            job_number=existing.job_number or user.job_number,
-                            title=existing.title or user.title,
-                            active=existing.active and user.active,
-                            department_ids=tuple(
-                                sorted(set(existing.department_ids + user.department_ids))
-                            ),
-                        )
-                    if len(users_by_id) > _MAX_DIRECTORY_USERS:
-                        raise DingTalkClientError("DingTalk directory exceeds the safety limit")
+                    merge_organization_user(users_by_id, user)
 
         return DingTalkOrganizationSnapshot(
             departments=tuple(departments),
