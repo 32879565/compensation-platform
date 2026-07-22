@@ -200,6 +200,40 @@ def test_metrics_endpoint_omits_org_series_when_database_is_unavailable(
     assert "private database topology" not in response.text
 
 
+def test_metrics_endpoint_discards_org_series_when_session_exit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main_module
+
+    class ExitFailureSession:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *args: object) -> None:
+            raise SQLAlchemyError("private close failure")
+
+    monkeypatch.setattr(main_module, "SessionLocal", ExitFailureSession)
+    monkeypatch.setattr(
+        main_module,
+        "render_org_sync_metrics",
+        lambda *args, **kwargs: "compensation_dingtalk_org_sync_ready_changes 42\n",
+    )
+    app = create_app()
+
+    @app.get("/metrics-exit-probe")
+    def metrics_exit_probe() -> Response:
+        return Response(status_code=200)
+
+    client = TestClient(app)
+    assert client.get("/metrics-exit-probe").status_code == 200
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert 'route="/metrics-exit-probe"' in response.text
+    assert "compensation_dingtalk_org_sync_" not in response.text
+    assert "private close failure" not in response.text
+
+
 def test_metrics_render_deterministic_aggregate_series() -> None:
     metrics = RequestMetrics()
     metrics.record(

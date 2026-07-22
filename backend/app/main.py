@@ -62,11 +62,15 @@ def create_app() -> FastAPI:
         content = request_metrics.render_prometheus()
         try:
             with SessionLocal() as session:
-                content += render_org_sync_metrics(session, now=datetime.now(UTC))
+                org_content = render_org_sync_metrics(session, now=datetime.now(UTC))
         except SQLAlchemyError:
             # A scrape remains useful during a database outage. Omitting the
             # database-backed series is distinguishable from healthy zeroes.
             pass
+        else:
+            # Closing the database session is part of a successful scrape. Do
+            # not publish a partial snapshot if context-manager exit fails.
+            content += org_content
         return Response(
             content=content,
             media_type="text/plain; version=0.0.4",

@@ -24,11 +24,20 @@ from app.models.org import OrgType, OrgUnit
 
 
 class _Connection:
-    def __init__(self, *results: object) -> None:
+    def __init__(
+        self,
+        *results: object,
+        invalidate_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
         self.results = iter(results)
+        self.invalidate_error = invalidate_error
+        self.close_error = close_error
         self.statements: list[str] = []
         self.closed = False
         self.invalidated = False
+        self.close_calls = 0
+        self.invalidate_calls = 0
 
     def scalar(self, statement: object) -> object:
         self.statements.append(str(statement))
@@ -38,9 +47,15 @@ class _Connection:
         return result
 
     def invalidate(self) -> None:
+        self.invalidate_calls += 1
+        if self.invalidate_error is not None:
+            raise self.invalidate_error
         self.invalidated = True
 
     def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
 
 
@@ -102,13 +117,174 @@ def test_schedule_lock_contention_does_not_attempt_unlock() -> None:
 def test_schedule_lock_discards_connection_when_unlock_fails() -> None:
     connection = _Connection(True, RuntimeError("connection lost"))
 
+    with pytest.raises(RuntimeError, match="connection lost"):
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ) as acquired:
+            assert acquired is True
+
+    assert connection.invalidated is True
+    assert connection.closed is True
+
+
+def test_schedule_lock_invalidates_when_unlock_reports_not_released() -> None:
+    connection = _Connection(True, False)
+
     with _schedule_lock(
         _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
     ) as acquired:
         assert acquired is True
 
+    assert connection.invalidate_calls == 1
     assert connection.invalidated is True
     assert connection.closed is True
+
+
+@pytest.mark.parametrize(
+    "acquire_error",
+    [RuntimeError("acquire failed"), KeyboardInterrupt()],
+    ids=["exception", "base-exception"],
+)
+def test_schedule_lock_invalidates_and_reraises_acquire_error(
+    acquire_error: BaseException,
+) -> None:
+    connection = _Connection(acquire_error)
+
+    with pytest.raises(type(acquire_error)) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ):
+            pytest.fail("the lock body must not run")
+
+    assert raised.value is acquire_error
+    assert connection.invalidated is True
+    assert connection.closed is True
+
+
+def test_schedule_lock_invalidates_and_reraises_unlock_interrupt() -> None:
+    unlock_error = KeyboardInterrupt()
+    connection = _Connection(True, unlock_error)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ) as acquired:
+            assert acquired is True
+
+    assert raised.value is unlock_error
+    assert connection.invalidated is True
+    assert connection.closed is True
+
+
+def test_schedule_lock_preserves_body_interrupt_when_unlock_also_fails() -> None:
+    body_error = KeyboardInterrupt()
+    connection = _Connection(True, SystemExit("unlock interrupted"))
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ) as acquired:
+            assert acquired is True
+            raise body_error
+
+    assert raised.value is body_error
+    assert connection.invalidated is True
+    assert connection.closed is True
+
+
+def test_schedule_lock_never_closes_when_acquire_invalidation_fails() -> None:
+    acquire_error = KeyboardInterrupt()
+    connection = _Connection(
+        acquire_error,
+        invalidate_error=SystemExit("invalidation interrupted"),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ):
+            pytest.fail("the lock body must not run")
+
+    assert raised.value is acquire_error
+    assert connection.invalidate_calls == 1
+    assert connection.close_calls == 0
+
+
+def test_schedule_lock_preserves_body_error_when_unlock_invalidation_fails() -> None:
+    body_error = SystemExit("body cancelled")
+    connection = _Connection(
+        True,
+        KeyboardInterrupt(),
+        invalidate_error=RuntimeError("invalidation failed"),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ) as acquired:
+            assert acquired is True
+            raise body_error
+
+    assert raised.value is body_error
+    assert connection.invalidate_calls == 1
+    assert connection.close_calls == 0
+
+
+def test_schedule_lock_preserves_acquire_error_when_close_also_fails() -> None:
+    acquire_error = RuntimeError("acquire outcome unknown")
+    connection = _Connection(
+        acquire_error,
+        close_error=KeyboardInterrupt(),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ):
+            pytest.fail("the lock body must not run")
+
+    assert raised.value is acquire_error
+    assert connection.invalidated is True
+    assert connection.close_calls == 1
+
+
+def test_schedule_lock_preserves_unlock_error_when_close_also_fails() -> None:
+    unlock_error = SystemExit("unlock outcome unknown")
+    connection = _Connection(
+        True,
+        unlock_error,
+        close_error=KeyboardInterrupt(),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ) as acquired:
+            assert acquired is True
+
+    assert raised.value is unlock_error
+    assert connection.invalidated is True
+    assert connection.close_calls == 1
+
+
+def test_schedule_lock_preserves_body_error_when_safe_close_fails() -> None:
+    body_error = KeyboardInterrupt()
+    connection = _Connection(
+        True,
+        True,
+        close_error=SystemExit("close interrupted"),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with _schedule_lock(
+            _LockSession(_Bind("postgresql", connection))  # type: ignore[arg-type]
+        ) as acquired:
+            assert acquired is True
+            raise body_error
+
+    assert raised.value is body_error
+    assert connection.invalidated is False
+    assert connection.close_calls == 1
 
 
 @pytest.mark.usefixtures("pg_engine")
@@ -247,11 +423,59 @@ def test_job_releases_existing_transaction_and_stages_before_individual_dispatch
         "stage",
         "commit",
         "dispatch:101",
+        "commit",
         "dispatch:102",
+        "commit",
         "audit",
         "commit",
     ]
     assert audit_kwargs["detail"] == {"changes": 6, "conflicts": 15}
+
+
+def test_each_recipient_is_committed_before_a_later_dispatch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.dingtalk.org_sync_job as job
+
+    class DurableJobSession(_JobSession):
+        def __init__(self) -> None:
+            super().__init__(SimpleNamespace(id=11, public_id="b" * 32), [])
+            self.pending: list[int] = []
+            self.durable: list[int] = []
+
+        def rollback(self) -> None:
+            super().rollback()
+            self.pending.clear()
+
+        def commit(self) -> None:
+            super().commit()
+            self.durable.extend(self.pending)
+            self.pending.clear()
+
+    session = DurableJobSession()
+
+    @contextmanager
+    def acquired_lock(_session: object):
+        yield True
+
+    class Client:
+        def list_organization_snapshot(self, *, root_department_ids: tuple[int, ...]):
+            del root_department_ids
+            return DingTalkOrganizationSnapshot(departments=(), users=())
+
+    def dispatch(*args: object, notification_id: int, **kwargs: object) -> None:
+        if notification_id == 102:
+            raise job.DingTalkOrganizationSyncError("ORG_DISPATCH_FAILED", "safe")
+        session.pending.append(notification_id)
+
+    monkeypatch.setattr(job, "_schedule_lock", acquired_lock)
+    monkeypatch.setattr(job, "preview_organization_sync", lambda *args, **kwargs: _preview())
+    monkeypatch.setattr(job, "stage_org_sync_notifications", lambda *args, **kwargs: (101, 102))
+    monkeypatch.setattr(job, "dispatch_org_sync_notification", dispatch)
+    monkeypatch.setattr(job.audit, "record", lambda *args, **kwargs: None)
+
+    assert run_scheduled_org_sync(session, settings=_settings(), client=Client()) == 1  # type: ignore[arg-type]
+    assert session.durable == [101]
 
 
 def test_job_failure_audit_has_an_exact_safe_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:

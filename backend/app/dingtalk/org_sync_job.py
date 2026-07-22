@@ -48,27 +48,65 @@ def _schedule_lock(session: Session) -> Iterator[bool]:
 
     connection = _dedicated_connection(session)
     acquired = False
-    try:
-        acquired = bool(
-            connection.scalar(select(func.pg_try_advisory_lock(func.hashtext(_SCHEDULE_LOCK))))
-        )
-        yield acquired
-    finally:
+    pending_error: BaseException | None = None
+    safe_to_close = True
+
+    def invalidate_connection() -> BaseException | None:
+        nonlocal safe_to_close
+
+        # Until invalidation succeeds, closing could return an unknown-lock
+        # connection to the pool. Prefer leaking that handle to doing so.
+        safe_to_close = False
         try:
+            connection.invalidate()
+        except BaseException as exc:
+            return exc
+        safe_to_close = True
+        return None
+
+    try:
+        try:
+            acquired = bool(
+                connection.scalar(select(func.pg_try_advisory_lock(func.hashtext(_SCHEDULE_LOCK))))
+            )
+        except BaseException as exc:
+            # The server may have acquired the session lock before the client
+            # lost the outcome. This connection can never safely re-enter the pool.
+            pending_error = exc
+            invalidate_connection()
+            raise
+
+        try:
+            yield acquired
+        except BaseException as exc:
+            pending_error = exc
+            raise
+        finally:
             if acquired:
                 try:
                     released = connection.scalar(
                         select(func.pg_advisory_unlock(func.hashtext(_SCHEDULE_LOCK)))
                     )
-                except Exception:
-                    # A session-level lock must never return to the pool attached to
-                    # an unverified connection. Invalidating closes the DBAPI handle.
-                    connection.invalidate()
+                except BaseException as exc:
+                    invalidate_connection()
+                    if pending_error is None:
+                        pending_error = exc
+                        raise
+                    # Preserve an exception or cancellation already raised by
+                    # the protected job body; cleanup must not replace it.
                 else:
                     if not released:
-                        connection.invalidate()
-        finally:
-            connection.close()
+                        invalidation_error = invalidate_connection()
+                        if invalidation_error is not None and pending_error is None:
+                            pending_error = invalidation_error
+                            raise invalidation_error
+    finally:
+        if safe_to_close:
+            try:
+                connection.close()
+            except BaseException:
+                if pending_error is None:
+                    raise
 
 
 def _failure_code(error: DingTalkClientError | DingTalkOrganizationSyncError) -> str:
@@ -133,6 +171,10 @@ def run_scheduled_org_sync(
                         settings=settings,
                         client=client,
                     )
+                    # Dispatch has several safe early-return branches that may
+                    # only flush. Persist every recipient independently before
+                    # starting the next provider boundary.
+                    session.commit()
             audit.record(
                 session,
                 action="dingtalk.organization.schedule.succeeded",
