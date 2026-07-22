@@ -114,6 +114,7 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
             assert batch_columns["requested_by_user_id"] == "YES"
             assert batch_columns["trigger"] == "NO"
             assert batch_columns["root_config_hash"] == "NO"
+            assert batch_columns["local_baseline_hash"] == "NO"
             assert batch_columns["last_checked_at"] == "YES"
             assert {
                 "remote_region_count",
@@ -185,11 +186,50 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
             )
             assert local_sync_enum_names == set(_SYNC_ENUM_NAMES)
 
+            scheduled_reuse_index_columns = connection.scalars(
+                text("""
+                    SELECT table_attribute.attname
+                    FROM pg_class AS index_class
+                    JOIN pg_namespace AS index_namespace
+                      ON index_namespace.oid = index_class.relnamespace
+                    JOIN pg_index AS index_metadata
+                      ON index_metadata.indexrelid = index_class.oid
+                    JOIN LATERAL unnest(index_metadata.indkey) WITH ORDINALITY
+                      AS indexed_column(attnum, position) ON TRUE
+                    JOIN pg_attribute AS table_attribute
+                      ON table_attribute.attrelid = index_metadata.indrelid
+                     AND table_attribute.attnum = indexed_column.attnum
+                    WHERE index_namespace.nspname = :schema
+                      AND index_class.relname = :index_name
+                    ORDER BY indexed_column.position
+                    """),
+                {
+                    "schema": schema,
+                    "index_name": "ix_dingtalk_org_sync_batch_scheduled_reuse",
+                },
+            ).all()
+            assert scheduled_reuse_index_columns == [
+                "trigger",
+                "status",
+                "root_config_hash",
+                "snapshot_hash",
+                "local_baseline_hash",
+                "expires_at",
+                "id",
+            ]
+
             connection.commit()
             command.downgrade(config, _D19_REVISION)
 
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
                 _D19_REVISION
+            )
+            assert (
+                connection.scalar(
+                    text("SELECT to_regclass(:index_name)"),
+                    {"index_name": f"{schema}.ix_dingtalk_org_sync_batch_scheduled_reuse"},
+                )
+                is None
             )
             assert (
                 connection.scalar(

@@ -290,6 +290,7 @@ def upgrade() -> None:
         ),
         sa.Column("snapshot_hash", sa.String(length=64), nullable=False),
         sa.Column("root_config_hash", sa.String(length=64), nullable=False),
+        sa.Column("local_baseline_hash", sa.String(length=64), nullable=False),
         sa.Column(
             "trigger",
             dingtalk_org_sync_trigger_enum,
@@ -354,6 +355,19 @@ def upgrade() -> None:
         "ix_dingtalk_org_sync_batch_status_applied_at_id",
         "dingtalk_org_sync_batch",
         ["status", "applied_at", "id"],
+    )
+    op.create_index(
+        "ix_dingtalk_org_sync_batch_scheduled_reuse",
+        "dingtalk_org_sync_batch",
+        [
+            "trigger",
+            "status",
+            "root_config_hash",
+            "snapshot_hash",
+            "local_baseline_hash",
+            "expires_at",
+            "id",
+        ],
     )
 
     op.create_table(
@@ -522,6 +536,10 @@ def downgrade() -> None:
         )
     op.drop_table("dingtalk_org_sync_item")
 
+    op.drop_index(
+        "ix_dingtalk_org_sync_batch_scheduled_reuse",
+        table_name="dingtalk_org_sync_batch",
+    )
     op.drop_index(
         "ix_dingtalk_org_sync_batch_status_applied_at_id",
         table_name="dingtalk_org_sync_batch",

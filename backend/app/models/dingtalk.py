@@ -259,6 +259,16 @@ class DingTalkOrgSyncBatch(Base, TimestampMixin):
             "applied_at",
             "id",
         ),
+        Index(
+            "ix_dingtalk_org_sync_batch_scheduled_reuse",
+            "trigger",
+            "status",
+            "root_config_hash",
+            "snapshot_hash",
+            "local_baseline_hash",
+            "expires_at",
+            "id",
+        ),
     )
 
     public_id: Mapped[str] = mapped_column(
@@ -277,6 +287,7 @@ class DingTalkOrgSyncBatch(Base, TimestampMixin):
     )
     snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     root_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    local_baseline_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     trigger: Mapped[DingTalkOrgSyncTrigger] = mapped_column(
         Enum(DingTalkOrgSyncTrigger, name="dingtalk_org_sync_trigger"),
         nullable=False,

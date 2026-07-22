@@ -158,6 +158,9 @@ def test_upgrade_adds_direct_sync_schema_and_hr_permissions(monkeypatch) -> None
     }
     assert batch_columns["public_id"].type.length == 32
     assert batch_columns["snapshot_hash"].type.length == 64
+    assert batch_columns["local_baseline_hash"].type.length == 64
+    assert batch_columns["local_baseline_hash"].nullable is False
+    assert batch_columns["local_baseline_hash"].server_default is None
     assert batch_columns["requested_by_user_id"].nullable is True
     assert batch_columns["applied_by_user_id"].nullable is True
     assert batch_columns["trigger"].nullable is False
@@ -196,6 +199,25 @@ def test_upgrade_adds_direct_sync_schema_and_hr_permissions(monkeypatch) -> None
     }
     assert "uq_dingtalk_org_sync_notification_key" in notification_constraints
 
+    created_indexes = {
+        args[0]: (args[1], tuple(args[2]), kwargs.get("unique", False))
+        for name, (args, kwargs) in op.actions
+        if name == "create_index"
+    }
+    assert created_indexes["ix_dingtalk_org_sync_batch_scheduled_reuse"] == (
+        "dingtalk_org_sync_batch",
+        (
+            "trigger",
+            "status",
+            "root_config_hash",
+            "snapshot_hash",
+            "local_baseline_hash",
+            "expires_at",
+            "id",
+        ),
+        False,
+    )
+
     executed_sql = "\n".join(
         str(args[0]) for name, (args, _kwargs) in op.actions if name == "execute"
     )
@@ -217,6 +239,8 @@ def test_downgrade_removes_sync_schema_in_dependency_order(monkeypatch) -> None:
         "dingtalk_org_sync_item",
         "dingtalk_org_sync_batch",
     ]
+    dropped_indexes = {args[0] for name, (args, _kwargs) in op.actions if name == "drop_index"}
+    assert "ix_dingtalk_org_sync_batch_scheduled_reuse" in dropped_indexes
     dropped_columns = {
         (args[0], args[1]) for name, (args, _kwargs) in op.actions if name == "drop_column"
     }

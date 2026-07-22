@@ -71,6 +71,11 @@ def test_org_sync_batch_records_preview_lifecycle_and_aggregate_counts() -> None
     )
     assert isinstance(table.c.snapshot_hash.type, String)
     assert table.c.snapshot_hash.type.length == 64
+    assert isinstance(table.c.local_baseline_hash.type, String)
+    assert table.c.local_baseline_hash.type.length == 64
+    assert table.c.local_baseline_hash.nullable is False
+    assert table.c.local_baseline_hash.default is None
+    assert table.c.local_baseline_hash.server_default is None
     assert isinstance(table.c.expires_at.type, DateTime)
     assert table.c.requested_by_user_id.nullable is True
     assert table.c.applied_by_user_id.nullable is True
@@ -99,6 +104,20 @@ def test_org_sync_batch_records_preview_lifecycle_and_aggregate_counts() -> None
         "ck_dingtalk_org_sync_batch_nonnegative_counts",
         "ck_dingtalk_org_sync_batch_applied_audit",
     }
+    scheduled_reuse_index = next(
+        index
+        for index in table.indexes
+        if index.name == "ix_dingtalk_org_sync_batch_scheduled_reuse"
+    )
+    assert tuple(column.name for column in scheduled_reuse_index.columns) == (
+        "trigger",
+        "status",
+        "root_config_hash",
+        "snapshot_hash",
+        "local_baseline_hash",
+        "expires_at",
+        "id",
+    )
 
 
 def test_org_sync_item_keeps_remote_identity_encrypted_and_rows_idempotent() -> None:
