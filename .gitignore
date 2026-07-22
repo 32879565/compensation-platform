@@ -41,3 +41,7 @@ backups/
 .idea/
 .vscode/
 .DS_Store
+
+# Local isolated worktrees and Superpowers execution ledger
+.worktrees/
+.superpowers/
