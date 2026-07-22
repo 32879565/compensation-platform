@@ -140,8 +140,10 @@ type LegacyDingTalkOrganizationNodeAction =
   | 'MISSING_IN_DINGTALK'
 
 interface DingTalkOrganizationNodeItemResponse
-  extends Omit<DingTalkOrganizationNodeItem, 'action'> {
+  extends Omit<DingTalkOrganizationNodeItem, 'action' | 'kind' | 'change_fields'> {
   action: LegacyDingTalkOrganizationNodeAction
+  kind?: DingTalkOrganizationNodeKind
+  change_fields?: DingTalkOrganizationChangeField[]
 }
 
 type DingTalkOrganizationPreviewResponse = Omit<
@@ -268,12 +270,12 @@ function toOrganizationNodeItem(
 ): DingTalkOrganizationNodeItem {
   return {
     id: item.id,
-    kind: item.kind,
+    kind: item.kind ?? 'STORE',
     remote_department_id: item.remote_department_id,
     remote_department_name: item.remote_department_name,
     remote_department_path: item.remote_department_path,
     action: item.action === 'MISSING_IN_DINGTALK' ? 'DEACTIVATE' : item.action,
-    change_fields: [...item.change_fields],
+    change_fields: [...(item.change_fields ?? [])],
     match_method: item.match_method,
     proposed_org_unit_id: item.proposed_org_unit_id,
     proposed_org_unit_name: item.proposed_org_unit_name,

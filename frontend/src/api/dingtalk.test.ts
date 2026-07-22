@@ -380,12 +380,10 @@ describe('DingTalk and compensation appeal API client', () => {
         store_items: [
           {
             id: 101,
-            kind: 'STORE',
             remote_department_id: null,
             remote_department_name: 'Closed store',
             remote_department_path: 'Local / Closed store',
             action: 'MISSING_IN_DINGTALK',
-            change_fields: ['dingtalk_dept_id'],
             match_method: 'LOCAL_STORE_NOT_VISIBLE',
             proposed_org_unit_id: 11,
             proposed_org_unit_name: 'Closed store',
@@ -409,8 +407,9 @@ describe('DingTalk and compensation appeal API client', () => {
       region_items: [],
     })
     expect(staged.store_items[0]).toMatchObject({
+      kind: 'STORE',
       action: 'DEACTIVATE',
-      change_fields: ['dingtalk_dept_id'],
+      change_fields: [],
     })
   })
 })
