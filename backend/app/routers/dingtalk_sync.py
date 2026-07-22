@@ -730,6 +730,7 @@ def apply_dingtalk_organization(
             encryption_key=settings.encryption_key,
             tenant_id=settings.dingtalk_corp_id or "",
             actor=(principal.user_id, principal.username),
+            root_mappings=settings.dingtalk_org_root_mapping_pairs,
         )
     except DingTalkClientError as exc:
         _logger.warning(

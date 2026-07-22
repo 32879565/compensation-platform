@@ -241,6 +241,7 @@ def _make_live_review_world(session, world, settings):
         status=DingTalkOrgSyncBatchStatus.APPLIED,
         snapshot_hash="a" * 64,
         root_config_hash=_EMPTY_ROOT_CONFIG_HASH,
+        local_baseline_hash="b" * 64,
         expires_at=datetime.now(UTC) + timedelta(minutes=15),
         requested_by_user_id=manager.id,
         applied_by_user_id=manager.id,

@@ -116,6 +116,7 @@ def _add_applied_sync(
         status=DingTalkOrgSyncBatchStatus.APPLIED,
         snapshot_hash="a" * 64,
         root_config_hash=_LIVE_ROOT_CONFIG_HASH,
+        local_baseline_hash="b" * 64,
         expires_at=now + timedelta(minutes=15),
         requested_by_user_id=actor.id,
         applied_by_user_id=actor.id,
