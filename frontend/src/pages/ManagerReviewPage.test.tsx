@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -43,8 +44,8 @@ const review = {
   ],
 }
 
-function renderPage() {
-  return render(
+function renderPage({ strict = false }: { strict?: boolean } = {}) {
+  const page = (
     <MemoryRouter
       initialEntries={[`/manager-review/${reviewId}`]}
       future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
@@ -52,7 +53,10 @@ function renderPage() {
       <Routes>
         <Route path="/manager-review/:reviewId" element={<ManagerReviewPage />} />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
+  )
+  return render(
+    strict ? <StrictMode>{page}</StrictMode> : page,
   )
 }
 
@@ -86,8 +90,8 @@ describe('ManagerReviewPage', () => {
   it('uses DingTalk login, shows employee details, and raises an item-level dispute', async () => {
     renderPage()
 
-    expect(await screen.findByText('Dining Employee')).toBeInTheDocument()
-    expect(screen.getByText('¥6,000.00')).toBeInTheDocument()
+    expect(await screen.findByText('Dining Employee')).toBeTruthy()
+    expect(screen.getAllByText('¥6,000.00')).toHaveLength(2)
     expect(bridge.requestDingTalkAuthCode).toHaveBeenCalledWith({
       clientId: 'ding-client',
       corpId: 'ding-corp',
@@ -105,15 +109,11 @@ describe('ManagerReviewPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '提交异议' }))
 
     await waitFor(() =>
-      expect(managerApi.createManagerDispute).toHaveBeenCalledWith(
-        reviewId,
-        'manager-token',
-        {
-          employee_id: 7,
-          salary_item: 'ATTEND_WAGE',
-          opinion: 'Attendance days should be checked.',
-        },
-      ),
+      expect(managerApi.createManagerDispute).toHaveBeenCalledWith(reviewId, 'manager-token', {
+        employee_id: 7,
+        salary_item: 'ATTEND_WAGE',
+        opinion: 'Attendance days should be checked.',
+      }),
     )
   })
 
@@ -137,7 +137,14 @@ describe('ManagerReviewPage', () => {
     })
     renderPage()
 
-    expect(await screen.findByText('请从钉钉工作通知中打开此页面')).toBeInTheDocument()
+    expect(await screen.findByText('请从钉钉工作通知中打开此页面')).toBeTruthy()
     expect(managerApi.fetchManagerReview).not.toHaveBeenCalled()
+  })
+
+  it('completes DingTalk authentication under React StrictMode', async () => {
+    renderPage({ strict: true })
+
+    expect(await screen.findByText('Dining Employee')).toBeTruthy()
+    expect(managerApi.fetchManagerReview).toHaveBeenCalledWith(reviewId, 'manager-token')
   })
 })
