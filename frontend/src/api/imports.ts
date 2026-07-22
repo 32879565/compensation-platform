@@ -24,6 +24,13 @@ export interface SalaryImportConfirmResult {
   written: number
 }
 
+export interface SalaryImportPublishTarget {
+  store_id: number
+  store_name: string
+  employee_count: number
+  departments: Array<'DINING' | 'KITCHEN'>
+}
+
 export interface SalaryImportPublishResult {
   import_batch_id: number
   payroll_batch_id: number
@@ -58,6 +65,20 @@ export async function confirmSalaryImport(batchId: number): Promise<SalaryImport
   return (await api.post<SalaryImportConfirmResult>(`/api/imports/${batchId}/confirm`)).data
 }
 
-export async function publishSalaryImport(batchId: number): Promise<SalaryImportPublishResult> {
-  return (await api.post<SalaryImportPublishResult>(`/api/imports/${batchId}/publish`)).data
+export async function fetchSalaryImportPublishTargets(
+  batchId: number,
+): Promise<SalaryImportPublishTarget[]> {
+  return (await api.get<SalaryImportPublishTarget[]>(`/api/imports/${batchId}/publish-targets`))
+    .data
+}
+
+export async function publishSalaryImport(
+  batchId: number,
+  storeIds: number[],
+): Promise<SalaryImportPublishResult> {
+  return (
+    await api.post<SalaryImportPublishResult>(`/api/imports/${batchId}/publish`, {
+      store_ids: storeIds,
+    })
+  ).data
 }

@@ -14,7 +14,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -27,10 +27,15 @@ from app.db.session import get_session
 from app.dingtalk import service as dingtalk
 from app.importing.excel import WorkbookLimitError, read_salary_workbook
 from app.importing.header_rules import CURRENT_IMPORT_FIELDS
-from app.importing.publish import ImportPublishError, publish_import_for_review
+from app.importing.publish import (
+    ImportPublishError,
+    list_import_publish_targets,
+    publish_import_for_review,
+)
 from app.importing.service import ImportError_, confirm_import, restage_import, stage_import
 from app.importing.source_lock import lock_legacy_salary_dataset
 from app.importing.store_aliases import STORE_ALIASES
+from app.models.employee import Department
 from app.models.salary import (
     ImportBatch,
     ImportStagingRow,
@@ -313,6 +318,60 @@ def confirm_batch(
     return ConfirmResult(written=written)
 
 
+class PublishTargetOut(BaseModel):
+    store_id: int
+    store_name: str
+    employee_count: int
+    departments: list[Department]
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/{batch_id}/publish-targets", response_model=list[PublishTargetOut])
+def get_publish_targets(
+    batch_id: int,
+    principal: Principal = Depends(_require_global_publisher),
+    session: Session = Depends(get_session),
+) -> list[PublishTargetOut]:
+    imported = session.get(ImportBatch, batch_id)
+    if imported is None:
+        raise HTTPException(status_code=404, detail="导入批次不存在")
+    try:
+        targets = list_import_publish_targets(session, imported)
+    except ImportPublishError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    response = [PublishTargetOut.model_validate(target) for target in targets]
+    audit.record(
+        session,
+        action="import.publish_targets.view",
+        actor=(principal.user_id, principal.username),
+        target_type="import_batch",
+        target_id=imported.id,
+        detail={"stores": len(response)},
+    )
+    session.commit()
+    return response
+
+
+class PublishSelection(BaseModel):
+    store_ids: list[int] = Field(min_length=1, max_length=500)
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("store_ids", mode="before")
+    @classmethod
+    def validate_store_ids(cls, value: object) -> object:
+        if not isinstance(value, list):
+            raise ValueError("store_ids must be a list")
+        if not 1 <= len(value) <= 500:
+            raise ValueError("store_ids must contain between 1 and 500 entries")
+        if any(type(store_id) is not int or store_id <= 0 for store_id in value):
+            raise ValueError("store_ids must contain only positive integers")
+        if len(set(value)) != len(value):
+            raise ValueError("store_ids must not contain duplicates")
+        return value
+
+
 class PublishResult(BaseModel):
     import_batch_id: int
     payroll_batch_id: int
@@ -322,6 +381,8 @@ class PublishResult(BaseModel):
     routed: int
     configuration_failures: int
     existing: int
+    selected_stores: int
+    selected_scopes: int
     already_published: bool
     sandbox: bool
 
@@ -329,6 +390,7 @@ class PublishResult(BaseModel):
 @router.post("/{batch_id}/publish", response_model=PublishResult)
 def publish_batch_for_review(
     batch_id: int,
+    selection: PublishSelection,
     background_tasks: BackgroundTasks,
     principal: Principal = Depends(_require_global_publisher),
     settings: Settings = Depends(get_settings),
@@ -338,10 +400,18 @@ def publish_batch_for_review(
     imported = session.get(ImportBatch, batch_id)
     if imported is None:
         raise HTTPException(status_code=404, detail="导入批次不存在")
+    selected_store_ids = frozenset(selection.store_ids)
     try:
-        published = publish_import_for_review(session, imported)
+        published = publish_import_for_review(
+            session,
+            imported,
+            store_ids=selected_store_ids,
+        )
         delivery = dingtalk.stage_review_deliveries(
-            session, batch_id=published.payroll_batch_id, settings=settings
+            session,
+            batch_id=published.payroll_batch_id,
+            settings=settings,
+            org_unit_ids=selected_store_ids,
         )
     except ImportPublishError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
@@ -358,8 +428,9 @@ def publish_batch_for_review(
         detail={
             "payroll_batch_id": published.payroll_batch_id,
             "batch_version": published.batch_version,
-            "employees": published.employees,
-            "scopes": published.scopes,
+            "selected_store_ids": sorted(selected_store_ids),
+            "selected_stores": len(selected_store_ids),
+            "selected_scopes": published.scopes,
             "already_published": published.already_published,
         },
     )
@@ -371,6 +442,8 @@ def publish_batch_for_review(
         target_id=published.payroll_batch_id,
         detail={
             "sandbox": sandbox,
+            "selected_stores": len(selected_store_ids),
+            "selected_scopes": delivery.scopes,
             "routed": delivery.routed,
             "configuration_failures": delivery.configuration_failures,
             "existing": delivery.existing,
@@ -391,6 +464,8 @@ def publish_batch_for_review(
         routed=delivery.routed,
         configuration_failures=delivery.configuration_failures,
         existing=delivery.existing,
+        selected_stores=len(selected_store_ids),
+        selected_scopes=delivery.scopes,
         already_published=published.already_published,
         sandbox=sandbox,
     )
