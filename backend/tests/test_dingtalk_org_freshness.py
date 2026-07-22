@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -21,6 +22,7 @@ from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
     DingTalkDelivery,
     DingTalkDeliveryStatus,
+    DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncBatchStatus,
     DingTalkOrgSyncItem,
@@ -31,6 +33,8 @@ from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 from app.models.payroll_batch import BatchStatus, PayrollBatch
 from app.models.payroll_result import BatchConfirmation
+
+_LIVE_ROOT_CONFIG_HASH = hashlib.sha256(b'[[10,"GROUP"]]').hexdigest()
 
 
 def _live_settings() -> Settings:
@@ -44,6 +48,7 @@ def _live_settings() -> Settings:
         dingtalk_agent_id=123,
         dingtalk_public_base_url="https://payroll.example.test",
         dingtalk_read_sync_enabled=True,
+        dingtalk_org_root_mappings="10:GROUP",
     )
 
 
@@ -110,6 +115,7 @@ def _add_applied_sync(
     batch = DingTalkOrgSyncBatch(
         status=DingTalkOrgSyncBatchStatus.APPLIED,
         snapshot_hash="a" * 64,
+        root_config_hash=_LIVE_ROOT_CONFIG_HASH,
         expires_at=now + timedelta(minutes=15),
         requested_by_user_id=actor.id,
         applied_by_user_id=actor.id,
@@ -124,11 +130,14 @@ def _add_applied_sync(
                 row_key=f"STORE:{store.id}",
                 kind=DingTalkOrgSyncItemKind.STORE,
                 status=DingTalkOrgSyncItemStatus.APPLIED,
+                action=DingTalkOrgSyncAction.LINK,
                 remote_department_id=store.id + 100,
                 remote_department_name=store.name,
                 remote_department_path=f"集团 / {store.name}",
                 proposed_org_unit_id=store.id,
+                proposed_org_type=OrgType.STORE,
                 match_method="LINK|STABLE_DEPARTMENT_ID",
+                change_fields=["dingtalk_dept_id"],
                 baseline_fingerprint="b" * 64,
             ),
             DingTalkOrgSyncItem(
@@ -136,13 +145,16 @@ def _add_applied_sync(
                 row_key=f"REVIEWER:{store.id}:DINING",
                 kind=DingTalkOrgSyncItemKind.REVIEWER,
                 status=DingTalkOrgSyncItemStatus.APPLIED,
+                action=DingTalkOrgSyncAction.ASSIGN_SCOPE,
                 remote_department_id=store.id + 100,
                 remote_department_name=store.name,
                 remote_department_path=f"集团 / {store.name}",
                 proposed_org_unit_id=store.id,
                 proposed_employee_id=employee.id,
+                proposed_org_type=None,
                 department=Department.DINING,
                 match_method="ASSIGN|JOB_NUMBER",
+                change_fields=["reviewer_scope"],
                 applied_identity_proof=dingtalk_organization_identity_proof(
                     employee.dingtalk_user_id_hash or "",
                     key=_live_settings().encryption_key,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -19,6 +20,7 @@ from app.models.auth import (
     UserRole,
 )
 from app.models.dingtalk import (
+    DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncBatchStatus,
     DingTalkOrgSyncItem,
@@ -29,6 +31,8 @@ from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
+
+_EMPTY_ROOT_CONFIG_HASH = hashlib.sha256(b"[]").hexdigest()
 
 
 @pytest.fixture
@@ -423,6 +427,7 @@ def test_manual_scope_remove_and_readd_cannot_restore_applied_sync_proof(client,
     sync_batch = DingTalkOrgSyncBatch(
         status=DingTalkOrgSyncBatchStatus.APPLIED,
         snapshot_hash="a" * 64,
+        root_config_hash=_EMPTY_ROOT_CONFIG_HASH,
         expires_at=datetime.now(UTC) + timedelta(minutes=15),
         requested_by_user_id=admin.id,
         applied_by_user_id=admin.id,
@@ -435,13 +440,16 @@ def test_manual_scope_remove_and_readd_cannot_restore_applied_sync_proof(client,
         row_key="REVIEWER:SCOPE-PROOF:DINING",
         kind=DingTalkOrgSyncItemKind.REVIEWER,
         status=DingTalkOrgSyncItemStatus.APPLIED,
+        action=DingTalkOrgSyncAction.ASSIGN_SCOPE,
         remote_department_id=700,
         remote_department_name=store.name,
         remote_department_path=f"Group / {store.name}",
         proposed_org_unit_id=store.id,
         proposed_employee_id=employee.id,
+        proposed_org_type=None,
         department=Department.DINING,
         match_method="ASSIGN|STABLE_ID",
+        change_fields=["reviewer_scope"],
         applied_identity_proof="d" * 64,
         baseline_fingerprint="b" * 64,
     )

@@ -33,30 +33,58 @@ org_type_enum = postgresql.ENUM(
 dingtalk_delivery_status_enum = postgresql.ENUM(
     "PENDING", "SANDBOXED", "SENT", "FAILED", name="dingtalk_delivery_status", create_type=False
 )
-dingtalk_org_sync_batch_status_enum = postgresql.ENUM(
-    "PREVIEWED", "APPLIED", "STALE", name="dingtalk_org_sync_batch_status", create_type=False
-)
-dingtalk_org_sync_trigger_enum = postgresql.ENUM(
-    "MANUAL", "SCHEDULED", name="dingtalk_org_sync_trigger", create_type=False
-)
-dingtalk_org_sync_item_kind_enum = postgresql.ENUM(
-    "REGION", "STORE", "REVIEWER", name="dingtalk_org_sync_item_kind", create_type=False
-)
-dingtalk_org_sync_action_enum = postgresql.ENUM(
-    "LINK",
-    "CREATE",
-    "UPDATE",
-    "ACTIVATE",
-    "DEACTIVATE",
-    "ASSIGN_SCOPE",
-    "REMOVE_SCOPE",
-    "NO_CHANGE",
-    name="dingtalk_org_sync_action",
-    create_type=False,
-)
-dingtalk_org_sync_item_status_enum = postgresql.ENUM(
-    "READY", "CONFLICT", "APPLIED", "IGNORED", name="dingtalk_org_sync_item_status", create_type=False
-)
+
+
+def _sync_enums(schema: str) -> tuple[postgresql.ENUM, ...]:
+    """Build D20-local enums so temporary-schema migrations never reuse public types."""
+
+    return (
+        postgresql.ENUM(
+            "PREVIEWED",
+            "APPLIED",
+            "STALE",
+            name="dingtalk_org_sync_batch_status",
+            schema=schema,
+            create_type=False,
+        ),
+        postgresql.ENUM(
+            "MANUAL",
+            "SCHEDULED",
+            name="dingtalk_org_sync_trigger",
+            schema=schema,
+            create_type=False,
+        ),
+        postgresql.ENUM(
+            "REGION",
+            "STORE",
+            "REVIEWER",
+            name="dingtalk_org_sync_item_kind",
+            schema=schema,
+            create_type=False,
+        ),
+        postgresql.ENUM(
+            "LINK",
+            "CREATE",
+            "UPDATE",
+            "ACTIVATE",
+            "DEACTIVATE",
+            "ASSIGN_SCOPE",
+            "REMOVE_SCOPE",
+            "NO_CHANGE",
+            name="dingtalk_org_sync_action",
+            schema=schema,
+            create_type=False,
+        ),
+        postgresql.ENUM(
+            "READY",
+            "CONFLICT",
+            "APPLIED",
+            "IGNORED",
+            name="dingtalk_org_sync_item_status",
+            schema=schema,
+            create_type=False,
+        ),
+    )
 
 
 def _decrypt_legacy_pii_v1(token: str, *, key: str) -> str:
@@ -210,13 +238,18 @@ def upgrade() -> None:
     _reject_ambiguous_reviewer_scopes()
 
     bind = op.get_bind()
-    for enum_type in (
+    schema = bind.scalar(sa.text("SELECT current_schema()"))
+    if not isinstance(schema, str) or not schema:
+        raise RuntimeError("D20 cannot determine the current PostgreSQL schema")
+    sync_enums = _sync_enums(schema)
+    (
         dingtalk_org_sync_batch_status_enum,
         dingtalk_org_sync_trigger_enum,
         dingtalk_org_sync_item_kind_enum,
         dingtalk_org_sync_action_enum,
         dingtalk_org_sync_item_status_enum,
-    ):
+    ) = sync_enums
+    for enum_type in sync_enums:
         enum_type.create(bind, checkfirst=True)
 
     op.add_column("org_unit", sa.Column("dingtalk_dept_id", sa.BigInteger(), nullable=True))
@@ -530,14 +563,11 @@ def downgrade() -> None:
     op.drop_column("org_unit", "dingtalk_dept_id")
 
     bind = op.get_bind()
-    for enum_name in (
-        "dingtalk_org_sync_item_status",
-        "dingtalk_org_sync_action",
-        "dingtalk_org_sync_item_kind",
-        "dingtalk_org_sync_trigger",
-        "dingtalk_org_sync_batch_status",
-    ):
-        sa.Enum(name=enum_name).drop(bind, checkfirst=True)
+    schema = bind.scalar(sa.text("SELECT current_schema()"))
+    if not isinstance(schema, str) or not schema:
+        raise RuntimeError("D20 cannot determine the current PostgreSQL schema")
+    for enum_type in reversed(_sync_enums(schema)):
+        enum_type.drop(bind, checkfirst=True)
 
     # The permission may have been seeded by newer application code before
     # this migration ran.  Keep the harmless catalog row and grants rather

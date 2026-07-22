@@ -620,6 +620,7 @@ def preview_dingtalk_organization(
             encryption_key=settings.encryption_key,
             actor=(principal.user_id, principal.username),
             store_root_names=settings.dingtalk_store_root_name_set,
+            root_mapping_pairs=settings.dingtalk_org_root_mapping_pairs,
             dining_manager_titles=settings.dingtalk_dining_manager_title_set,
             kitchen_manager_titles=settings.dingtalk_kitchen_manager_title_set,
         )

@@ -39,6 +39,7 @@ from app.dingtalk.read_sync import (
 )
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
+    DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncBatchStatus,
     DingTalkOrgSyncItem,
@@ -253,6 +254,49 @@ def _snapshot_hash(snapshot: DingTalkOrganizationSnapshot, *, encryption_key: st
         b"compensation-platform:dingtalk-org-snapshot:v2\0" + encryption_key.encode("utf-8")
     ).digest()
     return hmac.new(derived_key, payload, hashlib.sha256).hexdigest()
+
+
+def _root_config_hash(root_mapping_pairs: tuple[tuple[int, str], ...]) -> str:
+    """Fingerprint configured remote-root to immutable-local-anchor bindings only."""
+
+    payload = json.dumps(
+        sorted(
+            (int(remote_root_id), str(local_anchor_code))
+            for remote_root_id, local_anchor_code in root_mapping_pairs
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _persisted_store_action(action: str) -> tuple[DingTalkOrgSyncAction, list[str]]:
+    mapping = {
+        "LINK": (DingTalkOrgSyncAction.LINK, ["dingtalk_dept_id"]),
+        "CREATE": (
+            DingTalkOrgSyncAction.CREATE,
+            ["code", "name", "parent_id", "type", "dingtalk_dept_id"],
+        ),
+        "UPDATE": (DingTalkOrgSyncAction.UPDATE, ["name"]),
+        "ACTIVATE": (DingTalkOrgSyncAction.ACTIVATE, ["status"]),
+        "MISSING_IN_DINGTALK": (DingTalkOrgSyncAction.DEACTIVATE, ["status"]),
+    }
+    try:
+        return mapping[action]
+    except KeyError as exc:
+        raise RuntimeError("invalid store persistence action") from exc
+
+
+def _persisted_reviewer_action(action: str) -> tuple[DingTalkOrgSyncAction, list[str]]:
+    mapping = {
+        "ASSIGN": (DingTalkOrgSyncAction.ASSIGN_SCOPE, ["reviewer_scope"]),
+        "REMOVE": (DingTalkOrgSyncAction.REMOVE_SCOPE, ["reviewer_scope"]),
+        "CONFLICT": (DingTalkOrgSyncAction.NO_CHANGE, []),
+    }
+    try:
+        return mapping[action]
+    except KeyError as exc:
+        raise RuntimeError("invalid reviewer persistence action") from exc
 
 
 def _path_for_department(
@@ -577,6 +621,7 @@ def preview_organization_sync(
     actor: tuple[int, str],
     now: datetime | None = None,
     store_root_names: frozenset[str] = _DEFAULT_STORE_ROOT_NAMES,
+    root_mapping_pairs: tuple[tuple[int, str], ...] = (),
     dining_manager_titles: frozenset[str] = frozenset({"店长"}),
     kitchen_manager_titles: frozenset[str] = frozenset({"厨房经理"}),
 ) -> OrganizationPreview:
@@ -708,11 +753,13 @@ def preview_organization_sync(
             if action == "CREATE"
             else _resolved_store_baseline(proposed_store, org_units=state.org_units)
         )
+        persisted_action, change_fields = _persisted_store_action(action)
         store_rows.append(
             DingTalkOrgSyncItem(
                 row_key=f"STORE:REMOTE:{remote_store.department_id}",
                 kind=DingTalkOrgSyncItemKind.STORE,
                 status=status,
+                action=persisted_action,
                 remote_department_id=remote_store.department_id,
                 remote_department_name=remote_store.name,
                 remote_department_path=_path_for_department(remote_store, departments_by_id),
@@ -720,9 +767,11 @@ def preview_organization_sync(
                 proposed_org_unit_id=(proposed_store.id if proposed_store else None),
                 proposed_parent_org_unit_id=(proposed_parent.id if proposed_parent else None),
                 proposed_employee_id=None,
+                proposed_org_type=OrgType.STORE,
                 department=None,
                 match_method=_encode_method(action, method),
                 conflict_code=conflict_code,
+                change_fields=change_fields,
                 baseline_fingerprint=baseline,
             )
         )
@@ -747,11 +796,13 @@ def preview_organization_sync(
         if store.status == "ACTIVE" and store.id not in matched_local_store_ids
     ]
     for store in local_only_stores:
+        persisted_action, change_fields = _persisted_store_action("MISSING_IN_DINGTALK")
         store_rows.append(
             DingTalkOrgSyncItem(
                 row_key=f"STORE:LOCAL:{store.id}",
                 kind=DingTalkOrgSyncItemKind.STORE,
                 status=DingTalkOrgSyncItemStatus.CONFLICT,
+                action=persisted_action,
                 remote_department_id=None,
                 remote_department_name=store.name,
                 remote_department_path=_local_path(store, org_units_by_id),
@@ -759,9 +810,11 @@ def preview_organization_sync(
                 proposed_org_unit_id=store.id,
                 proposed_parent_org_unit_id=store.parent_id,
                 proposed_employee_id=None,
+                proposed_org_type=OrgType.STORE,
                 department=None,
                 match_method=_encode_method("MISSING_IN_DINGTALK", "LOCAL_STORE_NOT_VISIBLE"),
                 conflict_code="LOCAL_STORE_NOT_VISIBLE",
+                change_fields=change_fields,
                 baseline_fingerprint=_resolved_store_baseline(store, org_units=state.org_units),
             )
         )
@@ -851,10 +904,12 @@ def preview_organization_sync(
             if selected_remote is not None
             else None
         )
+        persisted_action, change_fields = _persisted_reviewer_action(action)
         row = DingTalkOrgSyncItem(
             row_key=row_key,
             kind=DingTalkOrgSyncItemKind.REVIEWER,
             status=status,
+            action=persisted_action,
             remote_department_id=(remote_store.department_id if remote_store is not None else None),
             remote_department_name=remote_name,
             remote_department_path=remote_path,
@@ -862,9 +917,11 @@ def preview_organization_sync(
             proposed_org_unit_id=store.id if store else None,
             proposed_parent_org_unit_id=None,
             proposed_employee_id=(selected_employee.id if selected_employee is not None else None),
+            proposed_org_type=None,
             department=department,
             match_method=_encode_method(action, method),
             conflict_code=conflict_code,
+            change_fields=change_fields,
             baseline_fingerprint=_reviewer_baseline(
                 store=store,
                 department=department,
@@ -1024,6 +1081,8 @@ def preview_organization_sync(
         for draft in drafts:
             _, method = _decode_method(draft.row)
             draft.row.status = DingTalkOrgSyncItemStatus.CONFLICT
+            draft.row.action = DingTalkOrgSyncAction.NO_CHANGE
+            draft.row.change_fields = []
             draft.row.match_method = _encode_method("CONFLICT", method)
             draft.row.conflict_code = "MANAGER_ASSIGNED_MULTIPLE_STORES"
 
@@ -1054,6 +1113,7 @@ def preview_organization_sync(
     batch = DingTalkOrgSyncBatch(
         status=DingTalkOrgSyncBatchStatus.PREVIEWED,
         snapshot_hash=_snapshot_hash(snapshot, encryption_key=encryption_key),
+        root_config_hash=_root_config_hash(root_mapping_pairs),
         expires_at=current_time + _PREVIEW_TTL,
         requested_by_user_id=actor[0],
         remote_store_count=len(candidate_departments),

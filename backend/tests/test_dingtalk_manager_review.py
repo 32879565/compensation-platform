@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -33,6 +34,7 @@ from app.models.dingtalk import (
     DingTalkDelivery,
     DingTalkDeliveryKind,
     DingTalkDeliveryStatus,
+    DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncBatchStatus,
     DingTalkOrgSyncItem,
@@ -48,6 +50,8 @@ from app.models.payroll_result import (
     ConfirmStatus,
     PayrollResult,
 )
+
+_EMPTY_ROOT_CONFIG_HASH = hashlib.sha256(b"[]").hexdigest()
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -236,6 +240,7 @@ def _make_live_review_world(session, world, settings):
     sync_batch = DingTalkOrgSyncBatch(
         status=DingTalkOrgSyncBatchStatus.APPLIED,
         snapshot_hash="a" * 64,
+        root_config_hash=_EMPTY_ROOT_CONFIG_HASH,
         expires_at=datetime.now(UTC) + timedelta(minutes=15),
         requested_by_user_id=manager.id,
         applied_by_user_id=manager.id,
@@ -250,11 +255,14 @@ def _make_live_review_world(session, world, settings):
                 row_key="STORE:700",
                 kind=DingTalkOrgSyncItemKind.STORE,
                 status=DingTalkOrgSyncItemStatus.APPLIED,
+                action=DingTalkOrgSyncAction.LINK,
                 remote_department_id=700,
                 remote_department_name=store.name,
                 remote_department_path=f"Group / {store.name}",
                 proposed_org_unit_id=store.id,
+                proposed_org_type=OrgType.STORE,
                 match_method="LINK|STABLE_DEPARTMENT_ID",
+                change_fields=["dingtalk_dept_id"],
                 baseline_fingerprint="b" * 64,
             ),
             DingTalkOrgSyncItem(
@@ -262,13 +270,16 @@ def _make_live_review_world(session, world, settings):
                 row_key="REVIEWER:700:DINING",
                 kind=DingTalkOrgSyncItemKind.REVIEWER,
                 status=DingTalkOrgSyncItemStatus.APPLIED,
+                action=DingTalkOrgSyncAction.ASSIGN_SCOPE,
                 remote_department_id=700,
                 remote_department_name=store.name,
                 remote_department_path=f"Group / {store.name}",
                 proposed_org_unit_id=store.id,
                 proposed_employee_id=employee.id,
+                proposed_org_type=None,
                 department=Department.DINING,
                 match_method="ASSIGN|STABLE_ID",
+                change_fields=["reviewer_scope"],
                 applied_identity_proof=dingtalk_organization_identity_proof(
                     provider_hash,
                     key=settings.encryption_key,

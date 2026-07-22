@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -18,8 +20,10 @@ from app.dingtalk.read_sync import blind_index_dingtalk_user_id
 from app.models.audit import AuditLog
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
+    DingTalkOrgSyncAction,
     DingTalkOrgSyncBatch,
     DingTalkOrgSyncItem,
+    DingTalkOrgSyncItemKind,
     DingTalkOrgSyncItemStatus,
 )
 from app.models.employee import Department, Employee
@@ -95,7 +99,7 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
-def _settings() -> Settings:
+def _settings(*, root_mappings: str = "") -> Settings:
     return Settings(
         database_url="postgresql+psycopg://test:test@localhost/test",
         secret_key="test-secret-key-only-for-tests-not-production",
@@ -106,7 +110,15 @@ def _settings() -> Settings:
         dingtalk_agent_id=123,
         dingtalk_corp_id="ding-test-corp",
         dingtalk_read_sync_enabled=True,
+        dingtalk_org_root_mappings=root_mappings,
     )
+
+
+def _expected_root_config_hash(root_mappings: tuple[tuple[int, str], ...]) -> str:
+    payload = json.dumps(
+        sorted(root_mappings), separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _group_hr(session, username: str) -> User:
@@ -211,9 +223,29 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
     db_session.expire_all()
     assert db_session.get(OrgUnit, store.id).dingtalk_dept_id is None
     assert db_session.scalars(select(UserReviewScope)).all() == []
-    assert db_session.scalar(select(DingTalkOrgSyncBatch.public_id)) == body["batch_id"]
+    batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(DingTalkOrgSyncBatch.public_id == body["batch_id"])
+    ).one()
+    assert batch.root_config_hash == _expected_root_config_hash(())
     staged_items = db_session.scalars(select(DingTalkOrgSyncItem)).all()
     assert len(staged_items) == 3
+    assert {
+        (item.kind.value, item.action, tuple(item.change_fields), item.proposed_org_type)
+        for item in staged_items
+    } == {
+        (
+            DingTalkOrgSyncItemKind.STORE.value,
+            DingTalkOrgSyncAction.LINK,
+            ("dingtalk_dept_id",),
+            OrgType.STORE,
+        ),
+        (
+            DingTalkOrgSyncItemKind.REVIEWER.value,
+            DingTalkOrgSyncAction.ASSIGN_SCOPE,
+            ("reviewer_scope",),
+            None,
+        ),
+    }
     staged_values = "|".join(
         str(getattr(item, column.name))
         for item in staged_items
@@ -224,6 +256,33 @@ def test_organization_preview_stages_safe_store_and_reviewer_changes_without_app
     assert "店长甲" not in staged_values
     assert "厨管乙" not in staged_values
     assert fake.calls == 1
+
+
+def test_organization_preview_persists_the_configured_root_mapping_hash(client, db_session):
+    _seed_store_and_managers(db_session)
+    admin = _group_hr(db_session, "org-sync-root-fingerprint")
+    fake = _FakeOrganizationClient()
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = lambda: _settings(
+        root_mappings="20:REGION-B,10:DIRECT-GROUP"
+    )
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 200, response.text
+    batch = db_session.scalars(
+        select(DingTalkOrgSyncBatch).where(
+            DingTalkOrgSyncBatch.public_id == response.json()["batch_id"]
+        )
+    ).one()
+    assert batch.root_config_hash == _expected_root_config_hash(
+        ((20, "REGION-B"), (10, "DIRECT-GROUP"))
+    )
 
 
 def test_organization_apply_missing_batch_does_not_read_provider(client, db_session):
@@ -355,6 +414,15 @@ def test_organization_apply_clears_departed_manager_scope_fail_closed(client, db
     assert {item["current_reviewer_name"] for item in preview["reviewer_items"]} == {
         manager.username for manager in managers
     }
+    staged_reviewers = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER
+        )
+    ).all()
+    assert {
+        (item.action, tuple(item.change_fields), item.proposed_org_type)
+        for item in staged_reviewers
+    } == {(DingTalkOrgSyncAction.REMOVE_SCOPE, ("reviewer_scope",), None)}
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -546,6 +614,19 @@ def test_organization_sync_activates_or_updates_historical_store(
     assert preview_response.status_code == 200, preview_response.text
     preview = preview_response.json()
     assert preview["store_items"][0]["action"] == expected_action
+    staged_store = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE
+        )
+    ).one()
+    expected_persistence = {
+        "ACTIVATE": (DingTalkOrgSyncAction.ACTIVATE, ("status",)),
+        "UPDATE": (DingTalkOrgSyncAction.UPDATE, ("name",)),
+    }
+    assert (staged_store.action, tuple(staged_store.change_fields)) == expected_persistence[
+        expected_action
+    ]
+    assert staged_store.proposed_org_type == OrgType.STORE
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -732,6 +813,21 @@ def test_organization_sync_creates_remote_only_store_and_assigns_both_reviewers(
     assert create_item["remote_department_name"] == "珠江新城店"
     assert create_item["proposed_parent_org_unit_id"] == group_id
     assert preview["reviewer_conflicts"] == 0
+    staged_create = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncItem.remote_department_id == 102,
+        )
+    ).one()
+    assert staged_create.action == DingTalkOrgSyncAction.CREATE
+    assert staged_create.change_fields == [
+        "code",
+        "name",
+        "parent_id",
+        "type",
+        "dingtalk_dept_id",
+    ]
+    assert staged_create.proposed_org_type == OrgType.STORE
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -823,6 +919,28 @@ def test_organization_sync_surfaces_local_only_store_and_clears_both_scopes(clie
     assert len(clears) == 2
     assert {item["action"] for item in clears} == {"REMOVE"}
     assert preview["reviewer_conflicts"] == 0
+    staged_hidden_items = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.proposed_org_unit_id == hidden_store.id
+        )
+    ).all()
+    assert {
+        (item.kind, item.action, tuple(item.change_fields), item.proposed_org_type)
+        for item in staged_hidden_items
+    } == {
+        (
+            DingTalkOrgSyncItemKind.STORE,
+            DingTalkOrgSyncAction.DEACTIVATE,
+            ("status",),
+            OrgType.STORE,
+        ),
+        (
+            DingTalkOrgSyncItemKind.REVIEWER,
+            DingTalkOrgSyncAction.REMOVE_SCOPE,
+            ("reviewer_scope",),
+            None,
+        ),
+    }
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -863,6 +981,15 @@ def test_organization_sync_rejects_weak_name_only_manager_match(client, db_sessi
     assert weak["action"] == "CONFLICT"
     assert weak["match_method"] == "UNIQUE_NAME"
     assert weak["conflict_code"] == "WEAK_NAME_MATCH"
+    staged_weak = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
+            DingTalkOrgSyncItem.department == Department.DINING,
+        )
+    ).one()
+    assert staged_weak.action == DingTalkOrgSyncAction.NO_CHANGE
+    assert staged_weak.change_fields == []
+    assert staged_weak.proposed_org_type is None
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
@@ -931,6 +1058,15 @@ def test_organization_sync_conflicts_same_manager_covering_multiple_stores(clien
     ]
     assert len(duplicated) == 2
     assert {item["action"] for item in duplicated} == {"CONFLICT"}
+    staged_duplicates = db_session.scalars(
+        select(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.conflict_code == "MANAGER_ASSIGNED_MULTIPLE_STORES"
+        )
+    ).all()
+    assert len(staged_duplicates) == 2
+    assert all(item.action == DingTalkOrgSyncAction.NO_CHANGE for item in staged_duplicates)
+    assert all(item.change_fields == [] for item in staged_duplicates)
+    assert all(item.proposed_org_type is None for item in staged_duplicates)
 
     response = client.post(
         f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",

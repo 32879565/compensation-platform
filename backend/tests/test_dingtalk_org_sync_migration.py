@@ -24,8 +24,11 @@ class _Connection:
         self.dropped_schema_items: list[str] = []
         self.dialect = postgresql.dialect()
 
-    def scalar(self, statement: object) -> int:
-        self.statements.append(str(statement))
+    def scalar(self, statement: object) -> int | str:
+        rendered = str(statement)
+        self.statements.append(rendered)
+        if "current_schema" in rendered:
+            return "d20_test_schema"
         return self.duplicate_scope_count
 
     def execute(self, statement: object, _params: object = None):
@@ -158,6 +161,7 @@ def test_upgrade_adds_direct_sync_schema_and_hr_permissions(monkeypatch) -> None
     assert batch_columns["requested_by_user_id"].nullable is True
     assert batch_columns["applied_by_user_id"].nullable is True
     assert batch_columns["trigger"].nullable is False
+    assert batch_columns["trigger"].type.schema == "d20_test_schema"
     assert batch_columns["root_config_hash"].type.length == 64
     assert batch_columns["last_checked_at"].nullable is True
     for column_name in (
@@ -176,6 +180,7 @@ def test_upgrade_adds_direct_sync_schema_and_hr_permissions(monkeypatch) -> None
     assert item_columns["proposed_parent_org_unit_id"].nullable is True
     assert item_columns["baseline_fingerprint"].nullable is False
     assert item_columns["action"].nullable is False
+    assert item_columns["action"].type.schema == "d20_test_schema"
     assert item_columns["change_fields"].nullable is False
     assert item_columns["proposed_org_type"].nullable is True
     notification_columns = {

@@ -15,6 +15,13 @@ from app.core.crypto import encrypt_pii
 from app.dingtalk.read_sync import blind_index_dingtalk_user_id
 
 _D19_REVISION = "h3q6k9m1p457"
+_SYNC_ENUM_NAMES = (
+    "dingtalk_org_sync_batch_status",
+    "dingtalk_org_sync_trigger",
+    "dingtalk_org_sync_item_kind",
+    "dingtalk_org_sync_action",
+    "dingtalk_org_sync_item_status",
+)
 
 
 def _config_with_connection(connection) -> Config:
@@ -134,9 +141,12 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
                     SELECT count(*)
                     FROM pg_enum
                     JOIN pg_type ON pg_type.oid = pg_enum.enumtypid
-                    WHERE pg_type.typname = 'dingtalk_org_sync_item_kind'
+                    JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+                    WHERE pg_namespace.nspname = :schema
+                      AND pg_type.typname = 'dingtalk_org_sync_item_kind'
                       AND pg_enum.enumlabel = 'REGION'
                     """),
+                {"schema": schema},
             ) == 1
             assert connection.scalar(
                 text("""
@@ -155,6 +165,46 @@ def test_d20_backfills_encrypted_legacy_reviewer_identity_on_postgresql(pg_engin
                 )
                 == expected_digest
             )
+            local_sync_enum_names = set(
+                connection.scalars(
+                    text("""
+                        SELECT pg_type.typname
+                        FROM pg_type
+                        JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+                        WHERE pg_namespace.nspname = :schema
+                          AND pg_type.typname = ANY(:enum_names)
+                        """),
+                    {"schema": schema, "enum_names": list(_SYNC_ENUM_NAMES)},
+                ).all()
+            )
+            assert local_sync_enum_names == set(_SYNC_ENUM_NAMES)
+
+            connection.commit()
+            command.downgrade(config, _D19_REVISION)
+
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                _D19_REVISION
+            )
+            assert connection.scalar(
+                text("""
+                    SELECT count(*)
+                    FROM pg_type
+                    JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+                    WHERE pg_namespace.nspname = :schema
+                      AND pg_type.typname = ANY(:enum_names)
+                    """),
+                {"schema": schema, "enum_names": list(_SYNC_ENUM_NAMES)},
+            ) == 0
+            assert connection.scalar(
+                text("""
+                    SELECT count(*)
+                    FROM pg_type
+                    JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+                    WHERE pg_namespace.nspname = 'public'
+                      AND pg_type.typname = ANY(:enum_names)
+                    """),
+                {"enum_names": list(_SYNC_ENUM_NAMES)},
+            ) == len(_SYNC_ENUM_NAMES)
             assert (
                 connection.scalar(
                     text("SELECT dingtalk_user_id_hash FROM employee WHERE id = :id"),
