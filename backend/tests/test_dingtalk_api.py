@@ -1022,14 +1022,14 @@ def test_live_delivery_requires_provider_userid_and_sends_ephemeral_action_card(
     assert len(fake_client.messages) == 1
     message = fake_client.messages[0]
     assert message["recipient_user_id"] == "provider-live-manager"
-    assert "Sensitive Employee Name" in message["markdown"]
+    assert "Sensitive Employee Name" not in message["markdown"]
     assert "Renamed after payroll lock" not in message["markdown"]
     assert message["title"] == "2026-07 薪资复核"
     assert "门店：Store" in message["markdown"]
     assert "Renamed after delivery staging" not in message["markdown"]
-    assert "6000.00" in message["markdown"]
-    assert message["action_url"].startswith(
-        "https://payroll.example.test/comp-appeals?delivery_id="
+    assert "6000.00" not in message["markdown"]
+    assert message["action_url"] == (
+        f"https://payroll.example.test/manager-review/{sent.review_public_id}"
     )
     assert not hasattr(sent, "message_body")
 
@@ -1079,7 +1079,7 @@ def test_live_delivery_never_blindly_retries_an_unknown_provider_outcome(db_sess
         )
 
 
-def test_review_card_reserves_space_for_omission_notice_and_confidentiality_footer(db_session):
+def test_review_card_keeps_employee_names_and_amounts_out_of_notification_preview(db_session):
     store, _first_employee, batch = _seed_review_round(db_session)
     for index in range(11):
         name = (f"Employee_{index:02d}_[Payroll]_" + "X" * 64)[:64]
@@ -1138,5 +1138,6 @@ def test_review_card_reserves_space_for_omission_notice_and_confidentiality_foot
 
     assert len(markdown) <= 1000
     assert len(markdown.encode("utf-8")) <= 900
-    assert "另有" in markdown
+    assert "Employee_" not in markdown
+    assert "6000.00" not in markdown
     assert markdown.endswith("> 薪资敏感信息，仅限本门店本部门授权负责人查看。")
