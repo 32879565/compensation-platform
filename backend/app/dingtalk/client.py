@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from app.core.config import Settings, get_settings
@@ -788,7 +788,20 @@ class DingTalkClient:
             raise DingTalkClientError("The DingTalk notification title is invalid")
         if not markdown.strip() or len(markdown) > 1000:
             raise DingTalkClientError("The DingTalk notification body is invalid")
-        if not action_url.startswith("https://") or len(action_url) > 500:
+        try:
+            parsed_action_url = urlsplit(action_url)
+            valid_action_url = (
+                parsed_action_url.scheme == "https"
+                and parsed_action_url.hostname is not None
+                and (parsed_action_url.port is None or parsed_action_url.port > 0)
+                and parsed_action_url.username is None
+                and parsed_action_url.password is None
+                and not parsed_action_url.query
+                and not parsed_action_url.fragment
+            )
+        except ValueError:
+            valid_action_url = False
+        if not valid_action_url or len(action_url) > 500:
             raise DingTalkClientError("The DingTalk notification action URL is invalid")
         if not isinstance(action_title, str):
             raise DingTalkClientError("The DingTalk notification action title is invalid")

@@ -4,8 +4,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
+import app.dingtalk.org_notifications as org_notifications
 from app.auth.bootstrap import seed_rbac
 from app.auth.permissions import Perm
 from app.core.config import DingTalkMode, Settings
@@ -276,4 +277,131 @@ def test_live_dispatch_without_a_public_url_fails_without_calling_provider(db_se
     assert row.status is DingTalkDeliveryStatus.FAILED
     assert row.error_code == "PUBLIC_BASE_URL_MISSING"
     assert row.attempt_count == 0
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    "public_base_url",
+    [
+        "http://pay.example.test",
+        "https:///org",
+        "https://pay.example.test:invalid",
+        "https://user:password@pay.example.test",
+        "https://pay.example.test/base?next=unsafe",
+        "https://pay.example.test/base#unsafe",
+    ],
+)
+def test_live_dispatch_rejects_unsafe_public_base_url(db_session, public_base_url):
+    batch = _batch(db_session)
+    _global_hr(db_session, "global-hr")
+    live_settings = _settings(mode=DingTalkMode.LIVE)
+    notification_id = stage_org_sync_notifications(db_session, batch=batch, settings=live_settings)[
+        0
+    ]
+    unsafe_settings = Settings.model_construct(
+        dingtalk_mode=DingTalkMode.LIVE,
+        dingtalk_public_base_url=public_base_url,
+    )
+    client = _Client(DingTalkSendResult(task_id=1, request_id=None))
+
+    row = dispatch_org_sync_notification(
+        db_session,
+        notification_id=notification_id,
+        settings=unsafe_settings,
+        client=client,
+    )
+
+    assert row.status is DingTalkDeliveryStatus.FAILED
+    assert row.error_code == "PUBLIC_BASE_URL_INVALID"
+    assert row.attempt_count == 0
+    assert client.calls == []
+
+
+def test_dispatch_rechecks_global_permissions_after_unknown_marker_commit(db_session, monkeypatch):
+    batch = _batch(db_session)
+    recipient = _global_hr(db_session, "global-hr")
+    settings = _settings(mode=DingTalkMode.LIVE)
+    notification_id = stage_org_sync_notifications(db_session, batch=batch, settings=settings)[0]
+    original = org_notifications._locked_current_recipient
+
+    def revoke_permissions_after_marker(session, *, recipient_user_id):
+        marker = session.get(DingTalkOrgSyncNotification, notification_id)
+        assert marker is not None
+        assert marker.status is DingTalkDeliveryStatus.FAILED
+        assert marker.error_code == "PROVIDER_SEND_OUTCOME_UNKNOWN"
+        assert marker.attempt_count == 1
+        session.execute(delete(UserRole).where(UserRole.user_id == recipient_user_id))
+        session.flush()
+        return original(session, recipient_user_id=recipient_user_id)
+
+    monkeypatch.setattr(
+        org_notifications,
+        "_locked_current_recipient",
+        revoke_permissions_after_marker,
+    )
+    client = _Client(DingTalkSendResult(task_id=1, request_id=None))
+
+    row = dispatch_org_sync_notification(
+        db_session, notification_id=notification_id, settings=settings, client=client
+    )
+
+    assert recipient.id == row.recipient_user_id
+    assert row.status is DingTalkDeliveryStatus.FAILED
+    assert row.error_code == "RECIPIENT_NOT_AUTHORIZED"
+    assert row.attempt_count == 0
+    assert row.dispatched_at is None
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_error"),
+    [
+        ("dingtalk_user_id", "MISSING_DINGTALK_USER_ID"),
+        ("login_enabled", "RECIPIENT_NOT_AUTHORIZED"),
+        ("status", "RECIPIENT_NOT_AUTHORIZED"),
+        ("is_deleted", "RECIPIENT_NOT_AUTHORIZED"),
+    ],
+)
+def test_dispatch_rechecks_recipient_state_after_unknown_marker_commit(
+    db_session, monkeypatch, change, expected_error
+):
+    batch = _batch(db_session)
+    _global_hr(db_session, "global-hr", dingtalk_user_id="before-commit-id")
+    settings = _settings(mode=DingTalkMode.LIVE)
+    notification_id = stage_org_sync_notifications(db_session, batch=batch, settings=settings)[0]
+    original = org_notifications._locked_current_recipient
+
+    def change_recipient_after_marker(session, *, recipient_user_id):
+        marker = session.get(DingTalkOrgSyncNotification, notification_id)
+        assert marker is not None
+        assert marker.status is DingTalkDeliveryStatus.FAILED
+        assert marker.error_code == "PROVIDER_SEND_OUTCOME_UNKNOWN"
+        recipient = session.get(User, recipient_user_id)
+        assert recipient is not None
+        if change == "dingtalk_user_id":
+            recipient.dingtalk_user_id = None
+        elif change == "login_enabled":
+            recipient.login_enabled = False
+        elif change == "status":
+            recipient.status = "DISABLED"
+        else:
+            recipient.is_deleted = True
+        session.flush()
+        return original(session, recipient_user_id=recipient_user_id)
+
+    monkeypatch.setattr(
+        org_notifications,
+        "_locked_current_recipient",
+        change_recipient_after_marker,
+    )
+    client = _Client(DingTalkSendResult(task_id=1, request_id=None))
+
+    row = dispatch_org_sync_notification(
+        db_session, notification_id=notification_id, settings=settings, client=client
+    )
+
+    assert row.status is DingTalkDeliveryStatus.FAILED
+    assert row.error_code == expected_error
+    assert row.attempt_count == 0
+    assert row.dispatched_at is None
     assert client.calls == []

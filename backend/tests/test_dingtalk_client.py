@@ -47,7 +47,7 @@ def test_token_is_cached_and_action_card_uses_fixed_provider_destinations(monkey
         recipient_user_id="manager-userid",
         title="2026-07 薪资复核",
         markdown="请复核本门店厅面薪资结果。",
-        action_url="https://pay.example.test/comp-appeals?delivery=1",
+        action_url="https://pay.example.test/comp-appeals/1",
     )
 
     assert first_token == second_token == "provider-token"
@@ -84,6 +84,29 @@ def test_action_card_accepts_purpose_specific_button(monkeypatch):
     assert captured["message"]["action_card"]["single_title"] == "查看组织同步"
 
 
+@pytest.mark.parametrize(
+    "action_url",
+    [
+        "http://pay.example.test/org",
+        "https:///org",
+        "https://pay.example.test:invalid/org",
+        "https://user:password@pay.example.test/org",
+        "https://pay.example.test/org?next=https://attacker.example",
+        "https://pay.example.test/org#details",
+    ],
+)
+def test_action_card_rejects_unsafe_action_urls_before_provider_use(action_url):
+    client = DingTalkClient(client_id="ding-client", client_secret="secret", agent_id=123)
+
+    with pytest.raises(DingTalkClientError, match="action URL"):
+        client.send_action_card(
+            recipient_user_id="manager-userid",
+            title="组织同步待确认",
+            markdown="发现 3 项待应用变更，1 项冲突。",
+            action_url=action_url,
+        )
+
+
 def test_provider_http_errors_are_sanitized(monkeypatch):
     def fake_urlopen(request, *, timeout):
         raise HTTPError(request.full_url, 401, "rejected secret=value", {}, None)
@@ -118,7 +141,7 @@ def test_notification_timeout_is_reported_as_an_unknown_send_outcome(monkeypatch
             recipient_user_id="manager-userid",
             title="2026-07 薪资复核",
             markdown="请复核本门店厅面薪资结果。",
-            action_url="https://pay.example.test/comp-appeals?delivery=1",
+            action_url="https://pay.example.test/comp-appeals/1",
         )
 
 
@@ -142,7 +165,7 @@ def test_malformed_notification_response_is_an_unknown_outcome(monkeypatch, payl
             recipient_user_id="manager-userid",
             title="2026-07 薪资复核",
             markdown="请复核本门店厅面薪资结果。",
-            action_url="https://pay.example.test/comp-appeals?delivery=1",
+            action_url="https://pay.example.test/comp-appeals/1",
         )
 
 
