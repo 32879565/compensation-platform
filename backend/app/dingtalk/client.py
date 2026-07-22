@@ -9,6 +9,7 @@ required by DingTalk's current enterprise-app token contract.
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -39,7 +40,7 @@ _MAX_DIRECTORY_USERS = 50_000
 _MAX_PROVIDER_PAGES = 1_000
 _ATTENDANCE_USER_BATCH_SIZE = 50
 _READ_MAX_WORKERS = 8
-_READ_RETRY_DELAYS_SECONDS = (0.25, 0.5, 1.0)
+_READ_RETRY_DELAYS_SECONDS = (0.25, 0.5)
 _ATTENDANCE_MAX_WINDOW = timedelta(days=7)
 
 
@@ -399,7 +400,7 @@ class DingTalkClient:
             except _DingTalkTemporaryError:
                 if attempt >= len(_READ_RETRY_DELAYS_SECONDS):
                     raise
-                time.sleep(_READ_RETRY_DELAYS_SECONDS[attempt])
+                time.sleep(_READ_RETRY_DELAYS_SECONDS[attempt] * random.uniform(0.8, 1.2))
         raise DingTalkClientError("DingTalk is temporarily unreachable")
 
     @staticmethod
@@ -408,14 +409,37 @@ class DingTalkClient:
             raise DingTalkClientError("DingTalk returned an invalid directory response")
         return value
 
-    def list_organization_snapshot(self) -> DingTalkOrganizationSnapshot:
+    def list_organization_snapshot(
+        self,
+        *,
+        root_department_ids: tuple[int, ...] | None = None,
+    ) -> DingTalkOrganizationSnapshot:
         """Read a bounded snapshot of visible departments and their direct members.
 
         DingTalk's department and member endpoints are direct-child/direct-member
         APIs, so both hierarchies are traversed explicitly with hard limits and
-        bounded parallelism. The implicit root department (ID 1) has no metadata
-        in ``listsub`` and is therefore represented only in user memberships.
+        bounded parallelism. Configured roots are synchronization boundaries:
+        their direct members and children are read, but no synthetic department
+        rows are emitted for the roots themselves. The implicit root department
+        (ID 1) remains the default for legacy callers.
         """
+
+        roots: tuple[int, ...]
+        if root_department_ids is None:
+            roots = (1,)
+        else:
+            roots = root_department_ids
+            if (
+                not roots
+                or len(set(roots)) != len(roots)
+                or any(
+                    not isinstance(root_id, int) or isinstance(root_id, bool) or root_id <= 0
+                    for root_id in roots
+                )
+            ):
+                raise ValueError("DingTalk organization roots must be unique positive IDs")
+        if len(roots) > _MAX_DIRECTORY_DEPARTMENTS:
+            raise DingTalkClientError("DingTalk directory exceeds the safety limit")
 
         def child_departments(department_id: int) -> tuple[DingTalkDepartment, ...]:
             payload = self._post_legacy_json(
@@ -543,10 +567,10 @@ class DingTalkClient:
                     raise DingTalkClientError("DingTalk returned an invalid directory cursor")
                 page_cursor = next_cursor
 
-        department_ids = [1]
-        known_department_ids = {1}
+        department_ids = list(roots)
+        known_department_ids = set(roots)
         departments: list[DingTalkDepartment] = []
-        frontier = [1]
+        frontier = list(roots)
         users_by_id: dict[str, DingTalkOrganizationUser] = {}
         with ThreadPoolExecutor(
             max_workers=_READ_MAX_WORKERS,
