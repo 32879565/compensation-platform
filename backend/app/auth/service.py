@@ -365,6 +365,8 @@ def revoke_refresh_token(session: Session, raw_token: str) -> None:
     ).first()
     if rec is None or rec.user_id != user_id:
         return
+    if _expired(rec.expires_at, datetime.now(UTC)):
+        return
     revoke_all_for_user(session, user_id)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -334,3 +335,34 @@ def test_concurrent_refresh_then_revoke_revokes_the_rotated_token(
     finally:
         release_refresh.set()
         _cleanup_user(pg_engine, user_id)
+
+
+def test_expired_presented_token_does_not_revoke_valid_sessions(db_session) -> None:
+    user = User(
+        username=f"expired-logout-{uuid4().hex}",
+        password_hash=hash_password(_PASSWORD),
+    )
+    db_session.add(user)
+    db_session.flush()
+    expired_raw = issue_refresh_token(db_session, user.id)
+    valid_raw = issue_refresh_token(db_session, user.id)
+    tokens = list(
+        db_session.scalars(
+            select(RefreshToken).where(RefreshToken.user_id == user.id).order_by(RefreshToken.id)
+        )
+    )
+    tokens[0].expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    db_session.flush()
+
+    revoke_refresh_token(db_session, expired_raw)
+
+    db_session.expire_all()
+    refreshed_tokens = list(
+        db_session.scalars(
+            select(RefreshToken).where(RefreshToken.user_id == user.id).order_by(RefreshToken.id)
+        )
+    )
+    assert refreshed_tokens[0].revoked_at is None
+    assert refreshed_tokens[1].revoked_at is None
+    rotated_user_id, _rotated_raw = rotate_refresh_token(db_session, valid_raw)
+    assert rotated_user_id == user.id
