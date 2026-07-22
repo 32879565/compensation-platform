@@ -74,6 +74,24 @@ def test_partial_or_non_https_live_dingtalk_configuration_fails_closed(monkeypat
         Settings(_env_file=None)
 
 
+def test_live_dingtalk_manager_review_requires_corp_id(monkeypatch):
+    monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
+    monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
+    monkeypatch.setenv("COMP_DATABASE_URL", "postgresql+psycopg://a:b@localhost/c")
+    monkeypatch.setenv("COMP_DINGTALK_CLIENT_ID", "ding-client")
+    monkeypatch.setenv("COMP_DINGTALK_CLIENT_SECRET", "c" * 48)
+    monkeypatch.setenv("COMP_DINGTALK_AGENT_ID", "123")
+    monkeypatch.setenv("COMP_DINGTALK_MODE", "live")
+    monkeypatch.setenv("COMP_DINGTALK_PUBLIC_BASE_URL", "https://payroll.example.test")
+    monkeypatch.delenv("COMP_DINGTALK_CORP_ID", raising=False)
+
+    with pytest.raises(ValidationError, match="corp_id"):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("COMP_DINGTALK_CORP_ID", "ding-corp")
+    assert Settings(_env_file=None).dingtalk_corp_id == "ding-corp"
+
+
 def test_dingtalk_read_sync_cannot_be_enabled_without_complete_credentials(monkeypatch):
     monkeypatch.setenv("COMP_SECRET_KEY", "a" * 48)
     monkeypatch.setenv("COMP_ENCRYPTION_KEY", "b" * 48)
