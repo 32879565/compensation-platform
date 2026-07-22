@@ -8,6 +8,7 @@ silently recalculated from mutable master data.
 from __future__ import annotations
 
 import calendar
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -44,6 +45,15 @@ class ImportPublishSummary:
     employees: int
     scopes: int
     already_published: bool
+    stores: int = 0
+
+
+@dataclass(frozen=True)
+class ImportPublishTarget:
+    store_id: int
+    store_name: str
+    employee_count: int
+    departments: tuple[Department, ...]
 
 
 @dataclass(frozen=True)
@@ -304,7 +314,115 @@ def _period_dates(period: str) -> tuple[date, date]:
         raise ImportPublishError("计薪月份无效") from None
 
 
-def _published_summary(session: Session, imported: ImportBatch) -> ImportPublishSummary:
+def _normalize_store_selection(
+    store_ids: AbstractSet[int] | None,
+    *,
+    available_store_ids: set[int],
+) -> frozenset[int]:
+    if store_ids is None:
+        selected = frozenset(available_store_ids)
+    else:
+        if not isinstance(store_ids, AbstractSet):
+            raise ImportPublishError("门店选择格式无效")
+        if not store_ids:
+            raise ImportPublishError("至少选择一家门店")
+        if len(store_ids) > 500:
+            raise ImportPublishError("一次最多选择 500 家门店")
+        if any(type(store_id) is not int or store_id <= 0 for store_id in store_ids):
+            raise ImportPublishError("门店 ID 必须是正整数")
+        selected = frozenset(store_ids)
+    if not selected:
+        raise ImportPublishError("至少选择一家门店")
+    unknown_store_ids = selected - available_store_ids
+    if unknown_store_ids:
+        raise ImportPublishError("选中的门店不属于该导入批次")
+    return selected
+
+
+def _target_department(record: SalaryRecord, employee: Employee | None) -> Department | None:
+    fields = record.fields if isinstance(record.fields, dict) else {}
+    selected = _field_value(fields, ("复核部门", "部门", "所属部门"))
+    if selected is not None:
+        _field, raw = selected
+        department = _DEPARTMENT_ALIASES.get("".join(str(raw).split()).upper())
+        if department in {Department.DINING, Department.KITCHEN}:
+            return department
+    if employee is not None and employee.department in {
+        Department.DINING,
+        Department.KITCHEN,
+    }:
+        return employee.department
+    return None
+
+
+def list_import_publish_targets(
+    session: Session,
+    imported: ImportBatch,
+) -> list[ImportPublishTarget]:
+    """List immutable import scopes without validating unrelated employee master data."""
+
+    if imported.source != SalarySource.IMPORT:
+        raise ImportPublishError("仅人事 Excel 导入可以推送复核")
+    if imported.status != ImportStatus.CONFIRMED:
+        raise ImportPublishError("请先确认导入数据，再选择推送门店")
+    records = list(
+        session.scalars(
+            select(SalaryRecord)
+            .where(
+                SalaryRecord.import_batch_id == imported.id,
+                SalaryRecord.source == SalarySource.IMPORT,
+            )
+            .order_by(SalaryRecord.id)
+        ).all()
+    )
+    if not records:
+        raise ImportPublishError("导入批次没有可推送的工资数据")
+
+    store_ids = {record.org_unit_id for record in records if record.org_unit_id is not None}
+    stores = {
+        store.id: store
+        for store in session.scalars(select(OrgUnit).where(OrgUnit.id.in_(store_ids))).all()
+    }
+    employee_ids = {record.employee_id for record in records if record.employee_id is not None}
+    employees = {
+        employee.id: employee
+        for employee in session.scalars(select(Employee).where(Employee.id.in_(employee_ids))).all()
+    }
+    employee_keys: dict[int, set[int]] = {}
+    departments: dict[int, set[Department]] = {}
+    for record in records:
+        if record.org_unit_id is None or record.org_unit_id not in stores:
+            continue
+        employee_key = record.employee_id if record.employee_id is not None else -record.id
+        employee_keys.setdefault(record.org_unit_id, set()).add(employee_key)
+        employee = employees.get(record.employee_id) if record.employee_id is not None else None
+        department = _target_department(record, employee)
+        if department is not None:
+            departments.setdefault(record.org_unit_id, set()).add(department)
+
+    department_order = {
+        Department.DINING: 0,
+        Department.KITCHEN: 1,
+    }
+    return [
+        ImportPublishTarget(
+            store_id=store_id,
+            store_name=stores[store_id].name,
+            employee_count=len(employee_keys.get(store_id, set())),
+            departments=tuple(
+                sorted(departments.get(store_id, set()), key=department_order.__getitem__)
+            ),
+        )
+        for store_id in sorted(employee_keys)
+    ]
+
+
+def _published_summary(
+    session: Session,
+    imported: ImportBatch,
+    *,
+    selected_store_ids: frozenset[int],
+) -> ImportPublishSummary:
     if imported.published_batch_id is None or imported.published_batch_version is None:
         raise ImportPublishError("导入批次的发布关联不完整，请联系系统管理员")
     payroll_batch = session.get(PayrollBatch, imported.published_batch_id)
@@ -312,6 +430,27 @@ def _published_summary(session: Session, imported: ImportBatch) -> ImportPublish
         raise ImportPublishError("已发布的薪资批次不存在，请联系系统管理员")
     if payroll_batch.version != imported.published_batch_version:
         raise ImportPublishError("该导入已发布到历史版本；请上传修正后的新文件")
+    result_store_ids = set(
+        session.scalars(
+            select(PayrollResult.org_unit_id).where(
+                PayrollResult.source_import_batch_id == imported.id,
+                PayrollResult.batch_id == payroll_batch.id,
+                PayrollResult.batch_version == imported.published_batch_version,
+            )
+        ).all()
+    )
+    confirmation_store_ids = set(
+        session.scalars(
+            select(BatchConfirmation.org_unit_id).where(
+                BatchConfirmation.batch_id == payroll_batch.id,
+                BatchConfirmation.batch_version == imported.published_batch_version,
+            )
+        ).all()
+    )
+    if None in result_store_ids or result_store_ids != confirmation_store_ids:
+        raise ImportPublishError("已发布的薪资复核范围不完整，请联系系统管理员")
+    if result_store_ids != selected_store_ids:
+        raise ImportPublishError("该导入批次已经按其他门店范围发布")
     employees = (
         session.scalar(
             select(func.count())
@@ -344,10 +483,16 @@ def _published_summary(session: Session, imported: ImportBatch) -> ImportPublish
         employees=int(employees),
         scopes=int(scopes),
         already_published=True,
+        stores=len(result_store_ids),
     )
 
 
-def publish_import_for_review(session: Session, imported: ImportBatch) -> ImportPublishSummary:
+def publish_import_for_review(
+    session: Session,
+    imported: ImportBatch,
+    *,
+    store_ids: AbstractSet[int] | None = None,
+) -> ImportPublishSummary:
     """Create one immutable payroll-result round from a confirmed import.
 
     The transaction is serialized with calculation and source correction.  All
@@ -360,8 +505,6 @@ def publish_import_for_review(session: Session, imported: ImportBatch) -> Import
         raise ImportPublishError("仅人事 Excel 导入可以推送复核")
     if imported.status != ImportStatus.CONFIRMED:
         raise ImportPublishError("请先确认导入数据，再推送复核")
-    if imported.published_batch_id is not None:
-        return _published_summary(session, imported)
     if not imported.period:
         raise ImportPublishError("导入批次缺少计薪月份")
 
@@ -378,7 +521,27 @@ def publish_import_for_review(session: Session, imported: ImportBatch) -> Import
     )
     if not records:
         raise ImportPublishError("导入批次没有可推送的工资数据")
-    employee_ids = {record.employee_id for record in records if record.employee_id is not None}
+    available_store_ids = {
+        record.org_unit_id for record in records if record.org_unit_id is not None
+    }
+    selected_store_ids = _normalize_store_selection(
+        store_ids,
+        available_store_ids=available_store_ids,
+    )
+    if imported.published_batch_id is not None:
+        return _published_summary(
+            session,
+            imported,
+            selected_store_ids=selected_store_ids,
+        )
+    selected_records = (
+        records
+        if store_ids is None
+        else [record for record in records if record.org_unit_id in selected_store_ids]
+    )
+    employee_ids = {
+        record.employee_id for record in selected_records if record.employee_id is not None
+    }
     employees = {
         employee.id: employee
         for employee in session.scalars(
@@ -396,7 +559,7 @@ def publish_import_for_review(session: Session, imported: ImportBatch) -> Import
     }
     attendance_start, attendance_end = _period_dates(imported.period)
     validated = _validate_records(
-        records,
+        selected_records,
         employees,
         org_units,
         period=imported.period,
@@ -553,4 +716,5 @@ def publish_import_for_review(session: Session, imported: ImportBatch) -> Import
         employees=len(validated),
         scopes=len(scopes),
         already_published=False,
+        stores=len(selected_store_ids),
     )

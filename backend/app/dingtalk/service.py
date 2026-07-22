@@ -7,6 +7,7 @@ recipient ids are copied into delivery/audit records.
 
 from __future__ import annotations
 
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -58,6 +59,7 @@ class DeliveryStageSummary:
     configuration_failures: int
     existing: int
     pending_delivery_ids: tuple[int, ...] = ()
+    scopes: int = 0
 
 
 def _now(session: Session) -> datetime:
@@ -255,11 +257,28 @@ def _existing_review_delivery(
     ).first()
 
 
+def _normalize_review_org_unit_ids(
+    org_unit_ids: AbstractSet[int] | None,
+) -> frozenset[int] | None:
+    if org_unit_ids is None:
+        return None
+    if not isinstance(org_unit_ids, AbstractSet):
+        raise DingTalkError("Review store selection must be a set of positive integers")
+    if not org_unit_ids:
+        raise DingTalkError("At least one review store must be selected")
+    if len(org_unit_ids) > 500:
+        raise DingTalkError("At most 500 review stores may be selected")
+    if any(type(org_unit_id) is not int or org_unit_id <= 0 for org_unit_id in org_unit_ids):
+        raise DingTalkError("Review store ids must be positive integers")
+    return frozenset(org_unit_ids)
+
+
 def stage_review_deliveries(
     session: Session,
     *,
     batch_id: int,
     settings: Settings | None = None,
+    org_unit_ids: AbstractSet[int] | None = None,
 ) -> DeliveryStageSummary:
     """Create one delivery per current confirmation scope.
 
@@ -268,6 +287,7 @@ def stage_review_deliveries(
     failure instead of selecting a broader recipient.
     """
 
+    selected_org_unit_ids = _normalize_review_org_unit_ids(org_unit_ids)
     active_settings = settings or get_settings()
     batch = session.scalars(
         select(PayrollBatch).where(PayrollBatch.id == batch_id).with_for_update()
@@ -289,6 +309,16 @@ def stage_review_deliveries(
     )
     if not confirmations:
         raise DingTalkError("Payroll batch has no review scopes to notify")
+    available_org_unit_ids = {confirmation.org_unit_id for confirmation in confirmations}
+    if selected_org_unit_ids is not None:
+        unknown_org_unit_ids = selected_org_unit_ids - available_org_unit_ids
+        if unknown_org_unit_ids:
+            raise DingTalkError("Selected stores do not belong to this payroll review round")
+        confirmations = [
+            confirmation
+            for confirmation in confirmations
+            if confirmation.org_unit_id in selected_org_unit_ids
+        ]
 
     routed = configuration_failures = existing = 0
     pending_deliveries: list[DingTalkDelivery] = []
@@ -376,6 +406,7 @@ def stage_review_deliveries(
         configuration_failures=configuration_failures,
         existing=existing,
         pending_delivery_ids=tuple(delivery.id for delivery in pending_deliveries),
+        scopes=len(confirmations),
     )
 
 

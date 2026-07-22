@@ -337,6 +337,7 @@ describe('ImportsPage salary workbook workflow', () => {
     fireEvent.click(await screen.findByRole('button', { name: '确认写入薪资记录' }))
     fireEvent.click(await screen.findByRole('checkbox', { name: /一店/ }))
     fireEvent.click(await screen.findByRole('button', { name: '推送给店长和厨房经理' }))
+    fireEvent.click(await screen.findByRole('button', { name: '确认推送' }))
 
     expect(await screen.findByText('复核任务已生成，部分通知配置失败')).toBeTruthy()
     expect(importsApi.publishSalaryImport).toHaveBeenNthCalledWith(1, 8, [101])

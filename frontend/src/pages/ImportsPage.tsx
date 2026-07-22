@@ -1,17 +1,19 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Alert, Button, Card, Descriptions, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Descriptions, Modal, Space, Table, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import {
   confirmSalaryImport,
+  fetchSalaryImportPublishTargets,
   fetchSalaryImportRows,
   publishSalaryImport,
   uploadSalaryImport,
   type SalaryImportBatchSummary,
   type SalaryImportConfirmResult,
   type SalaryImportPublishResult,
+  type SalaryImportPublishTarget,
   type SalaryImportStagingRow,
 } from '../api/imports'
 import { useAuth } from '../auth/AuthContext'
@@ -72,6 +74,10 @@ function fieldValueText(value: unknown): string {
   }
 }
 
+function departmentLabel(department: SalaryImportPublishTarget['departments'][number]): string {
+  return department === 'DINING' ? '厅面' : '厨房'
+}
+
 export default function ImportsPage() {
   const { user, hasPermission, hasGlobalPermission } = useAuth()
   const queryScope = user?.username ?? 'anonymous'
@@ -87,6 +93,10 @@ export default function ImportsPage() {
   const [confirmation, setConfirmation] = useState<SalaryImportConfirmResult | null>(null)
   const [confirmationRecovered, setConfirmationRecovered] = useState(false)
   const [publishResult, setPublishResult] = useState<SalaryImportPublishResult | null>(null)
+  const [selectedStoreIds, setSelectedStoreIds] = useState<number[]>([])
+  const [pendingPublishStoreIds, setPendingPublishStoreIds] = useState<number[]>([])
+  const [lockedPublishStoreIds, setLockedPublishStoreIds] = useState<number[] | null>(null)
+  const [publishConfirmOpen, setPublishConfirmOpen] = useState(false)
   const [feedback, setFeedback] = useState<string | null>(null)
 
   const rowsQuery = useQuery({
@@ -109,6 +119,32 @@ export default function ImportsPage() {
       rowCountMismatch ||
       batch.total_rows === 0)
 
+  const publishTargetsQuery = useQuery({
+    queryKey: ['salaryImportPublishTargets', queryScope, batch?.id],
+    queryFn: () => fetchSalaryImportPublishTargets(batch!.id),
+    enabled: batch !== null && confirmation !== null && canPublish && publishResult === null,
+    staleTime: Number.POSITIVE_INFINITY,
+    gcTime: 0,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
+  const publishTargets = publishTargetsQuery.data ?? []
+
+  function orderedStoreIds(storeIds: number[]): number[] {
+    const requested = new Set(storeIds)
+    return publishTargets
+      .filter((target) => requested.has(target.store_id))
+      .map((target) => target.store_id)
+  }
+
+  function targetNames(storeIds: number[]): string {
+    const requested = new Set(storeIds)
+    return publishTargets
+      .filter((target) => requested.has(target.store_id))
+      .map((target) => target.store_name)
+      .join('、')
+  }
+
   const uploadMutation = useMutation({
     mutationFn: ({ uploadPeriod, uploadFile }: { uploadPeriod: string; uploadFile: File }) =>
       uploadSalaryImport(uploadPeriod, uploadFile),
@@ -118,6 +154,10 @@ export default function ImportsPage() {
       setConfirmation(null)
       setConfirmationRecovered(false)
       setPublishResult(null)
+      setSelectedStoreIds([])
+      setPendingPublishStoreIds([])
+      setLockedPublishStoreIds(null)
+      setPublishConfirmOpen(false)
     },
     onSuccess: setBatch,
     onError: (error) => setFeedback(importErrorMessage(error)),
@@ -136,6 +176,7 @@ export default function ImportsPage() {
     onSuccess: (result) => {
       setConfirmation(result)
       setConfirmationRecovered(false)
+      setSelectedStoreIds([])
       setBatch((current) => (current ? { ...current, status: 'CONFIRMED' } : current))
     },
     onError: (error, importBatch) => {
@@ -143,6 +184,7 @@ export default function ImportsPage() {
       if (parsed.status === 409 && parsed.message === '批次已确认') {
         setConfirmation({ written: importBatch.total_rows })
         setConfirmationRecovered(true)
+        setSelectedStoreIds([])
         setBatch((current) => (current ? { ...current, status: 'CONFIRMED' } : current))
         setFeedback(null)
         return
@@ -154,14 +196,19 @@ export default function ImportsPage() {
     },
   })
   const publishMutation = useMutation({
-    mutationFn: async (importBatch: SalaryImportBatchSummary) => {
-      if (!canPublish || confirmation === null) {
+    mutationFn: async ({ batchId, storeIds }: { batchId: number; storeIds: number[] }) => {
+      if (!canPublish || confirmation === null || storeIds.length === 0) {
         throw new Error('当前批次尚未确认或账号缺少薪资核算权限')
       }
-      return publishSalaryImport(importBatch.id)
+      return publishSalaryImport(batchId, storeIds)
     },
     onMutate: () => setFeedback(null),
-    onSuccess: setPublishResult,
+    onSuccess: (result, request) => {
+      setPublishResult(result)
+      setLockedPublishStoreIds([...request.storeIds])
+      setPendingPublishStoreIds([])
+      setPublishConfirmOpen(false)
+    },
     onError: (error) => setFeedback(importErrorMessage(error)),
     onSettled: () => {
       publishInFlightRef.current = false
@@ -176,6 +223,10 @@ export default function ImportsPage() {
     setConfirmation(null)
     setConfirmationRecovered(false)
     setPublishResult(null)
+    setSelectedStoreIds([])
+    setPendingPublishStoreIds([])
+    setLockedPublishStoreIds(null)
+    setPublishConfirmOpen(false)
     setFeedback(null)
   }
 
@@ -249,6 +300,37 @@ export default function ImportsPage() {
               <li key={`${index}-${errorEntryText(entry)}`}>{errorEntryText(entry)}</li>
             ))}
           </ul>
+        ) : (
+          '—'
+        ),
+    },
+  ]
+
+  const publishTargetColumns: TableProps<SalaryImportPublishTarget>['columns'] = [
+    {
+      title: '门店',
+      dataIndex: 'store_name',
+      width: 220,
+    },
+    {
+      title: '员工数',
+      dataIndex: 'employee_count',
+      width: 120,
+      render: (count: number) => `${count} 人`,
+    },
+    {
+      title: '复核部门',
+      dataIndex: 'departments',
+      width: 220,
+      render: (departments: SalaryImportPublishTarget['departments']) =>
+        departments.length ? (
+          <Space size={[4, 4]} wrap>
+            {departments.map((department) => (
+              <Tag key={department} color={department === 'DINING' ? 'blue' : 'orange'}>
+                {departmentLabel(department)}
+              </Tag>
+            ))}
+          </Space>
         ) : (
           '—'
         ),
@@ -443,19 +525,105 @@ export default function ImportsPage() {
 
           {confirmation && publishResult === null ? (
             canPublish ? (
-              <Button
-                type="primary"
-                loading={publishMutation.isPending}
-                disabled={publishMutation.isPending}
-                style={{ marginTop: 16 }}
-                onClick={() => {
-                  if (publishInFlightRef.current) return
-                  publishInFlightRef.current = true
-                  publishMutation.mutate(batch)
-                }}
-              >
-                推送给店长和厨房经理
-              </Button>
+              <Card size="small" title="选择推送门店" style={{ marginTop: 16 }}>
+                {publishTargetsQuery.isError ? (
+                  <Alert
+                    type="error"
+                    showIcon
+                    message="可推送门店读取失败，已禁止推送"
+                    description={importErrorMessage(publishTargetsQuery.error)}
+                    action={
+                      <Button
+                        size="small"
+                        loading={publishTargetsQuery.isFetching}
+                        onClick={() => void publishTargetsQuery.refetch()}
+                      >
+                        重新读取
+                      </Button>
+                    }
+                  />
+                ) : publishTargetsQuery.isSuccess && publishTargets.length === 0 ? (
+                  <Alert type="warning" showIcon message="该批次没有可推送的门店，已禁止推送" />
+                ) : (
+                  <>
+                    <Space wrap style={{ marginBottom: 12 }}>
+                      <Typography.Text>
+                        已选择 {selectedStoreIds.length} / {publishTargets.length} 家门店
+                      </Typography.Text>
+                      <Button
+                        size="small"
+                        disabled={
+                          publishTargetsQuery.isLoading ||
+                          publishTargetsQuery.isFetching ||
+                          publishTargets.length === 0 ||
+                          selectedStoreIds.length === publishTargets.length
+                        }
+                        onClick={() =>
+                          setSelectedStoreIds(publishTargets.map((target) => target.store_id))
+                        }
+                      >
+                        全选
+                      </Button>
+                      <Button
+                        size="small"
+                        disabled={selectedStoreIds.length === 0}
+                        onClick={() => setSelectedStoreIds([])}
+                      >
+                        清空
+                      </Button>
+                    </Space>
+                    <div
+                      role="region"
+                      aria-label="可推送门店"
+                      tabIndex={0}
+                      style={{ overflowX: 'auto' }}
+                    >
+                      <Table
+                        rowKey="store_id"
+                        loading={publishTargetsQuery.isLoading || publishTargetsQuery.isFetching}
+                        columns={publishTargetColumns}
+                        dataSource={publishTargets}
+                        pagination={false}
+                        rowSelection={{
+                          type: 'checkbox',
+                          selectedRowKeys: selectedStoreIds,
+                          onChange: (rowKeys) =>
+                            setSelectedStoreIds(
+                              orderedStoreIds(rowKeys.map((rowKey) => Number(rowKey))),
+                            ),
+                          getCheckboxProps: (target) =>
+                            ({
+                              title: `选择门店 ${target.store_name}`,
+                              'aria-label': `选择门店 ${target.store_name}`,
+                            }) as { title: string },
+                        }}
+                        scroll={{ x: 620 }}
+                        size="small"
+                      />
+                    </div>
+                    <Button
+                      type="primary"
+                      loading={publishMutation.isPending}
+                      disabled={
+                        publishTargetsQuery.isLoading ||
+                        publishTargetsQuery.isFetching ||
+                        publishTargetsQuery.isError ||
+                        selectedStoreIds.length === 0 ||
+                        publishMutation.isPending
+                      }
+                      style={{ marginTop: 16 }}
+                      onClick={() => {
+                        const storeIds = orderedStoreIds(selectedStoreIds)
+                        if (storeIds.length === 0) return
+                        setPendingPublishStoreIds(storeIds)
+                        setPublishConfirmOpen(true)
+                      }}
+                    >
+                      推送给店长和厨房经理
+                    </Button>
+                  </>
+                )}
+              </Card>
             ) : (
               <Alert
                 type="info"
@@ -493,6 +661,9 @@ export default function ImportsPage() {
                       {publishResult.configuration_failures} 人 · 已存在 {publishResult.existing} 人
                       ·{publishResult.sandbox ? '沙箱模式' : '正式模式'}
                     </span>
+                    {lockedPublishStoreIds ? (
+                      <span>推送门店：{targetNames(lockedPublishStoreIds)}（范围已锁定）</span>
+                    ) : null}
                     {canReadPayroll ? (
                       <Link to="/payroll">查看薪资批次</Link>
                     ) : (
@@ -509,9 +680,17 @@ export default function ImportsPage() {
                   disabled={publishMutation.isPending}
                   style={{ marginTop: 12 }}
                   onClick={() => {
-                    if (publishInFlightRef.current) return
+                    if (
+                      publishInFlightRef.current ||
+                      lockedPublishStoreIds === null ||
+                      lockedPublishStoreIds.length === 0
+                    )
+                      return
                     publishInFlightRef.current = true
-                    publishMutation.mutate(batch)
+                    publishMutation.mutate({
+                      batchId: batch.id,
+                      storeIds: [...lockedPublishStoreIds],
+                    })
                   }}
                 >
                   修复配置后重试推送
@@ -530,6 +709,33 @@ export default function ImportsPage() {
           ) : null}
         </Card>
       ) : null}
+      <Modal
+        title="确认推送薪资复核？"
+        open={publishConfirmOpen}
+        okText="确认推送"
+        cancelText="取消"
+        confirmLoading={publishMutation.isPending}
+        okButtonProps={{ disabled: pendingPublishStoreIds.length === 0 }}
+        cancelButtonProps={{ disabled: publishMutation.isPending }}
+        closable={!publishMutation.isPending}
+        maskClosable={!publishMutation.isPending}
+        onCancel={() => {
+          if (publishMutation.isPending) return
+          setPublishConfirmOpen(false)
+          setPendingPublishStoreIds([])
+        }}
+        onOk={() => {
+          if (batch === null || pendingPublishStoreIds.length === 0 || publishInFlightRef.current)
+            return
+          const storeIds = [...pendingPublishStoreIds]
+          publishInFlightRef.current = true
+          setPublishConfirmOpen(false)
+          publishMutation.mutate({ batchId: batch.id, storeIds })
+        }}
+      >
+        <Typography.Paragraph>将向以下门店的店长和厨房经理推送薪资复核：</Typography.Paragraph>
+        <Typography.Text strong>{targetNames(pendingPublishStoreIds)}</Typography.Text>
+      </Modal>
     </div>
   )
 }
