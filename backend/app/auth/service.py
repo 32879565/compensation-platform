@@ -348,6 +348,14 @@ def rotate_refresh_token(session: Session, raw_token: str) -> tuple[int, str]:
 
 
 def revoke_refresh_token(session: Session, raw_token: str) -> None:
+    """Revoke every refresh session for the token's account.
+
+    Refresh tokens rotate, so the cookie presented by a logout request may
+    already have produced a successor in a concurrent request.  The User row
+    is the lifecycle lock; once held, revoke every active token so that the
+    successor cannot escape logout.
+    """
+
     digest = hash_refresh_token(raw_token)
     user_id = session.scalar(select(RefreshToken.user_id).where(RefreshToken.token_hash == digest))
     if user_id is None or _lock_user_for_update(session, user_id) is None:
@@ -357,9 +365,7 @@ def revoke_refresh_token(session: Session, raw_token: str) -> None:
     ).first()
     if rec is None or rec.user_id != user_id:
         return
-    if rec.revoked_at is None:
-        rec.revoked_at = datetime.now(UTC)
-        session.flush()
+    revoke_all_for_user(session, user_id)
 
 
 def revoke_all_for_user(session: Session, user_id: int) -> None:

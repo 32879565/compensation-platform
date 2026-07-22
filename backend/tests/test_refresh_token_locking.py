@@ -249,7 +249,10 @@ def test_concurrent_login_then_revoke_leaves_no_active_refresh_token(pg_engine) 
         _cleanup_user(pg_engine, user_id)
 
 
-def test_concurrent_refresh_then_revoke_revokes_the_rotated_token(pg_engine) -> None:
+@pytest.mark.parametrize("revoke_mode", ["account", "presented_token"])
+def test_concurrent_refresh_then_revoke_revokes_the_rotated_token(
+    pg_engine, revoke_mode: str
+) -> None:
     user_id, _username = _seed_user(pg_engine, "refresh-revoke")
     with Session(pg_engine) as session:
         raw = issue_refresh_token(session, user_id)
@@ -298,7 +301,10 @@ def test_concurrent_refresh_then_revoke_revokes_the_rotated_token(pg_engine) -> 
 
             event.listen(connection, "before_cursor_execute", note_user_lock_attempt)
             try:
-                revoke_all_for_user(session, user_id)
+                if revoke_mode == "account":
+                    revoke_all_for_user(session, user_id)
+                else:
+                    revoke_refresh_token(session, raw)
                 session.commit()
                 revoke_done.set()
             finally:
