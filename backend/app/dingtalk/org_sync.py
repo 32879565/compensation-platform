@@ -29,6 +29,7 @@ from app.dingtalk.client import (
     DingTalkOrganizationSnapshot,
     DingTalkOrganizationUser,
 )
+from app.dingtalk.org_freshness import invalidate_applied_reviewer_proofs
 from app.dingtalk.org_rules import manager_department_for_title
 from app.dingtalk.org_structure import (
     ClassifiedNode,
@@ -132,6 +133,7 @@ class OrganizationPreview:
 
 @dataclass(frozen=True)
 class OrganizationApplyResult:
+    applied_regions: int
     applied_stores: int
     applied_reviewers: int
     unresolved: int
@@ -160,6 +162,7 @@ def get_applied_organization_sync_result(
         )
     )
     return OrganizationApplyResult(
+        applied_regions=batch.ready_region_count,
         applied_stores=batch.ready_store_count,
         applied_reviewers=batch.ready_reviewer_count,
         unresolved=int(unresolved or 0),
@@ -639,6 +642,14 @@ def _create_store_baseline(
     )
 
 
+def _dingtalk_org_code(kind: DingTalkOrgSyncItemKind | OrgType, remote_id: int) -> str:
+    if kind in (DingTalkOrgSyncItemKind.REGION, OrgType.REGION):
+        return f"DINGTALK-R-{remote_id}"
+    if kind in (DingTalkOrgSyncItemKind.STORE, OrgType.STORE):
+        return f"DINGTALK-S-{remote_id}"
+    raise RuntimeError("reviewer items do not have organization codes")
+
+
 def _lock_org_unit_table_against_phantoms(session: Session) -> None:
     if session.get_bind().dialect.name == "postgresql":
         session.execute(text("LOCK TABLE org_unit IN SHARE ROW EXCLUSIVE MODE"))
@@ -924,7 +935,10 @@ def _plan_organization_nodes(
         change_fields: list[str] = []
         if proposed is None:
             action = DingTalkOrgSyncAction.CREATE
-            if f"DINGTALK-{remote.department_id}" in authority.org_units_by_code:
+            if (
+                _dingtalk_org_code(DingTalkOrgSyncItemKind(node.kind.value), remote.department_id)
+                in authority.org_units_by_code
+            ):
                 conflict_code = conflict_code or "ORG_PATH_AMBIGUOUS"
         else:
             matched_local_ids.add(proposed.id)
@@ -951,7 +965,9 @@ def _plan_organization_nodes(
         baseline = (
             _create_store_baseline(
                 parent=proposed_parent,
-                code=f"DINGTALK-{remote.department_id}",
+                code=_dingtalk_org_code(
+                    DingTalkOrgSyncItemKind(node.kind.value), remote.department_id
+                ),
                 name=remote.name,
             )
             if proposed is None
@@ -1823,6 +1839,7 @@ def apply_organization_sync(
     unresolved = sum(item.status == DingTalkOrgSyncItemStatus.CONFLICT for item in items)
     if batch.status == DingTalkOrgSyncBatchStatus.APPLIED:
         result = OrganizationApplyResult(
+            applied_regions=batch.ready_region_count,
             applied_stores=batch.ready_store_count,
             applied_reviewers=batch.ready_reviewer_count,
             unresolved=unresolved,
@@ -1834,6 +1851,12 @@ def apply_organization_sync(
         session.rollback()
         raise DingTalkOrganizationSyncError(
             "BATCH_STALE", "Organization preview is stale; preview again"
+        )
+    if any(item.status == DingTalkOrgSyncItemStatus.CONFLICT for item in items):
+        session.rollback()
+        raise DingTalkOrganizationSyncError(
+            "ORG_PREVIEW_HAS_CONFLICTS",
+            "Organization conflicts must be resolved before confirmation",
         )
     if _as_utc(batch.expires_at) <= current_time:
         _mark_batch_stale(session, batch, items, actor=actor, error_code="PREVIEW_EXPIRED")
@@ -1876,12 +1899,6 @@ def apply_organization_sync(
             "Organization data changed during confirmation; preview again",
         )
 
-    if any(item.status == DingTalkOrgSyncItemStatus.CONFLICT for item in items):
-        session.rollback()
-        raise DingTalkOrganizationSyncError(
-            "ORG_PREVIEW_HAS_CONFLICTS",
-            "Organization conflicts must be resolved before confirmation",
-        )
     if _snapshot_hash(fresh_snapshot, encryption_key=encryption_key) != batch.snapshot_hash:
         _mark_batch_stale(
             session, batch, items, actor=actor, error_code="PROVIDER_SNAPSHOT_CHANGED"
@@ -1889,12 +1906,6 @@ def apply_organization_sync(
         raise DingTalkOrganizationSyncError(
             "PROVIDER_SNAPSHOT_CHANGED",
             "DingTalk organization changed; preview again",
-        )
-    if any(item.kind == DingTalkOrgSyncItemKind.REGION for item in items):
-        session.rollback()
-        raise DingTalkOrganizationSyncError(
-            "ORG_REGION_APPLY_NOT_SUPPORTED",
-            "Region changes require the hierarchy apply transaction",
         )
     (
         org_units_by_id,
@@ -1905,6 +1916,7 @@ def apply_organization_sync(
         scope_users_by_pair,
     ) = _state_indexes(state)
     org_units_by_code = {org.code: org for org in state.org_units}
+    original_scope_users_by_pair = dict(scope_users_by_pair)
 
     stale = False
     for item in items:
@@ -1913,7 +1925,7 @@ def apply_organization_sync(
                 parent = _optional_get(org_units_by_id, item.proposed_parent_org_unit_id)
                 expected = _create_store_baseline(
                     parent=parent,
-                    code=f"DINGTALK-{item.remote_department_id}",
+                    code=_dingtalk_org_code(item.kind, item.remote_department_id),  # type: ignore[arg-type]
                     name=item.remote_department_name,
                 )
             else:
@@ -1957,6 +1969,12 @@ def apply_organization_sync(
             user
         )
 
+    ready_region_items = [
+        item
+        for item in items
+        if item.kind == DingTalkOrgSyncItemKind.REGION
+        and item.status == DingTalkOrgSyncItemStatus.READY
+    ]
     ready_store_items = [
         item
         for item in items
@@ -1969,6 +1987,7 @@ def apply_organization_sync(
         if item.kind == DingTalkOrgSyncItemKind.REVIEWER
         and item.status == DingTalkOrgSyncItemStatus.READY
     ]
+    ready_node_items = [*ready_region_items, *ready_store_items]
     manager_role = next((role for role in state.roles if role.code == "STORE_MANAGER"), None)
     if manager_role is None:
         session.rollback()
@@ -2050,17 +2069,38 @@ def apply_organization_sync(
                     "Organization data changed during confirmation; preview again",
                 )
 
+    region_changes: list[dict[str, object]] = []
     store_changes: list[dict[str, object]] = []
     reviewer_changes: list[dict[str, object]] = []
-    stores_by_remote_id: dict[int, OrgUnit] = {}
+    nodes_by_remote_id: dict[int, OrgUnit] = {}
     assigned_roles = {(assignment.user_id, assignment.role_id) for assignment in state.user_roles}
     usernames = {user.username for user in state.users}
+    remote_parent_by_id = {
+        department.department_id: department.parent_id for department in fresh_snapshot.departments
+    }
+
+    def item_depth(item: DingTalkOrgSyncItem) -> int:
+        return item.remote_department_path.count(" / ") + 1
+
+    def resolve_node_parent(item: DingTalkOrgSyncItem) -> OrgUnit | None:
+        parent = _optional_get(org_units_by_id, item.proposed_parent_org_unit_id)
+        if parent is not None:
+            return parent
+        if item.remote_department_id is None:
+            return None
+        remote_parent_id = remote_parent_by_id.get(item.remote_department_id)
+        return nodes_by_remote_id.get(remote_parent_id) if remote_parent_id is not None else None
+
     try:
-        for item in ready_store_items:
+        active_node_items = sorted(
+            (item for item in ready_node_items if item.action != DingTalkOrgSyncAction.DEACTIVATE),
+            key=lambda item: (item_depth(item), item.remote_department_id or 0, item.id),
+        )
+        for item in active_node_items:
             action = item.action
             remote_department_id = item.remote_department_id
-            if remote_department_id is None and action != DingTalkOrgSyncAction.DEACTIVATE:
-                raise RuntimeError("ready store item is missing its remote department")
+            if remote_department_id is None:
+                raise RuntimeError("ready organization item is missing its remote department")
             before_store = _optional_get(org_units_by_id, item.proposed_org_unit_id)
             before_state = (
                 {
@@ -2071,19 +2111,15 @@ def apply_organization_sync(
                 if before_store is not None
                 else None
             )
-            if action == DingTalkOrgSyncAction.DEACTIVATE:
-                if before_store is None:
-                    raise _ConcurrentChange("store baseline changed")
-                applied_store = before_store
-                applied_store.status = "HISTORICAL"
-            elif action == DingTalkOrgSyncAction.CREATE:
-                parent = _optional_get(org_units_by_id, item.proposed_parent_org_unit_id)
-                if parent is None or f"DINGTALK-{remote_department_id}" in org_units_by_code:
-                    raise _ConcurrentChange("create store baseline changed")
+            if action == DingTalkOrgSyncAction.CREATE:
+                parent = resolve_node_parent(item)
+                code = _dingtalk_org_code(item.kind, remote_department_id)
+                if parent is None or code in org_units_by_code:
+                    raise _ConcurrentChange("create organization baseline changed")
                 applied_store = OrgUnit(
-                    code=f"DINGTALK-{remote_department_id}",
+                    code=code,
                     name=item.remote_department_name,
-                    type=OrgType.STORE,
+                    type=OrgType(item.kind.value),
                     parent_id=parent.id,
                     dingtalk_dept_id=remote_department_id,
                     city=None,
@@ -2096,20 +2132,28 @@ def apply_organization_sync(
                 org_units_by_code[applied_store.code] = applied_store
             else:
                 if before_store is None:
-                    raise _ConcurrentChange("store baseline changed")
+                    raise _ConcurrentChange("organization baseline changed")
                 applied_store = before_store
-                applied_store.dingtalk_dept_id = remote_department_id
-                if action in {DingTalkOrgSyncAction.ACTIVATE, DingTalkOrgSyncAction.UPDATE}:
+                if action in {DingTalkOrgSyncAction.LINK, DingTalkOrgSyncAction.ACTIVATE}:
+                    applied_store.dingtalk_dept_id = remote_department_id
+                if action == DingTalkOrgSyncAction.ACTIVATE:
                     applied_store.status = "ACTIVE"
                 if action in {DingTalkOrgSyncAction.ACTIVATE, DingTalkOrgSyncAction.UPDATE}:
                     if "name" in item.change_fields:
                         applied_store.name = item.remote_department_name
                     if "parent_id" in item.change_fields:
-                        applied_store.parent_id = item.proposed_parent_org_unit_id
-            if remote_department_id is not None:
-                stores_by_remote_id[remote_department_id] = applied_store
+                        parent = resolve_node_parent(item)
+                        if parent is None:
+                            raise _ConcurrentChange("organization parent baseline changed")
+                        applied_store.parent_id = parent.id
+                    if "dingtalk_dept_id" in item.change_fields:
+                        applied_store.dingtalk_dept_id = remote_department_id
+            nodes_by_remote_id[remote_department_id] = applied_store
             item.status = DingTalkOrgSyncItemStatus.APPLIED
-            store_changes.append(
+            changes = (
+                region_changes if item.kind == DingTalkOrgSyncItemKind.REGION else store_changes
+            )
+            changes.append(
                 {
                     "item_id": item.id,
                     "action": action.value,
@@ -2122,24 +2166,107 @@ def apply_organization_sync(
                 }
             )
 
+        # Remove every affected authorization edge and revoke every displaced
+        # account before any node becomes historical.
+        deactivate_items = [
+            item for item in ready_node_items if item.action == DingTalkOrgSyncAction.DEACTIVATE
+        ]
+        children_by_parent: dict[int, list[int]] = defaultdict(list)
+        for organization in state.org_units:
+            if organization.parent_id is not None:
+                children_by_parent[organization.parent_id].append(organization.id)
+
+        deactivated_store_ids: set[int] = set()
+        for item in deactivate_items:
+            deactivate_root = _optional_get(org_units_by_id, item.proposed_org_unit_id)
+            if deactivate_root is None:
+                raise _ConcurrentChange("organization baseline changed")
+            stack = [deactivate_root.id]
+            while stack:
+                organization_id = stack.pop()
+                descendant = org_units_by_id[organization_id]
+                if descendant.type == OrgType.STORE:
+                    deactivated_store_ids.add(descendant.id)
+                stack.extend(children_by_parent.get(organization_id, ()))
+
+        affected_scope_pairs: set[tuple[int, Department]] = set()
+        for item in ready_reviewer_items:
+            department = _required_reviewer_department(item)
+            target = _optional_get(org_units_by_id, item.proposed_org_unit_id)
+            if target is None and item.remote_department_id is not None:
+                target = nodes_by_remote_id.get(item.remote_department_id)
+            if target is None:
+                raise _ConcurrentChange("reviewer organization baseline changed")
+            item.proposed_org_unit_id = target.id
+            affected_scope_pairs.add((target.id, department))
+        affected_scope_pairs.update(
+            (scope.org_unit_id, scope.department)
+            for scope in state.review_scopes
+            if scope.org_unit_id in deactivated_store_ids
+        )
+        displaced_user_ids = {
+            scope.user_id
+            for scope in state.review_scopes
+            if (scope.org_unit_id, scope.department) in affected_scope_pairs
+        }
+        invalidate_applied_reviewer_proofs(session, scopes=affected_scope_pairs)
+        for org_unit_id, department in sorted(
+            affected_scope_pairs, key=lambda value: (value[0], value[1].value)
+        ):
+            session.execute(
+                delete(UserReviewScope).where(
+                    UserReviewScope.org_unit_id == org_unit_id,
+                    UserReviewScope.department == department,
+                )
+            )
+            scope_users_by_pair[(org_unit_id, department)] = ()
+        for user_id in sorted(displaced_user_ids):
+            revoke_all_for_user(session, user_id)
+
+        for item in sorted(
+            deactivate_items,
+            key=lambda item: (-item_depth(item), item.proposed_org_unit_id or 0, item.id),
+        ):
+            node_to_deactivate = _optional_get(org_units_by_id, item.proposed_org_unit_id)
+            if node_to_deactivate is None:
+                raise _ConcurrentChange("organization baseline changed")
+            before_state = {
+                "org_unit_id": node_to_deactivate.id,
+                "parent_org_unit_id": node_to_deactivate.parent_id,
+                "status": node_to_deactivate.status,
+            }
+            node_to_deactivate.status = "HISTORICAL"
+            item.status = DingTalkOrgSyncItemStatus.APPLIED
+            changes = (
+                region_changes if item.kind == DingTalkOrgSyncItemKind.REGION else store_changes
+            )
+            changes.append(
+                {
+                    "item_id": item.id,
+                    "action": item.action.value,
+                    "before": before_state,
+                    "after": {
+                        "org_unit_id": node_to_deactivate.id,
+                        "parent_org_unit_id": node_to_deactivate.parent_id,
+                        "status": node_to_deactivate.status,
+                    },
+                }
+            )
+
         for item in ready_reviewer_items:
             action = item.action
             department = _required_reviewer_department(item)
             target_store = _optional_get(org_units_by_id, item.proposed_org_unit_id)
             if target_store is None and item.remote_department_id is not None:
-                target_store = stores_by_remote_id.get(item.remote_department_id)
+                target_store = nodes_by_remote_id.get(item.remote_department_id)
             if target_store is None:
                 raise RuntimeError("ready reviewer item lost its organization")
             # CREATE proposals do not have an internal organization id until
             # the store row above is flushed.  Persist the resolved id so
             # freshness checks cover its reviewer assignments too.
             item.proposed_org_unit_id = target_store.id
-            before_user_ids = tuple(scope_users_by_pair.get((target_store.id, department), ()))
-            session.execute(
-                delete(UserReviewScope).where(
-                    UserReviewScope.org_unit_id == target_store.id,
-                    UserReviewScope.department == department,
-                )
+            before_user_ids = tuple(
+                original_scope_users_by_pair.get((target_store.id, department), ())
             )
             after_user_ids: tuple[int, ...] = ()
             employee_id: int | None = None
@@ -2216,9 +2343,11 @@ def apply_organization_sync(
             target_type="dingtalk_org_sync_batch",
             target_id=batch.id,
             detail={
+                "applied_region_count": batch.ready_region_count,
                 "applied_store_count": batch.ready_store_count,
                 "applied_reviewer_count": batch.ready_reviewer_count,
                 "unresolved_count": unresolved,
+                "region_changes": region_changes,
                 "store_changes": store_changes,
                 "reviewer_changes": reviewer_changes,
             },
@@ -2240,8 +2369,12 @@ def apply_organization_sync(
             "CONCURRENT_CHANGE",
             "Organization data changed during confirmation; preview again",
         ) from None
+    except Exception:
+        session.rollback()
+        raise
 
     return OrganizationApplyResult(
+        applied_regions=batch.ready_region_count,
         applied_stores=batch.ready_store_count,
         applied_reviewers=batch.ready_reviewer_count,
         unresolved=unresolved,

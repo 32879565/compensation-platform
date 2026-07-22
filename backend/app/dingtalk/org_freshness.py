@@ -107,19 +107,6 @@ def require_recent_organization_scopes(
             DingTalkOrgSyncItem.proposed_org_unit_id.in_(org_ids),
         )
     ).all()
-    covered_stores: dict[int, DingTalkOrgSyncItem] = {}
-    ambiguous_stores: set[int] = set()
-    for item in items:
-        if (
-            item.kind != DingTalkOrgSyncItemKind.STORE
-            or item.status != DingTalkOrgSyncItemStatus.APPLIED
-            or item.proposed_org_unit_id is None
-            or item.remote_department_id is None
-        ):
-            continue
-        if item.proposed_org_unit_id in covered_stores:
-            ambiguous_stores.add(item.proposed_org_unit_id)
-        covered_stores[item.proposed_org_unit_id] = item
     current_store_bindings: dict[int, int] = {
         org_unit_id: remote_department_id
         for org_unit_id, remote_department_id in session.execute(
@@ -133,6 +120,22 @@ def require_recent_organization_scopes(
         ).all()
         if remote_department_id is not None
     }
+    # Coverage is identity-exact: REGION rows never count, and unrelated
+    # historical STORE rows in the same batch neither satisfy nor poison the
+    # one current STORE proof required for this local node.
+    covered_stores: dict[int, DingTalkOrgSyncItem] = {}
+    ambiguous_stores: set[int] = set()
+    for item in items:
+        if (
+            item.kind != DingTalkOrgSyncItemKind.STORE
+            or item.status != DingTalkOrgSyncItemStatus.APPLIED
+            or item.proposed_org_unit_id is None
+            or item.remote_department_id != current_store_bindings.get(item.proposed_org_unit_id)
+        ):
+            continue
+        if item.proposed_org_unit_id in covered_stores:
+            ambiguous_stores.add(item.proposed_org_unit_id)
+        covered_stores[item.proposed_org_unit_id] = item
     reviewer_proofs: dict[tuple[int, Department], DingTalkOrgSyncItem] = {}
     ambiguous_proofs: set[tuple[int, Department]] = set()
     for item in items:
@@ -143,7 +146,7 @@ def require_recent_organization_scopes(
             or item.department is None
             or item.proposed_employee_id is None
             or item.applied_identity_proof is None
-            or item.remote_department_id is None
+            or item.remote_department_id != current_store_bindings.get(item.proposed_org_unit_id)
             or item.action != DingTalkOrgSyncAction.ASSIGN_SCOPE
         ):
             continue

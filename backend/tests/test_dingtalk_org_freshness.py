@@ -281,6 +281,61 @@ def test_scope_freshness_binds_latest_sync_to_current_reviewer(db_session):
         )
 
 
+def test_scope_freshness_requires_exact_store_item_even_when_region_coexists(db_session):
+    now = datetime.now(UTC)
+    actor, store, employee, _manager = _seed_scope(db_session, suffix="08")
+    batch = _add_applied_sync(
+        db_session,
+        actor=actor,
+        store=store,
+        employee=employee,
+        now=now,
+    )
+    db_session.add(
+        DingTalkOrgSyncItem(
+            batch_id=batch.id,
+            row_key=f"REGION:{store.id}",
+            kind=DingTalkOrgSyncItemKind.REGION,
+            status=DingTalkOrgSyncItemStatus.APPLIED,
+            action=DingTalkOrgSyncAction.LINK,
+            remote_department_id=store.dingtalk_dept_id,
+            remote_department_name="Region cannot cover a store",
+            remote_department_path="Region",
+            proposed_org_unit_id=store.id,
+            proposed_org_type=OrgType.REGION,
+            match_method="STABLE_DEPARTMENT_ID",
+            change_fields=[],
+            baseline_fingerprint="d" * 64,
+        )
+    )
+    db_session.flush()
+
+    assert (
+        require_recent_organization_scopes(
+            db_session,
+            {(store.id, Department.DINING)},
+            encryption_key=_live_settings().encryption_key,
+            tenant_id=_live_settings().dingtalk_corp_id or "",
+            now=now,
+        )
+        == batch.id
+    )
+    db_session.execute(
+        delete(DingTalkOrgSyncItem).where(
+            DingTalkOrgSyncItem.batch_id == batch.id,
+            DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.STORE,
+        )
+    )
+    with pytest.raises(DingTalkOrganizationFreshnessError):
+        require_recent_organization_scopes(
+            db_session,
+            {(store.id, Department.DINING)},
+            encryption_key=_live_settings().encryption_key,
+            tenant_id=_live_settings().dingtalk_corp_id or "",
+            now=now,
+        )
+
+
 def test_scope_freshness_rejects_expired_batch(db_session):
     now = datetime.now(UTC)
     actor, store, employee, _manager = _seed_scope(db_session, suffix="02")
