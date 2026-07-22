@@ -12,9 +12,15 @@ from app.auth.deps import require_permission
 from app.auth.permissions import Perm
 from app.auth.service import Principal, resolve_permission_org_scope
 from app.db.session import get_session
+from app.dingtalk.org_freshness import (
+    invalidate_reviewer_authorization,
+    lock_reviewer_authorization_users,
+    reviewer_authorization_user_ids,
+)
+from app.dingtalk.org_sync import take_organization_sync_lock
 from app.models.employee import Employee, requires_approved_attendance_days
 from app.models.grade import JobGrade
-from app.models.org import OrgType
+from app.models.org import OrgType, OrgUnit
 from app.payroll.guards import (
     PayrollSourceLockedError,
     assert_employee_history_mutable,
@@ -49,6 +55,17 @@ _PAYROLL_INPUT_FIELDS = frozenset(
         "social_city",
     }
 )
+
+
+def _lock_employee_org_units(session: Session, org_unit_ids: set[int]) -> dict[int, OrgUnit]:
+    rows = session.scalars(
+        select(OrgUnit)
+        .where(OrgUnit.id.in_(org_unit_ids))
+        .order_by(OrgUnit.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    return {row.id: row for row in rows}
 
 
 def _repo(session: Session, principal: Principal, permission: str) -> EmployeeRepository:
@@ -208,6 +225,7 @@ def create_employee(
     principal: Principal = Depends(require_permission(Perm.EMPLOYEE_WRITE)),
     session: Session = Depends(get_session),
 ) -> EmployeeOut:
+    take_organization_sync_lock(session)
     # A newly created employee may join the cohort of a concurrent payroll run
     # or backfill an already-calculated cohort.  Both paths share the payroll
     # source lock and reject historical omissions outside the audit workflow.
@@ -218,6 +236,9 @@ def create_employee(
     org_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
     _visible_store_or_error(session, org_scope, body.org_unit_id)
     _visible_grade_or_error(session, body.job_grade_id)
+    locked_store = _lock_employee_org_units(session, {body.org_unit_id}).get(body.org_unit_id)
+    if locked_store is None or locked_store.is_deleted or locked_store.type != OrgType.STORE:
+        raise HTTPException(status_code=409, detail="所属门店已被其他操作修改，请刷新后重试")
     if body.id_card is not None or body.bank_account is not None:
         _require_pii_write(session, principal, body.org_unit_id)
     emp = Employee(
@@ -272,6 +293,7 @@ def update_employee(
     principal: Principal = Depends(require_permission(Perm.EMPLOYEE_WRITE)),
     session: Session = Depends(get_session),
 ) -> EmployeeOut:
+    take_organization_sync_lock(session)
     write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
     statement = select(Employee).where(
         Employee.id == employee_id,
@@ -279,11 +301,10 @@ def update_employee(
     )
     if write_scope is not None:
         statement = statement.where(Employee.org_unit_id.in_(write_scope))
-    emp = session.scalars(
-        statement.with_for_update().execution_options(populate_existing=True)
-    ).first()
+    emp = session.scalars(statement.execution_options(populate_existing=True)).first()
     if emp is None:
         raise HTTPException(status_code=404, detail="员工不存在或不可见")
+    observed_version = emp.version
     data = body.model_dump(exclude_unset=True, exclude={"expected_version"})
     target_position_title = data.get("position_title", emp.position_title)
     if requires_approved_attendance_days(target_position_title):
@@ -328,6 +349,35 @@ def update_employee(
             resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE),
             data["org_unit_id"],
         )
+    routing_changed = any(
+        field in data and data[field] != getattr(emp, field) for field in ("org_unit_id", "status")
+    )
+    invalidated_proof_count = 0
+    revoked_session_user_count = 0
+    affected_user_ids = (
+        reviewer_authorization_user_ids(session, employee_ids={emp.id}) if routing_changed else ()
+    )
+    lock_reviewer_authorization_users(session, affected_user_ids)
+    locked_orgs = _lock_employee_org_units(
+        session,
+        {emp.org_unit_id, target_org_unit_id},
+    )
+    if set(locked_orgs) != {emp.org_unit_id, target_org_unit_id}:
+        raise HTTPException(status_code=409, detail="员工组织已被其他操作修改，请刷新后重试")
+    locked_emp = session.scalars(
+        statement.with_for_update().execution_options(populate_existing=True)
+    ).first()
+    if locked_emp is None or locked_emp.version != observed_version:
+        raise HTTPException(status_code=409, detail="员工已被其他操作修改，请刷新后重试")
+    emp = locked_emp
+    if routing_changed:
+        invalidation = invalidate_reviewer_authorization(
+            session,
+            employee_ids={emp.id},
+            locked_user_ids=affected_user_ids,
+        )
+        invalidated_proof_count = invalidation.invalidated_proof_count
+        revoked_session_user_count = invalidation.revoked_user_count
     for field, value in data.items():
         setattr(emp, field, value)
     previous_version = emp.version
@@ -337,6 +387,8 @@ def update_employee(
         "changed": sorted(data.keys()),
         "from_version": previous_version,
         "to_version": emp.version,
+        "invalidated_sync_proof_count": invalidated_proof_count,
+        "revoked_session_user_count": revoked_session_user_count,
     }
     if grade_assignment_changed:
         audit_detail["job_grade_assignment"] = {
@@ -364,10 +416,18 @@ def delete_employee(
     principal: Principal = Depends(require_permission(Perm.EMPLOYEE_WRITE)),
     session: Session = Depends(get_session),
 ) -> None:
-    repo = _repo(session, principal, Perm.EMPLOYEE_WRITE)
-    emp = repo.get(employee_id)
+    take_organization_sync_lock(session)
+    write_scope = resolve_permission_org_scope(session, principal, Perm.EMPLOYEE_WRITE)
+    statement = select(Employee).where(
+        Employee.id == employee_id,
+        Employee.is_deleted.is_(False),
+    )
+    if write_scope is not None:
+        statement = statement.where(Employee.org_unit_id.in_(write_scope))
+    emp = session.scalars(statement.execution_options(populate_existing=True)).first()
     if emp is None:
         raise HTTPException(status_code=404, detail="员工不存在或不可见")
+    observed_version = emp.version
     _ensure_employee_history_mutable(
         session,
         principal,
@@ -375,12 +435,32 @@ def delete_employee(
         hire_date=emp.hire_date,
         leave_date=emp.leave_date,
     )
-    repo.soft_delete(emp)
+    affected_user_ids = reviewer_authorization_user_ids(session, employee_ids={emp.id})
+    lock_reviewer_authorization_users(session, affected_user_ids)
+    locked_store = _lock_employee_org_units(session, {emp.org_unit_id}).get(emp.org_unit_id)
+    if locked_store is None or locked_store.is_deleted:
+        raise HTTPException(status_code=409, detail="员工组织已被其他操作修改，请刷新后重试")
+    locked_emp = session.scalars(
+        statement.with_for_update().execution_options(populate_existing=True)
+    ).first()
+    if locked_emp is None or locked_emp.version != observed_version:
+        raise HTTPException(status_code=409, detail="员工已被其他操作修改，请刷新后重试")
+    emp = locked_emp
+    invalidation = invalidate_reviewer_authorization(
+        session,
+        employee_ids={emp.id},
+        locked_user_ids=affected_user_ids,
+    )
+    EmployeeRepository(session, org_scope=write_scope).soft_delete(emp)
     audit.record(
         session,
         action="employee.delete",
         actor=(principal.user_id, principal.username),
         target_type="employee",
         target_id=employee_id,
+        detail={
+            "invalidated_sync_proof_count": invalidation.invalidated_proof_count,
+            "revoked_session_user_count": invalidation.revoked_user_count,
+        },
     )
     session.commit()

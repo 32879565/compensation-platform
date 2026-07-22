@@ -1,10 +1,21 @@
+from datetime import UTC, date, datetime, timedelta
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.auth.bootstrap import seed_rbac
 from app.core.security import hash_password
-from app.models.auth import Role, User, UserOrgScope, UserRole
+from app.models.auth import RefreshToken, Role, User, UserOrgScope, UserReviewScope, UserRole
+from app.models.dingtalk import (
+    DingTalkOrgSyncAction,
+    DingTalkOrgSyncBatch,
+    DingTalkOrgSyncBatchStatus,
+    DingTalkOrgSyncItem,
+    DingTalkOrgSyncItemKind,
+    DingTalkOrgSyncItemStatus,
+)
+from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
@@ -63,6 +74,55 @@ def _token(client, username, password="StrongPass123!"):
     r = client.post("/api/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+def _applied_reviewer_authorization(session, *, store, employee, reviewer, suffix):
+    reviewer.employee_id = employee.id
+    session.add(
+        UserReviewScope(
+            user_id=reviewer.id,
+            org_unit_id=store.id,
+            department=Department.DINING,
+        )
+    )
+    batch = DingTalkOrgSyncBatch(
+        status=DingTalkOrgSyncBatchStatus.APPLIED,
+        snapshot_hash="a" * 64,
+        root_config_hash="b" * 64,
+        local_baseline_hash="c" * 64,
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        applied_by_user_id=reviewer.id,
+        applied_at=datetime.now(UTC),
+    )
+    session.add(batch)
+    session.flush()
+    item = DingTalkOrgSyncItem(
+        batch_id=batch.id,
+        row_key=f"REVIEWER:MANUAL:{suffix}",
+        kind=DingTalkOrgSyncItemKind.REVIEWER,
+        status=DingTalkOrgSyncItemStatus.APPLIED,
+        action=DingTalkOrgSyncAction.ASSIGN_SCOPE,
+        remote_department_id=1000 + store.id,
+        remote_department_name=store.name,
+        remote_department_path=store.name,
+        proposed_org_unit_id=store.id,
+        proposed_employee_id=employee.id,
+        department=Department.DINING,
+        match_method="JOB_NUMBER",
+        change_fields=["reviewer_scope"],
+        applied_identity_proof=suffix * 64,
+        baseline_fingerprint="d" * 64,
+    )
+    token = RefreshToken(
+        user_id=reviewer.id,
+        token_hash=suffix * 64,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        revoked_at=None,
+        created_at=datetime.now(UTC),
+    )
+    session.add_all([item, token])
+    session.flush()
+    return item, token
 
 
 def test_hr_can_create_and_list_employee_with_pii(client, db_session):
@@ -761,3 +821,108 @@ def test_org_duplicate_code_409(client, db_session):
     body = {"code": "DUPE", "name": "A", "type": "STORE"}
     assert client.post("/api/org", headers=hr, json=body).status_code == 201
     assert client.post("/api/org", headers=hr, json=body).status_code == 409
+
+
+def test_manual_org_routing_change_invalidates_descendant_proofs_and_sessions_only(
+    client, db_session
+):
+    orgs = _org_tree(db_session)
+    hr_user = _user(db_session, "manual-org-hr", ["GROUP_HR"])
+    affected = _user(db_session, "manual-org-reviewer", ["STORE_MANAGER"])
+    unrelated = _user(db_session, "manual-org-unrelated", ["STORE_MANAGER"])
+    affected_employee = Employee(
+        emp_no="MANUAL-ORG-1",
+        name="Affected reviewer",
+        org_unit_id=orgs["gz_store"].id,
+        department=Department.DINING,
+    )
+    unrelated_employee = Employee(
+        emp_no="MANUAL-ORG-2",
+        name="Unrelated reviewer",
+        org_unit_id=orgs["sz_store"].id,
+        department=Department.DINING,
+    )
+    db_session.add_all([affected_employee, unrelated_employee])
+    db_session.flush()
+    affected_item, affected_token = _applied_reviewer_authorization(
+        db_session,
+        store=orgs["gz_store"],
+        employee=affected_employee,
+        reviewer=affected,
+        suffix="1",
+    )
+    unrelated_item, unrelated_token = _applied_reviewer_authorization(
+        db_session,
+        store=orgs["sz_store"],
+        employee=unrelated_employee,
+        reviewer=unrelated,
+        suffix="2",
+    )
+    db_session.commit()
+    headers = _token(client, hr_user.username)
+
+    city_only = client.patch(
+        f"/api/org/{orgs['gz_store'].id}", headers=headers, json={"city": "佛山"}
+    )
+    assert city_only.status_code == 200, city_only.text
+    db_session.refresh(affected_item)
+    db_session.refresh(affected_token)
+    assert affected_item.applied_identity_proof == "1" * 64
+    assert affected_token.revoked_at is None
+
+    renamed = client.patch(
+        f"/api/org/{orgs['gz'].id}", headers=headers, json={"name": "广州新区域"}
+    )
+    assert renamed.status_code == 200, renamed.text
+    for row in (affected_item, affected_token, unrelated_item, unrelated_token):
+        db_session.refresh(row)
+    assert affected_item.applied_identity_proof is None
+    assert affected_token.revoked_at is not None
+    assert unrelated_item.applied_identity_proof == "2" * 64
+    assert unrelated_token.revoked_at is None
+
+
+def test_manual_employee_routing_change_invalidates_proof_and_linked_sessions(client, db_session):
+    orgs = _org_tree(db_session)
+    hr_user = _user(db_session, "manual-employee-hr", ["GROUP_HR"])
+    reviewer = _user(db_session, "manual-employee-reviewer", ["STORE_MANAGER"])
+    employee = Employee(
+        emp_no="MANUAL-EMP-1",
+        name="Original reviewer",
+        org_unit_id=orgs["gz_store"].id,
+        department=Department.DINING,
+        hire_date=date(2026, 1, 1),
+    )
+    db_session.add(employee)
+    db_session.flush()
+    proof, refresh_token = _applied_reviewer_authorization(
+        db_session,
+        store=orgs["gz_store"],
+        employee=employee,
+        reviewer=reviewer,
+        suffix="3",
+    )
+    db_session.commit()
+    headers = _token(client, hr_user.username)
+
+    renamed = client.patch(
+        f"/api/employees/{employee.id}",
+        headers=headers,
+        json={"name": "Renamed reviewer"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    db_session.refresh(proof)
+    db_session.refresh(refresh_token)
+    assert proof.applied_identity_proof == "3" * 64
+    assert refresh_token.revoked_at is None
+
+    moved = client.patch(
+        f"/api/employees/{employee.id}",
+        headers=headers,
+        json={"org_unit_id": orgs["sz_store"].id},
+    )
+    assert moved.status_code == 200, moved.text
+    db_session.refresh(proof)
+    db_session.refresh(refresh_token)
+    assert proof.applied_identity_proof is None
+    assert refresh_token.revoked_at is not None

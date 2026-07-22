@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hmac
 import secrets
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
+from app.auth.service import revoke_all_for_user
 from app.dingtalk.client import DingTalkOrganizationAccess
 from app.dingtalk.org_rules import manager_department_for_title
 from app.dingtalk.read_sync import (
@@ -30,6 +32,14 @@ from app.models.org import OrgType, OrgUnit
 
 class DingTalkOrganizationFreshnessError(RuntimeError):
     """The requested salary-review scopes lack a recent confirmed DingTalk snapshot."""
+
+
+@dataclass(frozen=True)
+class ReviewerAuthorizationInvalidation:
+    """Aggregate-only result safe to include in a master-data audit event."""
+
+    invalidated_proof_count: int
+    revoked_user_count: int
 
 
 def invalidate_applied_reviewer_proofs(
@@ -62,6 +72,102 @@ def invalidate_applied_reviewer_proofs(
         .values(applied_identity_proof=None)
     )
     return int(getattr(result, "rowcount", 0) or 0)
+
+
+def invalidate_reviewer_authorization(
+    session: Session,
+    *,
+    scopes: set[tuple[int, Department]] | frozenset[tuple[int, Department]] = frozenset(),
+    employee_ids: set[int] | frozenset[int] = frozenset(),
+    locked_user_ids: tuple[int, ...] | None = None,
+) -> ReviewerAuthorizationInvalidation:
+    """Invalidate confirmed reviewer identity and revoke affected login sessions.
+
+    The caller holds the organization advisory lock.  Only aggregate counts
+    escape this helper; employee, provider, and account identifiers never enter
+    the surrounding audit detail.
+    """
+
+    scope_predicates = [
+        and_(
+            UserReviewScope.org_unit_id == org_unit_id,
+            UserReviewScope.department == department,
+        )
+        for org_unit_id, department in scopes
+    ]
+    affected_user_ids = set(locked_user_ids or ())
+    if locked_user_ids is None:
+        affected_user_ids.update(
+            reviewer_authorization_user_ids(
+                session,
+                scopes=scopes,
+                employee_ids=employee_ids,
+            )
+        )
+        lock_reviewer_authorization_users(session, tuple(sorted(affected_user_ids)))
+
+    # Scope rows are deliberately locked after the caller has locked the
+    # affected organization and employee rows.
+    scope_lock_predicates = list(scope_predicates)
+    if affected_user_ids:
+        scope_lock_predicates.append(UserReviewScope.user_id.in_(affected_user_ids))
+    if scope_lock_predicates:
+        session.scalars(
+            select(UserReviewScope)
+            .where(or_(*scope_lock_predicates))
+            .order_by(UserReviewScope.user_id, UserReviewScope.id)
+            .with_for_update()
+        ).all()
+
+    invalidated = invalidate_applied_reviewer_proofs(
+        session,
+        scopes=scopes,
+        employee_ids=employee_ids,
+    )
+    for user_id in sorted(affected_user_ids):
+        revoke_all_for_user(session, user_id)
+    return ReviewerAuthorizationInvalidation(
+        invalidated_proof_count=invalidated,
+        revoked_user_count=len(affected_user_ids),
+    )
+
+
+def reviewer_authorization_user_ids(
+    session: Session,
+    *,
+    scopes: set[tuple[int, Department]] | frozenset[tuple[int, Department]] = frozenset(),
+    employee_ids: set[int] | frozenset[int] = frozenset(),
+) -> tuple[int, ...]:
+    """Preselect affected accounts without taking mutation row locks."""
+
+    scope_predicates = [
+        and_(
+            UserReviewScope.org_unit_id == org_unit_id,
+            UserReviewScope.department == department,
+        )
+        for org_unit_id, department in scopes
+    ]
+    affected_user_ids: set[int] = set()
+    if scope_predicates:
+        affected_user_ids.update(
+            session.scalars(select(UserReviewScope.user_id).where(or_(*scope_predicates))).all()
+        )
+    if employee_ids:
+        affected_user_ids.update(
+            session.scalars(select(User.id).where(User.employee_id.in_(employee_ids))).all()
+        )
+
+    return tuple(sorted(affected_user_ids))
+
+
+def lock_reviewer_authorization_users(session: Session, user_ids: tuple[int, ...]) -> None:
+    """Lock preselected account rows in the shared deterministic order."""
+
+    if not user_ids:
+        return
+    session.scalars(
+        select(User).where(User.id.in_(user_ids)).order_by(User.id).with_for_update()
+    ).all()
 
 
 def require_recent_organization_scopes(
