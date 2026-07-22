@@ -449,6 +449,7 @@ def _settings() -> Settings:
         secret_key="test-secret-key-only-for-tests-not-production",
         encryption_key="test-encryption-key-only-for-tests-not-production",
         cookie_secure=False,
+        dingtalk_corp_id="scheduled-test-tenant",
         dingtalk_org_root_mappings="10:GROUP",
     )
 
