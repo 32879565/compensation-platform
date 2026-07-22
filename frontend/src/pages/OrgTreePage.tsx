@@ -220,7 +220,7 @@ function OrganizationChangesSection({ kind, items }: OrganizationChangesSectionP
 }
 
 function totalReadyItems(preview: DingTalkOrganizationPreview): number {
-  return preview.ready_regions + preview.ready_stores + preview.ready_reviewers
+  return preview.ready_stores + preview.ready_reviewers
 }
 
 function totalConflicts(preview: DingTalkOrganizationPreview): number {
@@ -319,6 +319,7 @@ export default function OrgTreePage() {
   function applyPreview(): void {
     if (
       !syncPreview ||
+      syncPreview.region_items.length > 0 ||
       totalConflicts(syncPreview) > 0 ||
       totalReadyItems(syncPreview) === 0
     ) {
@@ -331,7 +332,10 @@ export default function OrgTreePage() {
 
   const hasApplicableItems = syncPreview !== null && totalReadyItems(syncPreview) > 0
   const canApplyPreview =
-    syncPreview !== null && hasApplicableItems && totalConflicts(syncPreview) === 0
+    syncPreview !== null &&
+    hasApplicableItems &&
+    syncPreview.region_items.length === 0 &&
+    totalConflicts(syncPreview) === 0
   const reviewerAssignments =
     syncPreview?.reviewer_items.filter((item) => item.action === 'ASSIGN') ?? []
   const reviewerRemovals =
@@ -376,8 +380,16 @@ export default function OrgTreePage() {
               type="info"
               showIcon
               message={`待应用：${syncPreview.ready_regions} 项区域变更、${syncPreview.ready_stores} 项门店变更、${syncPreview.ready_reviewers} 项负责人变更`}
-              description="确认后将应用预览中的区域变更、门店变更、负责人分配和负责人撤销。"
+              description="当前可确认门店变更、负责人分配和负责人撤销。"
             />
+            {syncPreview.region_items.length > 0 ? (
+              <Alert
+                type="warning"
+                showIcon
+                message="区域变更暂不可确认"
+                description="区域变更将在组织层级应用支持完成后可确认。"
+              />
+            ) : null}
             <Alert
               type={
                 totalConflicts(syncPreview) > 0 ? 'warning' : 'info'

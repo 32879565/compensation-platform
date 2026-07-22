@@ -283,7 +283,7 @@ describe('OrgTreePage DingTalk organization sync', () => {
     expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
   })
 
-  it('renders safe region changes and allows a region-only preview', async () => {
+  it('renders safe region changes but blocks them until hierarchy apply is supported', async () => {
     const regionOnlyPreview = {
       ...preview,
       ready_stores: 0,
@@ -303,14 +303,13 @@ describe('OrgTreePage DingTalk organization sync', () => {
     expect(within(regionChanges).getByText('集团 / 广州区域')).toBeTruthy()
 
     const applyButton = within(dialog).getByRole('button', { name: '确认应用变更' })
-    expect((applyButton as HTMLButtonElement).disabled).toBe(false)
+    expect(within(dialog).getByText('区域变更暂不可确认')).toBeTruthy()
+    expect(
+      within(dialog).getByText('区域变更将在组织层级应用支持完成后可确认。'),
+    ).toBeTruthy()
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(applyButton)
-
-    await waitFor(() =>
-      expect(dingtalkApi.applyDingTalkOrganization).toHaveBeenCalledWith(
-        '3fe80f532f184247b477694427bad0ce',
-      ),
-    )
+    expect(dingtalkApi.applyDingTalkOrganization).not.toHaveBeenCalled()
   })
 
   it('blocks apply when the preview contains a region conflict', async () => {
@@ -347,6 +346,9 @@ describe('OrgTreePage DingTalk organization sync', () => {
   it('shows every store action and applies the exact staged batch once conflicts are resolved', async () => {
     const resolvedPreview: DingTalkOrganizationPreview = {
       ...preview,
+      ready_regions: 0,
+      region_conflicts: 0,
+      region_items: [],
       reviewer_conflicts: 0,
       reviewer_items: preview.reviewer_items.filter((item) => item.action !== 'CONFLICT'),
     }
@@ -400,6 +402,9 @@ describe('OrgTreePage DingTalk organization sync', () => {
   it('reports when apply succeeds but the organization tree cannot refresh', async () => {
     const resolvedPreview: DingTalkOrganizationPreview = {
       ...preview,
+      ready_regions: 0,
+      region_conflicts: 0,
+      region_items: [],
       reviewer_conflicts: 0,
       reviewer_items: preview.reviewer_items.filter((item) => item.action !== 'CONFLICT'),
     }
