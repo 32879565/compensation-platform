@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app.audit import service as audit
 from app.auth.deps import require_permission
 from app.auth.permissions import Perm
-from app.auth.service import Principal, resolve_permission_org_scope
+from app.auth.service import Principal, resolve_permission_org_scope, resolve_review_scope
 from app.core.config import DingTalkMode, Settings, get_settings
 from app.db.session import get_session
 from app.dingtalk import service as dingtalk
@@ -506,9 +506,18 @@ def search_salary(
     principal: Principal = Depends(require_permission(Perm.SALARY_READ)),
     session: Session = Depends(get_session),
 ) -> SalaryRecordPage:
+    salary_scope = resolve_permission_org_scope(session, principal, Perm.SALARY_READ)
+    import_review_scope = None
+    if salary_scope is not None:
+        import_review_scope = frozenset(
+            (org_unit_id, department)
+            for org_unit_id, department in resolve_review_scope(session, principal)
+            if org_unit_id in salary_scope
+        )
     repo = SalaryRecordRepository(
         session,
-        org_scope=resolve_permission_org_scope(session, principal, Perm.SALARY_READ),
+        org_scope=salary_scope,
+        import_review_scope=import_review_scope,
     )
     result = repo.search(
         name=name, emp_no=emp_no, period=period, store=store, page=page, page_size=page_size

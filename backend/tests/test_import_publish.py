@@ -19,7 +19,7 @@ from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 from app.models.payroll_batch import BatchStatus, PayrollBatch
 from app.models.payroll_result import BatchConfirmation, PayrollResult
-from app.models.salary import SalaryRecord
+from app.models.salary import SalaryRecord, SalarySource
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -411,7 +411,25 @@ def test_salary_search_hides_unpublished_stores_and_other_departments(client, db
         store_id=excluded_store.id,
         department=Department.DINING,
     )
+    _salary_reader(
+        db_session,
+        username="search-manager-without-review-scope",
+        role_code="STORE_MANAGER",
+        store_id=selected_store.id,
+    )
     _salary_reader(db_session, username="search-global-hr", role_code="GROUP_HR")
+    db_session.add(
+        SalaryRecord(
+            period="2026-04",
+            emp_no=dining_employee.emp_no,
+            name="历史工资仍可见",
+            store_name=selected_store.name,
+            org_unit_id=selected_store.id,
+            employee_id=dining_employee.id,
+            source=SalarySource.HISTORICAL,
+            fields={"实发工资": "4300.00"},
+        )
+    )
     db_session.commit()
 
     dining_response = client.get(
@@ -429,6 +447,16 @@ def test_salary_search_hides_unpublished_stores_and_other_departments(client, db
         headers=_token(client, "search-excluded-manager"),
         params={"period": "2026-05"},
     )
+    no_review_import_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-manager-without-review-scope"),
+        params={"period": "2026-05"},
+    )
+    no_review_history_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-manager-without-review-scope"),
+        params={"period": "2026-04"},
+    )
     global_response = client.get(
         "/api/salary-records",
         headers=_token(client, "search-global-hr"),
@@ -442,6 +470,10 @@ def test_salary_search_hides_unpublished_stores_and_other_departments(client, db
     assert excluded_response.status_code == 200, excluded_response.text
     assert excluded_response.json()["items"] == []
     assert excluded_response.json()["total"] == 0
+    assert no_review_import_response.status_code == 200, no_review_import_response.text
+    assert no_review_import_response.json()["items"] == []
+    assert no_review_history_response.status_code == 200, no_review_history_response.text
+    assert [row["name"] for row in no_review_history_response.json()["items"]] == ["历史工资仍可见"]
     assert global_response.status_code == 200, global_response.text
     assert {row["name"] for row in global_response.json()["items"]} == {
         dining_employee.name,
