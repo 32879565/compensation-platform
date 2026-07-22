@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from app.auth.bootstrap import seed_rbac
 from app.core.config import Settings
 from app.dingtalk.service import stage_review_deliveries
+from app.importing import publish as publish_module
 from app.importing.header_rules import MONEY_FIELDS
 from app.importing.parser import SalaryRow
 from app.importing.publish import ImportPublishError, publish_import_for_review
@@ -220,6 +221,142 @@ def test_confirmed_excel_projects_exact_results_and_routes_each_department(db_se
     assert all(delivery.status == DingTalkDeliveryStatus.SANDBOXED for delivery in deliveries)
 
 
+def test_publish_projects_results_and_review_scopes_only_for_selected_stores(db_session):
+    first_store = OrgUnit(code="SELECT-S1", name="选择一店", type=OrgType.STORE, city="广州")
+    second_store = OrgUnit(code="SELECT-S2", name="选择二店", type=OrgType.STORE, city="广州")
+    db_session.add_all([first_store, second_store])
+    db_session.flush()
+    first_employee = _employee(db_session, first_store, emp_no="SELECT-E1", name="一店员工")
+    second_employee = _employee(db_session, second_store, emp_no="SELECT-E2", name="二店员工")
+    first_manager = _reviewer(
+        db_session,
+        username="selected-first-manager",
+        store_id=first_store.id,
+        department=Department.DINING,
+    )
+    imported = _confirmed_import(
+        db_session,
+        first_store,
+        [
+            _salary_row(
+                emp_no=first_employee.emp_no,
+                name=first_employee.name,
+                store_name=first_store.name,
+                department="厅面",
+                gross="5000",
+                net="4400",
+            ),
+            _salary_row(
+                emp_no=second_employee.emp_no,
+                name=second_employee.name,
+                store_name=second_store.name,
+                department="厅面",
+                gross="5100",
+                net="4500",
+            ),
+        ],
+    )
+    published = publish_import_for_review(db_session, imported, store_ids={first_store.id})
+
+    assert published.employees == 1
+    assert published.stores == 1
+    results = list(db_session.scalars(select(PayrollResult)).all())
+    assert [(row.employee_id, row.org_unit_id) for row in results] == [
+        (first_employee.id, first_store.id)
+    ]
+    confirmations = list(db_session.scalars(select(BatchConfirmation)).all())
+    assert [(row.org_unit_id, row.department) for row in confirmations] == [
+        (first_store.id, Department.DINING)
+    ]
+
+    staged = stage_review_deliveries(
+        db_session,
+        batch_id=published.payroll_batch_id,
+        org_unit_ids={first_store.id},
+    )
+    assert staged.routed == 1
+    assert staged.scopes == 1
+    deliveries = list(db_session.scalars(select(DingTalkDelivery)).all())
+    assert [(row.org_unit_id, row.recipient_user_id) for row in deliveries] == [
+        (first_store.id, first_manager.id)
+    ]
+
+
+def test_publish_rejects_empty_or_foreign_store_selection_without_writes(db_session):
+    store = OrgUnit(code="SELECT-VALID", name="有效选择门店", type=OrgType.STORE)
+    db_session.add(store)
+    db_session.flush()
+    employee = _employee(db_session, store, emp_no="SELECT-VALID-E1", name="员工")
+    imported = _confirmed_import(
+        db_session,
+        store,
+        [
+            _salary_row(
+                emp_no=employee.emp_no,
+                name=employee.name,
+                store_name=store.name,
+                department="厅面",
+                gross="5000",
+                net="4400",
+            )
+        ],
+    )
+    with pytest.raises(ImportPublishError, match="至少选择一家门店"):
+        publish_import_for_review(db_session, imported, store_ids=set())
+    with pytest.raises(ImportPublishError, match="不属于该导入批次"):
+        publish_import_for_review(db_session, imported, store_ids={store.id + 1000})
+
+    assert db_session.scalar(select(func.count()).select_from(PayrollBatch)) == 0
+    assert db_session.scalar(select(func.count()).select_from(PayrollResult)) == 0
+    assert db_session.scalar(select(func.count()).select_from(BatchConfirmation)) == 0
+    assert db_session.scalar(select(func.count()).select_from(DingTalkDelivery)) == 0
+
+
+def test_import_publish_targets_report_store_counts_and_departments(db_session):
+    first_store = OrgUnit(code="TARGET-S1", name="目标一店", type=OrgType.STORE)
+    second_store = OrgUnit(code="TARGET-S2", name="目标二店", type=OrgType.STORE)
+    db_session.add_all([first_store, second_store])
+    db_session.flush()
+    first_employee = _employee(db_session, first_store, emp_no="TARGET-E1", name="一店员工")
+    second_employee = _employee(db_session, second_store, emp_no="TARGET-E2", name="二店员工")
+    _reviewer(
+        db_session,
+        username="target-first-manager",
+        store_id=first_store.id,
+        department=Department.DINING,
+    )
+    imported = _confirmed_import(
+        db_session,
+        first_store,
+        [
+            _salary_row(
+                emp_no=first_employee.emp_no,
+                name=first_employee.name,
+                store_name=first_store.name,
+                department="厅面",
+                gross="5000",
+                net="4400",
+            ),
+            _salary_row(
+                emp_no=second_employee.emp_no,
+                name=second_employee.name,
+                store_name=second_store.name,
+                department="厨房",
+                gross="5100",
+                net="4500",
+            ),
+        ],
+    )
+
+    targets = publish_module.list_import_publish_targets(db_session, imported)
+    assert [(row.store_id, row.store_name, row.employee_count) for row in targets] == [
+        (first_store.id, first_store.name, 1),
+        (second_store.id, second_store.name, 1),
+    ]
+    assert targets[0].departments == (Department.DINING,)
+    assert targets[1].departments == (Department.KITCHEN,)
+
+
 def test_publish_rejects_workbook_department_that_conflicts_with_employee_master(db_session):
     store = OrgUnit(code="DEPT-MISMATCH-S1", name="部门冲突门店", type=OrgType.STORE)
     db_session.add(store)
@@ -363,6 +500,49 @@ def test_publish_is_idempotent_for_the_same_import_and_delivery_round(db_session
     assert db_session.scalar(select(func.count()).select_from(DingTalkDelivery)) == 1
     assert first_delivery.routed == 1
     assert second_delivery.existing == 1
+
+
+def test_publish_retry_rejects_a_different_store_selection(db_session):
+    first_store = OrgUnit(code="LOCKED-S1", name="锁定一店", type=OrgType.STORE)
+    second_store = OrgUnit(code="LOCKED-S2", name="锁定二店", type=OrgType.STORE)
+    db_session.add_all([first_store, second_store])
+    db_session.flush()
+    first_employee = _employee(db_session, first_store, emp_no="LOCKED-E1", name="一店员工")
+    second_employee = _employee(db_session, second_store, emp_no="LOCKED-E2", name="二店员工")
+    imported = _confirmed_import(
+        db_session,
+        first_store,
+        [
+            _salary_row(
+                emp_no=first_employee.emp_no,
+                name=first_employee.name,
+                store_name=first_store.name,
+                department="厅面",
+                gross="5000",
+                net="4400",
+            ),
+            _salary_row(
+                emp_no=second_employee.emp_no,
+                name=second_employee.name,
+                store_name=second_store.name,
+                department="厨房",
+                gross="5100",
+                net="4500",
+            ),
+        ],
+    )
+
+    first = publish_import_for_review(db_session, imported, store_ids={first_store.id})
+    same = publish_import_for_review(db_session, imported, store_ids={first_store.id})
+    with pytest.raises(ImportPublishError, match="已经按其他门店范围发布"):
+        publish_import_for_review(db_session, imported, store_ids={second_store.id})
+
+    assert same.already_published is True
+    assert same.payroll_batch_id == first.payroll_batch_id
+    results = list(db_session.scalars(select(PayrollResult)).all())
+    assert {(row.employee_id, row.org_unit_id) for row in results} == {
+        (first_employee.id, first_store.id)
+    }
 
 
 def test_excel_delivery_retry_requeues_the_failed_row_after_routing_is_fixed(db_session):
