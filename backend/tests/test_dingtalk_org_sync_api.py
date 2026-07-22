@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import func, select
 
 import app.dingtalk.org_sync as org_sync
@@ -116,7 +117,7 @@ def _settings(*, root_mappings: str = "10:DIRECT-GROUP") -> Settings:
         encryption_key="test-encryption-key-only-for-tests-not-production",
         cookie_secure=False,
         dingtalk_client_id="test-client-id",
-        dingtalk_client_secret="test-client-secret-value",
+        dingtalk_client_secret=SecretStr("test-client-secret-value"),
         dingtalk_agent_id=123,
         dingtalk_corp_id="ding-test-corp",
         dingtalk_read_sync_enabled=True,
@@ -1561,6 +1562,124 @@ def test_shared_anchor_supports_two_roots_without_cross_path_matches(client, db_
     assert stores[101]["proposed_org_unit_id"] == east.id
     assert stores[201]["proposed_org_unit_id"] == west.id
     assert {stores[101]["status"], stores[201]["status"]} == {"READY"}
+
+
+def test_organization_apply_creates_same_name_store_under_distinct_root_path(client, db_session):
+    east_anchor = OrgUnit(code="EAST-GROUP", name="East Group", type=OrgType.GROUP)
+    west_anchor = OrgUnit(code="WEST-GROUP", name="West Group", type=OrgType.GROUP)
+    existing_store = OrgUnit(
+        code="EAST-SHARED",
+        name="Shared店",
+        type=OrgType.STORE,
+        parent=east_anchor,
+    )
+    db_session.add_all([east_anchor, west_anchor, existing_store])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Employee(
+                emp_no="E101",
+                name="East dining manager",
+                org_unit_id=existing_store.id,
+                department=Department.DINING,
+                position_title="店长",
+            ),
+            Employee(
+                emp_no="E102",
+                name="East kitchen manager",
+                org_unit_id=existing_store.id,
+                department=Department.KITCHEN,
+                position_title="厨房经理",
+            ),
+            Employee(
+                emp_no="W201",
+                name="West dining manager",
+                org_unit_id=existing_store.id,
+                department=Department.DINING,
+                position_title="店长",
+            ),
+            Employee(
+                emp_no="W202",
+                name="West kitchen manager",
+                org_unit_id=existing_store.id,
+                department=Department.KITCHEN,
+                position_title="厨房经理",
+            ),
+        ]
+    )
+    db_session.commit()
+    admin = _group_hr(db_session, "org-sync-create-same-name-different-root")
+    fake = _FakeOrganizationClient(
+        departments=(
+            DingTalkDepartment(101, 10, "Shared店"),
+            DingTalkDepartment(201, 20, "Shared店"),
+        ),
+        users=(
+            DingTalkOrganizationUser(
+                "east-dining", "East dining manager", "E101", "店长", True, (101,)
+            ),
+            DingTalkOrganizationUser(
+                "east-kitchen", "East kitchen manager", "E102", "厨房经理", True, (101,)
+            ),
+            DingTalkOrganizationUser(
+                "west-dining", "West dining manager", "W201", "店长", True, (201,)
+            ),
+            DingTalkOrganizationUser(
+                "west-kitchen", "West kitchen manager", "W202", "厨房经理", True, (201,)
+            ),
+        ),
+    )
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = lambda: _settings(
+        root_mappings="10:EAST-GROUP,20:WEST-GROUP"
+    )
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+    headers = _token(client, admin.username)
+
+    preview_response = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
+
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    assert preview["region_items"] == []
+    stores_by_remote_id = {item["remote_department_id"]: item for item in preview["store_items"]}
+    assert stores_by_remote_id[101]["action"] == "LINK"
+    assert stores_by_remote_id[101]["proposed_org_unit_id"] == existing_store.id
+    assert stores_by_remote_id[201]["action"] == "CREATE"
+    assert stores_by_remote_id[201]["status"] == "READY"
+    assert stores_by_remote_id[201]["proposed_org_unit_id"] is None
+    assert stores_by_remote_id[201]["proposed_parent_org_unit_id"] == west_anchor.id
+    assert preview["reviewer_conflicts"] == 0
+
+    apply_response = client.post(
+        f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
+        headers=headers,
+    )
+
+    assert apply_response.status_code == 200, apply_response.text
+    assert apply_response.json() == {
+        "applied_stores": 2,
+        "applied_reviewers": 4,
+        "unresolved": 0,
+        "already_applied": False,
+    }
+    db_session.expire_all()
+    unchanged_existing = db_session.get(OrgUnit, existing_store.id)
+    assert unchanged_existing is not None
+    assert (
+        unchanged_existing.code,
+        unchanged_existing.name,
+        unchanged_existing.parent_id,
+        unchanged_existing.status,
+        unchanged_existing.dingtalk_dept_id,
+    ) == ("EAST-SHARED", "Shared店", east_anchor.id, "ACTIVE", 101)
+    created_store = db_session.scalars(select(OrgUnit).where(OrgUnit.dingtalk_dept_id == 201)).one()
+    assert (
+        created_store.code,
+        created_store.name,
+        created_store.parent_id,
+        created_store.status,
+    ) == ("DINGTALK-201", "Shared店", west_anchor.id, "ACTIVE")
 
 
 def test_shared_anchor_conflicts_when_two_roots_target_the_same_local_path(client, db_session):

@@ -2058,17 +2058,7 @@ def apply_organization_sync(
                 applied_store.status = "HISTORICAL"
             elif action == DingTalkOrgSyncAction.CREATE:
                 parent = _optional_get(org_units_by_id, item.proposed_parent_org_unit_id)
-                duplicate_name = any(
-                    org.type == OrgType.STORE
-                    and not org.is_deleted
-                    and _normalize_name(org.name) == _normalize_name(item.remote_department_name)
-                    for org in state.org_units
-                )
-                if (
-                    parent is None
-                    or f"DINGTALK-{remote_department_id}" in org_units_by_code
-                    or duplicate_name
-                ):
+                if parent is None or f"DINGTALK-{remote_department_id}" in org_units_by_code:
                     raise _ConcurrentChange("create store baseline changed")
                 applied_store = OrgUnit(
                     code=f"DINGTALK-{remote_department_id}",
