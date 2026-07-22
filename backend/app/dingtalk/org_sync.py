@@ -26,7 +26,6 @@ from app.auth.service import revoke_all_for_user
 from app.core.security import hash_password
 from app.dingtalk.client import (
     DingTalkDepartment,
-    DingTalkDirectoryUser,
     DingTalkOrganizationSnapshot,
     DingTalkOrganizationUser,
 )
@@ -39,10 +38,8 @@ from app.dingtalk.org_structure import (
     normalize_org_name,
 )
 from app.dingtalk.read_sync import (
-    LocalEmployeeIdentity,
     blind_index_dingtalk_user_id,
     dingtalk_organization_identity_proof,
-    match_directory_users,
 )
 from app.models.auth import Role, User, UserReviewScope, UserRole
 from app.models.dingtalk import (
@@ -1068,6 +1065,45 @@ def _nearest_remote_store_by_department(
     return nearest
 
 
+def _match_reviewer_identity(
+    remote_user: DingTalkOrganizationUser,
+    *,
+    employees: tuple[Employee, ...],
+    encryption_key: str,
+) -> tuple[Employee | None, str, str | None]:
+    """Resolve a reviewer only by an established binding or exact employee number."""
+
+    provider_hash = blind_index_dingtalk_user_id(remote_user.user_id, key=encryption_key)
+    stable_matches = [
+        employee for employee in employees if employee.dingtalk_user_id_hash == provider_hash
+    ]
+    if len(stable_matches) == 1:
+        stable_employee = stable_matches[0]
+        if stable_employee.status == EmployeeStatus.ACTIVE and not stable_employee.is_deleted:
+            return stable_employee, "STABLE_ID", None
+        return None, "STABLE_ID", "ORG_EMPLOYEE_MATCH_FAILED"
+    if len(stable_matches) > 1:
+        return None, "STABLE_ID", "ORG_IDENTITY_CONFLICT"
+
+    job_number = (remote_user.job_number or "").strip()
+    if not job_number:
+        return None, "JOB_NUMBER", "ORG_EMPLOYEE_MATCH_FAILED"
+    job_number_matches = [
+        employee
+        for employee in employees
+        if employee.status == EmployeeStatus.ACTIVE
+        and not employee.is_deleted
+        and employee.emp_no.strip() == job_number
+    ]
+    if len(job_number_matches) == 1:
+        return job_number_matches[0], "JOB_NUMBER", None
+    return (
+        None,
+        "JOB_NUMBER",
+        "ORG_EMPLOYEE_MATCH_FAILED" if not job_number_matches else "ORG_IDENTITY_CONFLICT",
+    )
+
+
 def _plan_organization_reviewers(
     state: _LocalState,
     snapshot: DingTalkOrganizationSnapshot,
@@ -1079,40 +1115,14 @@ def _plan_organization_reviewers(
 ) -> tuple[_ReviewerDraft, ...]:
     (
         _org_units_by_id,
-        employees_by_id,
+        _employees_by_id,
         accounts_by_employee,
         users_by_id,
         role_codes_by_user,
         scope_users_by_pair,
     ) = _state_indexes(state)
-    active_employees = [
-        employee
-        for employee in state.employees
-        if employee.status == EmployeeStatus.ACTIVE and not employee.is_deleted
-    ]
+    employees = tuple(state.employees)
     active_remote_users = tuple(user for user in snapshot.users if user.active)
-    directory_matches = match_directory_users(
-        tuple(
-            LocalEmployeeIdentity(
-                employee_id=employee.id,
-                emp_no=employee.emp_no,
-                name=employee.name,
-                dingtalk_user_id_hash=employee.dingtalk_user_id_hash,
-            )
-            for employee in active_employees
-        ),
-        tuple(
-            DingTalkDirectoryUser(
-                user_id=user.user_id,
-                name=user.name,
-                job_number=user.job_number,
-                active=user.active,
-            )
-            for user in active_remote_users
-        ),
-        encryption_key=encryption_key,
-    )
-    matches_by_remote_id = {match.user_id: match for match in directory_matches.matches}
     account_ids_by_hash: dict[str, list[int]] = defaultdict(list)
     employee_ids_by_hash: dict[str, list[int]] = defaultdict(list)
     for account in state.users:
@@ -1242,72 +1252,61 @@ def _plan_organization_reviewers(
             reviewer_conflict_code: str | None = None
             reviewer_action = "CONFLICT"
             status = DingTalkOrgSyncItemStatus.CONFLICT
-            scope_user_ids = (
-                scope_users_by_pair.get((proposed_store.id, review_department), ())
-                if proposed_store is not None
-                else ()
-            )
             if store_row.status == DingTalkOrgSyncItemStatus.CONFLICT:
                 reviewer_conflict_code = "STORE_UNRESOLVED"
             elif not candidates:
-                if scope_user_ids:
-                    reviewer_action = "REMOVE"
-                    method = "REMOVE_MISSING_MANAGER"
-                    status = DingTalkOrgSyncItemStatus.READY
-                else:
-                    reviewer_conflict_code = "MANAGER_NOT_FOUND"
+                reviewer_action = "REMOVE"
+                method = "REMOVE_MISSING_MANAGER"
+                status = DingTalkOrgSyncItemStatus.READY
             elif len(candidates) > 1:
-                reviewer_conflict_code = "MULTIPLE_MANAGERS"
+                reviewer_conflict_code = "ORG_MANAGER_AMBIGUOUS"
             else:
                 selected_remote = candidates[0]
-                match = matches_by_remote_id.get(selected_remote.user_id)
-                if match is None:
-                    reviewer_conflict_code = "MANAGER_EMPLOYEE_NOT_MATCHED"
+                selected_employee, method, reviewer_conflict_code = _match_reviewer_identity(
+                    selected_remote,
+                    employees=employees,
+                    encryption_key=encryption_key,
+                )
+                if reviewer_conflict_code is not None:
+                    selected_employee = None
+                elif selected_employee is None:
+                    reviewer_conflict_code = "ORG_EMPLOYEE_MATCH_FAILED"
                 else:
-                    selected_employee = employees_by_id.get(match.employee_id)
-                    method = match.method
-                    if match.method == "UNIQUE_NAME":
-                        reviewer_conflict_code = "WEAK_NAME_MATCH"
-                    elif selected_employee is None:
-                        reviewer_conflict_code = "MANAGER_EMPLOYEE_NOT_MATCHED"
+                    accounts = accounts_by_employee.get(selected_employee.id, [])
+                    provider_hash = blind_index_dingtalk_user_id(
+                        selected_remote.user_id, key=encryption_key
+                    )
+                    if len(accounts) > 1:
+                        reviewer_conflict_code = "MULTIPLE_LOCAL_ACCOUNTS"
+                    elif accounts and (accounts[0].is_deleted or accounts[0].status != "ACTIVE"):
+                        reviewer_conflict_code = "MANAGER_ACCOUNT_INACTIVE"
+                    elif accounts and any(
+                        code not in _ALLOWED_REVIEWER_ROLES
+                        for code in role_codes_by_user.get(accounts[0].id, ())
+                    ):
+                        reviewer_conflict_code = "MANAGER_ACCOUNT_PRIVILEGED"
+                    elif accounts and accounts[0].dingtalk_user_id_hash not in (
+                        None,
+                        provider_hash,
+                    ):
+                        reviewer_conflict_code = "MANAGER_IDENTITY_CONFLICT"
+                    elif accounts and accounts[0].dingtalk_user_id not in (
+                        None,
+                        selected_remote.user_id,
+                    ):
+                        reviewer_conflict_code = "MANAGER_IDENTITY_CONFLICT"
                     else:
-                        accounts = accounts_by_employee.get(selected_employee.id, [])
-                        provider_hash = blind_index_dingtalk_user_id(
-                            selected_remote.user_id, key=encryption_key
-                        )
-                        if len(accounts) > 1:
-                            reviewer_conflict_code = "MULTIPLE_LOCAL_ACCOUNTS"
-                        elif accounts and (
-                            accounts[0].is_deleted or accounts[0].status != "ACTIVE"
-                        ):
-                            reviewer_conflict_code = "MANAGER_ACCOUNT_INACTIVE"
-                        elif accounts and any(
-                            code not in _ALLOWED_REVIEWER_ROLES
-                            for code in role_codes_by_user.get(accounts[0].id, ())
-                        ):
-                            reviewer_conflict_code = "MANAGER_ACCOUNT_PRIVILEGED"
-                        elif accounts and accounts[0].dingtalk_user_id_hash not in (
-                            None,
-                            provider_hash,
-                        ):
-                            reviewer_conflict_code = "MANAGER_IDENTITY_CONFLICT"
-                        elif accounts and accounts[0].dingtalk_user_id not in (
-                            None,
-                            selected_remote.user_id,
-                        ):
+                        expected_account_id = accounts[0].id if accounts else None
+                        account_owners = set(account_ids_by_hash.get(provider_hash, []))
+                        employee_owners = set(employee_ids_by_hash.get(provider_hash, []))
+                        if expected_account_id is not None:
+                            account_owners.discard(expected_account_id)
+                        employee_owners.discard(selected_employee.id)
+                        if account_owners or employee_owners:
                             reviewer_conflict_code = "MANAGER_IDENTITY_CONFLICT"
                         else:
-                            expected_account_id = accounts[0].id if accounts else None
-                            account_owners = set(account_ids_by_hash.get(provider_hash, []))
-                            employee_owners = set(employee_ids_by_hash.get(provider_hash, []))
-                            if expected_account_id is not None:
-                                account_owners.discard(expected_account_id)
-                            employee_owners.discard(selected_employee.id)
-                            if account_owners or employee_owners:
-                                reviewer_conflict_code = "MANAGER_IDENTITY_CONFLICT"
-                            else:
-                                reviewer_action = "ASSIGN"
-                                status = DingTalkOrgSyncItemStatus.READY
+                            reviewer_action = "ASSIGN"
+                            status = DingTalkOrgSyncItemStatus.READY
             add_reviewer_row(
                 row_key=f"REVIEWER:REMOTE:{remote_store.department_id}:{review_department.value}",
                 remote_store=remote_store,
@@ -1545,7 +1544,10 @@ def _persist_organization_preview(
         reviewer_conflict_count=sum(
             row.status == DingTalkOrgSyncItemStatus.CONFLICT for row in reviewer_rows
         ),
-        warning_count=len(node_plan.classified.warning_department_ids),
+        warning_count=(
+            len(node_plan.classified.warning_department_ids)
+            + sum(row.match_method == "REMOVE_MISSING_MANAGER" for row in reviewer_rows)
+        ),
     )
     session.add(batch)
     session.flush()

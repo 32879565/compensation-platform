@@ -31,7 +31,7 @@ from app.models.dingtalk import (
     DingTalkOrgSyncItemStatus,
     DingTalkOrgSyncTrigger,
 )
-from app.models.employee import Department, Employee
+from app.models.employee import Department, Employee, EmployeeStatus
 from app.models.org import OrgType, OrgUnit
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
@@ -449,6 +449,7 @@ def test_organization_apply_clears_departed_manager_scope_fail_closed(client, db
     preview = preview_response.json()
     assert preview["ready_reviewers"] == 2
     assert preview["reviewer_conflicts"] == 0
+    assert preview["warnings"] == 2
     assert {(item["action"], item["match_method"]) for item in preview["reviewer_items"]} == {
         ("REMOVE", "REMOVE_MISSING_MANAGER")
     }
@@ -990,7 +991,7 @@ def test_organization_sync_surfaces_local_only_store_and_clears_both_scopes(clie
     )
 
 
-def test_organization_sync_rejects_weak_name_only_manager_match(client, db_session):
+def test_reviewer_sync_never_uses_unique_name(client, db_session):
     store = _seed_store_and_managers(db_session)
     admin = _group_hr(db_session, "org-sync-weak-name")
     fake = _FakeOrganizationClient(
@@ -1012,8 +1013,9 @@ def test_organization_sync_rejects_weak_name_only_manager_match(client, db_sessi
     preview = preview_response.json()
     weak = next(item for item in preview["reviewer_items"] if item["department"] == "DINING")
     assert weak["action"] == "CONFLICT"
-    assert weak["match_method"] == "UNIQUE_NAME"
-    assert weak["conflict_code"] == "WEAK_NAME_MATCH"
+    assert weak["match_method"] == "JOB_NUMBER"
+    assert weak["conflict_code"] == "ORG_EMPLOYEE_MATCH_FAILED"
+    assert "weak-provider-manager" not in preview_response.text
     staged_weak = db_session.scalars(
         select(DingTalkOrgSyncItem).where(
             DingTalkOrgSyncItem.kind == DingTalkOrgSyncItemKind.REVIEWER,
@@ -1033,6 +1035,151 @@ def test_organization_sync_rejects_weak_name_only_manager_match(client, db_sessi
     db_session.expire_all()
     assert db_session.get(OrgUnit, store.id).dingtalk_dept_id is None
     assert db_session.scalars(select(UserReviewScope)).all() == []
+
+
+def test_reviewer_sync_uses_unique_exact_job_number(client, db_session):
+    _seed_store_and_managers(db_session)
+    admin = _group_hr(db_session, "org-sync-exact-job-number")
+    fake = _FakeOrganizationClient()
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+
+    response = client.post(
+        "/api/dingtalk/sync/organization/preview",
+        headers=_token(client, admin.username),
+    )
+
+    assert response.status_code == 200, response.text
+    item = next(row for row in response.json()["reviewer_items"] if row["department"] == "DINING")
+    assert item["status"] == "READY"
+    assert item["action"] == "ASSIGN"
+    assert item["match_method"] == "JOB_NUMBER"
+
+
+def test_reviewer_sync_conflicts_when_store_has_multiple_title_candidates(client, db_session):
+    _seed_store_and_managers(db_session)
+    admin = _group_hr(db_session, "org-sync-ambiguous-manager")
+    fake = _FakeOrganizationClient(
+        users=(
+            DingTalkOrganizationUser("provider-manager", "店长甲", "M001", "店长", True, (101,)),
+            DingTalkOrganizationUser(
+                "provider-manager-two", "店长乙", "M003", "店长", True, (101,)
+            ),
+            DingTalkOrganizationUser(
+                "provider-kitchen", "厨管乙", "M002", "厨房经理", True, (101,)
+            ),
+        )
+    )
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = _settings
+    app.dependency_overrides[get_dingtalk_client] = lambda: fake
+    headers = _token(client, admin.username)
+
+    preview_response = client.post("/api/dingtalk/sync/organization/preview", headers=headers)
+
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    item = next(row for row in preview["reviewer_items"] if row["department"] == "DINING")
+    assert item["status"] == "CONFLICT"
+    assert item["conflict_code"] == "ORG_MANAGER_AMBIGUOUS"
+    apply_response = client.post(
+        f"/api/dingtalk/sync/organization/{preview['batch_id']}/apply",
+        headers=headers,
+    )
+    assert apply_response.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("employees", "remote_user", "expected_method"),
+    [
+        (
+            (
+                Employee(
+                    emp_no="DUPLICATE",
+                    name="first",
+                    status=EmployeeStatus.ACTIVE,
+                    is_deleted=False,
+                ),
+                Employee(
+                    emp_no="DUPLICATE",
+                    name="second",
+                    status=EmployeeStatus.ACTIVE,
+                    is_deleted=False,
+                ),
+            ),
+            DingTalkOrganizationUser(
+                "provider-duplicate-job", "manager", "DUPLICATE", "店长", True, ()
+            ),
+            "JOB_NUMBER",
+        ),
+        (
+            (
+                Employee(
+                    emp_no="M101",
+                    name="first",
+                    dingtalk_user_id_hash=blind_index_dingtalk_user_id(
+                        "provider-duplicate-stable", key=_settings().encryption_key
+                    ),
+                ),
+                Employee(
+                    emp_no="M102",
+                    name="second",
+                    dingtalk_user_id_hash=blind_index_dingtalk_user_id(
+                        "provider-duplicate-stable", key=_settings().encryption_key
+                    ),
+                ),
+            ),
+            DingTalkOrganizationUser(
+                "provider-duplicate-stable", "manager", "M101", "店长", True, ()
+            ),
+            "STABLE_ID",
+        ),
+    ],
+)
+def test_reviewer_identity_conflicts_on_duplicate_stable_or_job_number(
+    employees, remote_user, expected_method
+):
+    employee, method, conflict_code = org_sync._match_reviewer_identity(
+        remote_user,
+        employees=employees,
+        encryption_key=_settings().encryption_key,
+    )
+
+    assert employee is None
+    assert method == expected_method
+    assert conflict_code == "ORG_IDENTITY_CONFLICT"
+
+
+@pytest.mark.parametrize(
+    ("status", "is_deleted"),
+    [(EmployeeStatus.RESIGNED, False), (EmployeeStatus.ACTIVE, True)],
+)
+def test_reviewer_identity_rejects_inactive_or_deleted_stable_binding(status, is_deleted):
+    remote_user = DingTalkOrganizationUser(
+        "provider-inactive-stable", "manager", "M101", "店长", True, ()
+    )
+    employee = Employee(
+        emp_no="M101",
+        name="inactive manager",
+        status=status,
+        is_deleted=is_deleted,
+        dingtalk_user_id_hash=blind_index_dingtalk_user_id(
+            remote_user.user_id, key=_settings().encryption_key
+        ),
+    )
+
+    matched_employee, method, conflict_code = org_sync._match_reviewer_identity(
+        remote_user,
+        employees=(employee,),
+        encryption_key=_settings().encryption_key,
+    )
+
+    assert matched_employee is None
+    assert method == "STABLE_ID"
+    assert conflict_code == "ORG_EMPLOYEE_MATCH_FAILED"
 
 
 def test_organization_sync_conflicts_same_manager_covering_multiple_stores(client, db_session):
@@ -1193,7 +1340,7 @@ def test_organization_preview_stages_region_create_and_authority_deactivate(clie
     assert body["local_regions"] == 1
     assert body["ready_regions"] == 2
     assert body["region_conflicts"] == 0
-    assert body["warnings"] == 0
+    assert body["warnings"] == 2
     created_region = next(item for item in body["region_items"] if item["action"] == "CREATE")
     assert created_region == {
         "id": created_region["id"],
@@ -1916,15 +2063,11 @@ def test_reviewer_planner_scans_users_and_store_rows_once(db_session, monkeypatc
         local_authority_nodes=node_plan.local_authority_nodes,
         local_only_stores=node_plan.local_only_stores,
     )
-    directory_match_calls = 0
-    match_directory_users = org_sync.match_directory_users
 
-    def count_directory_matches(*args, **kwargs):
-        nonlocal directory_match_calls
-        directory_match_calls += 1
-        return match_directory_users(*args, **kwargs)
+    def fail_identity_match(*_args, **_kwargs):
+        raise AssertionError("non-manager users must not enter reviewer identity matching")
 
-    monkeypatch.setattr(org_sync, "match_directory_users", count_directory_matches)
+    monkeypatch.setattr(org_sync, "_match_reviewer_identity", fail_identity_match)
     org_sync._plan_organization_reviewers(
         state,
         snapshot,
@@ -1934,7 +2077,6 @@ def test_reviewer_planner_scans_users_and_store_rows_once(db_session, monkeypatc
         kitchen_manager_titles=frozenset(),
     )
 
-    assert directory_match_calls == 1
     assert sum(user.department_id_reads for user in users) == len(users)
     assert counted_rows.iterations == 1
     assert counted_store_map.reads == len(stores)
