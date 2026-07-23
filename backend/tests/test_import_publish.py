@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 
 from app.auth.bootstrap import seed_rbac
 from app.core.config import Settings
+from app.core.security import hash_password
 from app.dingtalk import service as dingtalk_service
 from app.dingtalk.service import stage_review_deliveries
 from app.importing import publish as publish_module
@@ -13,13 +14,13 @@ from app.importing.header_rules import MONEY_FIELDS
 from app.importing.parser import SalaryRow
 from app.importing.publish import ImportPublishError, publish_import_for_review
 from app.importing.service import confirm_import, stage_import
-from app.models.auth import Role, User, UserReviewScope, UserRole
+from app.models.auth import Role, User, UserOrgScope, UserReviewScope, UserRole
 from app.models.dingtalk import DingTalkDelivery, DingTalkDeliveryStatus
 from app.models.employee import Department, Employee
 from app.models.org import OrgType, OrgUnit
 from app.models.payroll_batch import BatchStatus, PayrollBatch
 from app.models.payroll_result import BatchConfirmation, PayrollResult
-from app.models.salary import SalaryRecord
+from app.models.salary import SalaryRecord, SalarySource
 
 pytestmark = pytest.mark.usefixtures("pg_engine")
 
@@ -33,6 +34,22 @@ def _isolate_publish_tests_from_org_sync(monkeypatch):
         "require_recent_organization_scopes",
         lambda _session, _scopes, **_kwargs: 1,
     )
+
+
+@pytest.fixture
+def client(db_session):
+    from fastapi.testclient import TestClient
+
+    from app.db.session import get_session
+    from app.main import app
+
+    def _override():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
 
 
 def _employee(session, store, *, emp_no: str, name: str) -> Employee:
@@ -114,6 +131,43 @@ def _reviewer(session, *, username: str, store_id: int, department: Department) 
     )
     session.flush()
     return user
+
+
+def _salary_reader(
+    session,
+    *,
+    username: str,
+    role_code: str,
+    store_id: int | None = None,
+    department: Department | None = None,
+) -> User:
+    seed_rbac(session)
+    role = session.scalars(select(Role).where(Role.code == role_code)).one()
+    user = User(username=username, password_hash=hash_password("StrongPass123!"))
+    session.add(user)
+    session.flush()
+    session.add(UserRole(user_id=user.id, role_id=role.id))
+    if store_id is not None:
+        session.add(UserOrgScope(user_id=user.id, org_unit_id=store_id))
+    if store_id is not None and department is not None:
+        session.add(
+            UserReviewScope(
+                user_id=user.id,
+                org_unit_id=store_id,
+                department=department,
+            )
+        )
+    session.flush()
+    return user
+
+
+def _token(client, username: str) -> dict[str, str]:
+    response = client.post(
+        "/api/auth/login",
+        json={"username": username, "password": "StrongPass123!"},
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
 def _live_dingtalk_settings() -> Settings:
@@ -295,6 +349,152 @@ def test_publish_projects_results_and_review_scopes_only_for_selected_stores(db_
     assert [(row.org_unit_id, row.recipient_user_id) for row in deliveries] == [
         (first_store.id, first_manager.id)
     ]
+
+
+def test_salary_search_hides_unpublished_stores_and_other_departments(client, db_session):
+    selected_store = OrgUnit(code="SEARCH-SELECTED", name="已推送门店", type=OrgType.STORE)
+    excluded_store = OrgUnit(code="SEARCH-EXCLUDED", name="未推送门店", type=OrgType.STORE)
+    db_session.add_all([selected_store, excluded_store])
+    db_session.flush()
+    dining_employee = _employee(
+        db_session,
+        selected_store,
+        emp_no="SEARCH-DINING",
+        name="厅面可见员工",
+    )
+    kitchen_employee = _employee(
+        db_session,
+        selected_store,
+        emp_no="SEARCH-KITCHEN",
+        name="厨房可见员工",
+    )
+    excluded_employee = _employee(
+        db_session,
+        excluded_store,
+        emp_no="SEARCH-EXCLUDED",
+        name="未推送员工",
+    )
+    imported = _confirmed_import(
+        db_session,
+        selected_store,
+        [
+            _salary_row(
+                emp_no=dining_employee.emp_no,
+                name=dining_employee.name,
+                store_name=selected_store.name,
+                department="厅面",
+                gross="5000",
+                net="4400",
+            ),
+            _salary_row(
+                emp_no=kitchen_employee.emp_no,
+                name=kitchen_employee.name,
+                store_name=selected_store.name,
+                department="厨房",
+                gross="5100",
+                net="4500",
+            ),
+            _salary_row(
+                emp_no=excluded_employee.emp_no,
+                name=excluded_employee.name,
+                store_name=excluded_store.name,
+                department="厅面",
+                gross="5200",
+                net="4600",
+            ),
+        ],
+    )
+    publish_import_for_review(db_session, imported, store_ids={selected_store.id})
+    _salary_reader(
+        db_session,
+        username="search-dining-manager",
+        role_code="STORE_MANAGER",
+        store_id=selected_store.id,
+        department=Department.DINING,
+    )
+    _salary_reader(
+        db_session,
+        username="search-kitchen-manager",
+        role_code="STORE_MANAGER",
+        store_id=selected_store.id,
+        department=Department.KITCHEN,
+    )
+    _salary_reader(
+        db_session,
+        username="search-excluded-manager",
+        role_code="STORE_MANAGER",
+        store_id=excluded_store.id,
+        department=Department.DINING,
+    )
+    _salary_reader(
+        db_session,
+        username="search-manager-without-review-scope",
+        role_code="STORE_MANAGER",
+        store_id=selected_store.id,
+    )
+    _salary_reader(db_session, username="search-global-hr", role_code="GROUP_HR")
+    db_session.add(
+        SalaryRecord(
+            period="2026-04",
+            emp_no=dining_employee.emp_no,
+            name="历史工资仍可见",
+            store_name=selected_store.name,
+            org_unit_id=selected_store.id,
+            employee_id=dining_employee.id,
+            source=SalarySource.HISTORICAL,
+            fields={"实发工资": "4300.00"},
+        )
+    )
+    db_session.commit()
+
+    dining_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-dining-manager"),
+        params={"period": "2026-05"},
+    )
+    kitchen_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-kitchen-manager"),
+        params={"period": "2026-05"},
+    )
+    excluded_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-excluded-manager"),
+        params={"period": "2026-05"},
+    )
+    no_review_import_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-manager-without-review-scope"),
+        params={"period": "2026-05"},
+    )
+    no_review_history_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-manager-without-review-scope"),
+        params={"period": "2026-04"},
+    )
+    global_response = client.get(
+        "/api/salary-records",
+        headers=_token(client, "search-global-hr"),
+        params={"period": "2026-05"},
+    )
+
+    assert dining_response.status_code == 200, dining_response.text
+    assert [row["name"] for row in dining_response.json()["items"]] == [dining_employee.name]
+    assert kitchen_response.status_code == 200, kitchen_response.text
+    assert [row["name"] for row in kitchen_response.json()["items"]] == [kitchen_employee.name]
+    assert excluded_response.status_code == 200, excluded_response.text
+    assert excluded_response.json()["items"] == []
+    assert excluded_response.json()["total"] == 0
+    assert no_review_import_response.status_code == 200, no_review_import_response.text
+    assert no_review_import_response.json()["items"] == []
+    assert no_review_history_response.status_code == 200, no_review_history_response.text
+    assert [row["name"] for row in no_review_history_response.json()["items"]] == ["历史工资仍可见"]
+    assert global_response.status_code == 200, global_response.text
+    assert {row["name"] for row in global_response.json()["items"]} == {
+        dining_employee.name,
+        kitchen_employee.name,
+        excluded_employee.name,
+    }
 
 
 def test_publish_rejects_empty_or_foreign_store_selection_without_writes(db_session):
